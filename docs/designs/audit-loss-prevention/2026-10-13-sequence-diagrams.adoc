@@ -1,0 +1,650 @@
+= Module 11 — Audit & Loss Prevention Sequence Diagrams
+
+Started at: 2026/10/13 00:00:00  
+Finished at: 2026/10/13 00:00:00  
+Total time: 0 minutes
+
+== Scope and notation
+
+Các sơ đồ này là design-level diagrams được sinh sau khi user xác nhận 8 flows và participant boundaries. Repository chưa có application implementation source; tên component, queue và endpoint phản ánh Contracts/Architecture, không phải runtime trace.
+
+* L1: system-level flow giữa actor, service, broker, database và storage.
+* L2: internal backend flow; Repository/DAO được collapse vào Service → DB.
+* `OrderPaid`/Payment revenue facts không được Audit tự suy diễn; Audit chỉ consume approved source facts.
+* Audit/Loss Prevention không block Order, Payment, Shift hoặc POS operations.
+
+== Participants
+
+L1 dùng các participant đã xác nhận: Owner/Manager/Cashier, Angular/POS, Order, Promotion, Payment, Shift/POS Device, Identity, EventBridge/SQS, Audit, PostgreSQL, Loss Worker, Case Service và encrypted Object Storage.
+
+== 1. Successful order cancel → audit evidence
+
+=== 1.1 L1 — System Flow
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Order cancel → Audit evidence — L1: System Flow
+
+actor "Manager/POS" as actor
+participant "Order Service" as order
+queue "EventBridge/SQS" as bus
+participant "Audit Service" as audit
+database "Audit PostgreSQL" as db
+
+actor -> order: [HTTP/REST] POST /api/v1/orders/{id}/lines/{lineId}/cancel
+order -> order: Validate permission, reason, If-Match and order scope
+alt Invalid scope/state/reason
+  order --> actor: HTTP 403/409/422 safe error
+else Valid cancellation
+  order -> order: Commit line state + OrderLineCancelled.v1 outbox
+  order ->> bus: [EventBridge/SQS] OrderLineCancelled.v1
+  bus ->> audit: [SQS async] deliver event
+  audit -> audit: Validate, redact and deduplicate sourceEventId
+  audit -> db: INSERT immutable audit evidence + projection
+  db --> audit: committed evidence/watermark
+  audit --> actor: Source command success already returned
+end
+
+alt Audit consumer retry/DLQ
+  audit ->> bus: [SQS async] retry then DLQ after bounded attempts
+end
+@enduml
+----
+
+=== 1.2 L2 — Internal Backend Flow
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Order cancel → Audit evidence — L2: Internal Backend Flow
+
+participant "Order Command Service" as orderSvc
+database "Order DB" as orderDb
+queue "Order Outbox" as outbox
+participant "Audit Consumer" as consumer
+participant "Schema/Redaction Validator" as validator
+database "Audit DB" as auditDb
+
+orderSvc -> orderSvc: Validate scope, reason, If-Match and active line
+alt Validation failed
+  orderSvc --> orderSvc: Return safe business error
+else Validation passed
+  orderSvc -> orderDb: Transaction: cancel line + state version
+  orderDb --> orderSvc: committed order state
+  orderSvc -> outbox: Insert OrderLineCancelled.v1
+  outbox --> orderSvc: durable outbox ID
+end
+
+consumer -> validator: Validate envelope/version/redaction
+alt Invalid schema or sensitive payload
+  validator --> consumer: Quarantine/DLQ safe error
+else Valid event
+  consumer -> auditDb: INSERT inbox/source dedupe
+  auditDb --> consumer: new event / duplicate
+  alt New source event
+    consumer -> auditDb: INSERT audit_events + projection + watermark
+    auditDb --> consumer: committed evidence
+  else Duplicate source event
+    consumer --> consumer: No-op projection effect
+  end
+end
+@enduml
+----
+
+== 2. Manual discount/promotion → audit evidence
+
+=== 2.1 L1 — System Flow
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Discount/promotion → Audit evidence — L1: System Flow
+
+actor "Cashier/POS" as actor
+participant "Order Service" as order
+participant "Promotion/Loyalty" as promo
+queue "EventBridge/SQS" as bus
+participant "Audit Service" as audit
+database "Audit PostgreSQL" as db
+
+actor -> order: [HTTP/REST] Apply discount to order/line
+order -> promo: [HTTP/REST] Validate promotion/voucher/override policy
+promo --> order: Applied version/allocation or rejection
+alt Manual override
+  order -> order: Require bounded reason + actor/effective operator
+else Promotion/Voucher
+  order -> order: Snapshot immutable promotion/rule/voucher version
+end
+alt Rejected or invalid discount
+  order --> actor: HTTP 403/409/422 safe error
+else Applied
+  order -> order: Commit order pricing + DiscountApplied.v1 outbox
+  order ->> bus: [EventBridge/SQS] DiscountApplied.v1
+  bus ->> audit: [SQS async] deliver event
+  audit -> db: INSERT normalized discount evidence/projection
+  db --> audit: committed evidence
+  order --> actor: HTTP 200 applied order snapshot
+end
+@enduml
+----
+
+=== 2.2 L2 — Internal Backend Flow
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Discount/promotion → Audit evidence — L2: Internal Backend Flow
+
+participant "Order Pricing Service" as orderSvc
+participant "Promotion Client" as promoClient
+database "Order DB" as orderDb
+queue "Order Outbox" as outbox
+participant "Audit Normalizer" as normalizer
+database "Audit DB" as auditDb
+
+orderSvc -> promoClient: [HTTP sync - client] Resolve applied rule/voucher/override
+promoClient --> orderSvc: version + allocation + policy result
+orderSvc -> orderSvc: Validate VND minor-unit and allocation invariant
+alt Invalid or missing manual reason
+  orderSvc --> orderSvc: Reject without successful discount fact
+else Valid discount
+  orderSvc -> orderDb: Commit pricing snapshot + order version
+  orderSvc -> outbox: Insert DiscountApplied.v1
+end
+
+normalizer -> auditDb: INSERT inbox/source key
+auditDb --> normalizer: new/duplicate
+alt New event
+  normalizer -> normalizer: Map discountSource + redact reason/snapshots
+  normalizer -> auditDb: INSERT immutable evidence + allocation projection
+else Duplicate
+  normalizer --> normalizer: No-op
+end
+@enduml
+----
+
+== 3. Cash drawer command/result → audit evidence
+
+=== 3.1 L1 — System Flow
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Cash drawer command/result → Audit evidence — L1: System Flow
+
+actor "Cashier/POS" as actor
+participant "POS Device" as device
+participant "Shift Service" as shift
+participant "Drawer Hardware" as hardware
+queue "EventBridge/SQS" as bus
+participant "Audit Service" as audit
+database "Audit PostgreSQL" as db
+
+actor -> device: [HTTP/REST] Request drawer open
+device -> shift: [HTTP/REST] Validate active shift/operator/device
+shift --> device: authorized operation context
+device -> hardware: [Device protocol] Open drawer(commandId)
+hardware --> device: result(success/failure)
+device -> device: Commit operation/result + CashDrawerOpened.v1 outbox
+device ->> bus: [EventBridge/SQS] CashDrawerOpened.v1
+bus ->> audit: [SQS async] deliver drawer evidence
+audit -> db: INSERT immutable drawer evidence/projection
+db --> audit: committed evidence/watermark
+device --> actor: HTTP 200 result or safe device error
+
+alt Hardware result delayed
+  device ->> bus: [EventBridge/SQS] later result with same operationKey
+  audit -> audit: Reconcile command/result without double count
+end
+@enduml
+----
+
+=== 3.2 L2 — Internal Backend Flow
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Cash drawer command/result → audit evidence — L2: Internal Backend Flow
+
+participant "Drawer Controller" as ctrl
+participant "Drawer Operation Service" as drawerSvc
+participant "Shift Client" as shiftClient
+participant "Hardware Adapter" as hw
+database "POS/Shift DB" as sourceDb
+participant "Audit Normalizer" as normalizer
+database "Audit DB" as auditDb
+
+ctrl -> drawerSvc: openDrawer(request)
+drawerSvc -> shiftClient: [HTTP sync - client] Resolve shift/operator/device scope
+shiftClient --> drawerSvc: operation context
+drawerSvc -> hw: [Device protocol] open(commandId)
+hw --> drawerSvc: hardware result or timeout
+drawerSvc -> sourceDb: Persist operation/result + outbox(operationKey)
+sourceDb --> drawerSvc: committed source fact
+
+normalizer -> auditDb: INSERT inbox by sourceEventId/operationKey
+alt First result
+  normalizer -> auditDb: INSERT CashDrawerOpened evidence + projection
+else Retry/duplicate result
+  normalizer -> auditDb: Update reconciliation reference only
+end
+@enduml
+----
+
+== 4. Owner/Manager query timeline with scope denial
+
+=== 4.1 L1 — System Flow
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Audit timeline query — L1: System Flow
+
+actor "Owner/Manager" as user
+participant "Angular Audit Console" as ui
+participant "Audit API" as api
+participant "Identity" as identity
+database "Audit PostgreSQL" as db
+
+user -> ui: Select branch/date/action filters
+ui -> api: [HTTP/REST] GET /api/v1/audit/events
+api -> identity: [HTTP/REST] Resolve audit:read + scope/version
+alt Denied or foreign branch
+  identity --> api: 403/scope_not_allowed
+  api --> ui: Safe 403/409 without enumeration
+  ui --> user: Show no access
+else Authorized
+  identity --> api: resolved tenant/branch scope
+  api -> api: Validate max 90-day range/cursor/filter allowlist
+  api -> db: SELECT scope-safe timeline projection
+  db --> api: rows + watermark/data quality
+  api --> ui: HTTP 200 data + meta + freshness
+  ui --> user: Render timeline and quality state
+end
+@enduml
+----
+
+=== 4.2 L2 — Internal Backend Flow
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Audit timeline query — L2: Internal Backend Flow
+
+participant "Audit Controller" as ctrl
+participant "Scope Policy" as policy
+participant "Identity Client" as identityClient
+participant "Query Service" as querySvc
+database "Audit DB" as db
+participant "Redaction Mapper" as mapper
+
+ctrl -> policy: authorize(request, JWT context)
+policy -> identityClient: [HTTP sync - client] Resolve permission/scope/version
+identityClient --> policy: authorized scope or denial
+alt Denied
+  policy --> ctrl: Safe forbidden/scope error
+else Authorized
+  policy -> querySvc: normalized filter + scope hash
+  querySvc -> querySvc: Validate cursor/filter hash and 90-day bound
+  querySvc -> db: SELECT timeline projection + watermark
+  db --> querySvc: page + quality
+  querySvc -> mapper: Redact fields and map safe labels
+  mapper --> ctrl: response envelope
+end
+@enduml
+----
+
+== 5. P2 anomaly detection → finding/case
+
+=== 5.1 L1 — System Flow
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Anomaly detection → finding/case — L1: System Flow
+
+queue "Audit/Order/Payment/Shift Events" as events
+participant "Loss Prevention Worker" as worker
+database "Audit PostgreSQL" as db
+participant "Case Service" as cases
+participant "Owner/Manager Console" as console
+
+events ->> worker: [EventBridge/SQS] normalized facts
+worker -> db: Read evidence + baseline + rule policy
+db --> worker: facts, baseline, policy version
+worker -> worker: Aggregate employee/branch/time features
+worker -> worker: Evaluate explainable rules
+alt Insufficient baseline/data gap
+  worker -> db: Record quality telemetry, no high-confidence finding
+else Rule triggered
+  worker -> db: INSERT idempotent finding + evidence snapshot
+  worker -> cases: [Internal] Open/update case reference
+  cases -> db: INSERT case action/current pointer
+  cases ->> events: [EventBridge/SQS] AnomalyFindingCreated.v1
+end
+console -> cases: [HTTP/REST] Query authorized finding/case
+cases --> console: finding severity/evidence/explanation/state
+@enduml
+----
+
+=== 5.2 L2 — Internal Backend Flow
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Anomaly detection → finding/case — L2: Internal Backend Flow
+
+participant "Fact Consumer" as consumer
+participant "Feature Aggregator" as aggregator
+participant "Rule Evaluator" as evaluator
+database "Audit DB" as db
+participant "Finding/Case Service" as caseSvc
+queue "Audit Outbox" as outbox
+
+consumer -> aggregator: apply normalized facts by watermark
+aggregator -> db: Read/update employee/branch/time baseline
+db --> aggregator: baseline + warm-up/data quality
+aggregator -> evaluator: features + rule policy/version
+evaluator -> evaluator: Evaluate cancel/discount/drawer/repeated-action rules
+alt Insufficient baseline or partial source
+  evaluator -> db: Record INSUFFICIENT_BASELINE/PARTIAL telemetry
+else Triggered
+  evaluator -> caseSvc: createOrReviseFinding(deterministicKey)
+  caseSvc -> db: INSERT finding/evidence snapshot with CAS/dedupe
+  db --> caseSvc: finding state
+  caseSvc -> db: INSERT OPEN case action/current pointer
+  caseSvc ->> outbox: publish AnomalyFindingCreated.v1
+end
+@enduml
+----
+
+== 6. Case transition
+
+=== 6.1 L1 — System Flow
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Finding/case transition — L1: System Flow
+
+actor "Owner/Manager" as user
+participant "Angular Audit Console" as ui
+participant "Audit API/Case Service" as api
+participant "Identity" as identity
+database "Audit PostgreSQL" as db
+queue "EventBridge/SQS" as bus
+
+user -> ui: Acknowledge/investigate/resolve/dismiss
+ui -> api: [HTTP/REST] POST /api/v1/loss-prevention/findings/{id}/{action}
+api -> identity: [HTTP/REST] Resolve case permission + branch scope
+alt Manager attempts resolve/dismiss
+  identity --> api: denied
+  api --> ui: HTTP 403 safe error
+else Authorized
+  identity --> api: scope/version
+  api -> db: Read case + evidence scope/version
+  db --> api: current case
+  api -> db: CAS transition + append case action/outbox
+  alt Version conflict/invalid transition
+    db --> api: conflict
+    api --> ui: HTTP 409 current state
+  else Committed
+    db --> api: new state/action ID
+    api ->> bus: [EventBridge/SQS] AuditCaseActionRecorded.v1
+    api --> ui: HTTP 200 current case
+  end
+end
+@enduml
+----
+
+=== 6.2 L2 — Internal Backend Flow
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Finding/case transition — L2: Internal Backend Flow
+
+participant "Case Controller" as ctrl
+participant "Case Policy" as policy
+participant "Identity Client" as identityClient
+participant "Case Service" as caseSvc
+database "Audit DB" as db
+queue "Case Outbox" as outbox
+
+ctrl -> policy: validate action/reason/If-Match
+policy -> identityClient: [HTTP sync - client] Resolve case permission/scope
+identityClient --> policy: decision
+alt Denied
+  policy --> ctrl: safe forbidden
+else Allowed
+  policy -> caseSvc: transition(caseId, action, expectedVersion)
+  caseSvc -> db: SELECT case/evidence with tenant/branch predicate
+  db --> caseSvc: current state/version
+  caseSvc -> caseSvc: Validate transition and required reason
+  caseSvc -> db: CAS current pointer + INSERT case_actions + outbox
+  alt CAS conflict
+    db --> caseSvc: 0 rows updated
+    caseSvc --> ctrl: 409 conflict
+  else Success
+    db --> caseSvc: committed transition
+    caseSvc ->> outbox: publish AuditCaseActionRecorded.v1
+    caseSvc --> ctrl: current case response
+  end
+end
+@enduml
+----
+
+== 7. Digest verification mismatch
+
+=== 7.1 L1 — System Flow
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Digest verification — L1: System Flow
+
+actor "Scheduler/Ops" as ops
+participant "Digest Worker" as digest
+database "Audit PostgreSQL" as db
+participant "Alert/Observability" as alert
+participant "Audit Service" as audit
+
+ops -> digest: [Internal] Start/lease integrity check
+digest -> db: SELECT digest batch + ordered audit evidence
+db --> digest: batch rows/checkpoint
+digest -> digest: Canonicalize allowlisted fields + SHA-256
+digest -> db: Record verification result
+alt Digest matches
+  digest --> ops: VERIFIED batch/checkpoint
+else Digest mismatch
+  digest -> db: INSERT integrity finding + freeze verification result
+  digest -> alert: [HTTP/REST] Alert integrity mismatch
+  digest -> audit: [Internal] Record AuditIntegrityMismatchDetected.v1
+  digest --> ops: MISMATCH + restricted investigation required
+end
+@enduml
+----
+
+=== 7.2 L2 — Internal Backend Flow
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Digest verification — L2: Internal Backend Flow
+
+participant "Integrity Controller/Lease" as ctrl
+participant "Digest Service" as digestSvc
+participant "Canonicalizer" as canon
+database "Audit DB" as db
+participant "Integrity Finding Writer" as finding
+queue "Audit Outbox" as outbox
+
+ctrl -> digestSvc: acquire batch verification lease
+digestSvc -> db: SELECT batch metadata + ordered event IDs
+db --> digestSvc: batch
+digestSvc -> canon: serialize canonical event fields/version
+canon --> digestSvc: canonical bytes
+digestSvc -> digestSvc: Compute SHA-256 + previousDigest
+digestSvc -> db: INSERT verification result
+alt Match
+  db --> digestSvc: VERIFIED
+else Mismatch
+  digestSvc -> finding: createIntegrityFinding(batch)
+  finding -> db: INSERT immutable integrity finding
+  finding ->> outbox: publish AuditIntegrityMismatchDetected.v1
+end
+@enduml
+----
+
+== 8. Seven-year export/legal hold/replay
+
+=== 8.1 L1 — System Flow
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Audit export/legal hold/replay — L1: System Flow
+
+actor "Owner/Ops" as user
+participant "Audit API" as api
+participant "Identity" as identity
+participant "Export/Retention Worker" as worker
+database "Audit PostgreSQL" as db
+database "Encrypted Object Storage" as objectStore
+queue "EventBridge/SQS" as bus
+
+user -> api: [HTTP/REST] POST /api/v1/audit/exports
+api -> identity: [HTTP/REST] Resolve audit:operate + scope
+alt Denied/invalid scope
+  identity --> api: forbidden/scope_not_allowed
+  api --> user: safe error
+else Authorized
+  identity --> api: scope/version
+  api -> db: INSERT idempotent export operation
+  db --> api: operationId
+  api --> user: HTTP 202 pollUrl
+  worker -> db: Re-check scope/legal hold/data class
+  alt Legal hold or policy conflict
+    worker -> db: Mark blocked/audit hold decision
+  else Allowed export/archive
+    worker -> db: Stream redacted bounded rows
+    worker -> objectStore: [HTTP/REST] Upload encrypted file/checksum/expiry
+    objectStore --> worker: object reference
+    worker -> db: Complete operation + audit reference
+  end
+end
+
+opt Restricted replay/rebuild
+  user -> api: [HTTP/REST] POST /internal/v1/audit/rebuilds
+  api ->> bus: [EventBridge/SQS] replay source window
+end
+@enduml
+----
+
+=== 8.2 L2 — Internal Backend Flow
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Audit export/legal hold/replay — L2: Internal Backend Flow
+
+participant "Operations Controller" as ctrl
+participant "Operations Policy" as policy
+participant "Identity Client" as identityClient
+participant "Export/Retention Service" as opSvc
+database "Audit DB" as db
+database "Encrypted Object Storage" as objectStore
+queue "Replay Outbox" as outbox
+
+ctrl -> policy: validate operation/scope/date/data class
+policy -> identityClient: [HTTP sync - client] Resolve audit:operate
+identityClient --> policy: scope/version
+policy -> opSvc: createOrResumeOperation(idempotencyKey)
+opSvc -> db: SELECT current operation + legal holds
+db --> opSvc: operation/hold state
+alt Hold blocks operation
+  opSvc -> db: INSERT blocked retention/export decision
+else Export allowed
+  opSvc -> db: Stream redacted rows with scope predicate
+  opSvc -> objectStore: [HTTP sync - SDK] Put encrypted object
+  objectStore --> opSvc: checksum/object reference
+  opSvc -> db: Mark operation completed/expiry/audit reference
+end
+
+opt Replay
+  opSvc ->> outbox: publish replay request with source window
+end
+@enduml
+----
+
+== Diagram validation
+
+* 8 critical flows × 2 levels = 16 PlantUML blocks.
+* Each block uses `!theme toy`, `autonumber`, explicit protocol labels on cross-service arrows, `alt`/`opt` for failure and policy branches.
+* No API Gateway or auth-service participant is shown; Identity appears only where current authorization decision is an explicit part of the flow.
+* No Repository/DAO participant is shown; database access is represented directly from the relevant service.

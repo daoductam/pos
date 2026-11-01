@@ -1,0 +1,558 @@
+= Module 8 — Gợi ý món / Upsell: Sequence Diagrams
+:toc:
+:sectnums:
+
+Ngày: 2026-10-13
+
+Các sơ đồ là design-level diagrams. Repository chưa có Recommendation implementation source; các service và provider ngoài boundary được biểu diễn theo contracts đã xác nhận.
+
+== Participants
+
+L1 biểu diễn POS, Recommendation, Order, Catalog, Inventory, Loyalty, EventBridge/SQS, Reporting/Audit và DeepSeek khi flow liên quan.
+
+L2 tập trung vào Controller, Application Service, Order Context Client, Eligibility Projection, Rule/Model Runtime, Recommendation DB và Outbox/ML Worker; không biểu diễn Repository/DAO riêng.
+
+== 1. P0 cart recommendation — L1: System Flow
+
+[plantuml,recommendation-cart-l1,svg]
+....
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title P0 Cart Recommendation — L1: System Flow
+
+actor "Cashier/POS" as pos
+participant "Recommendation Service" as rec
+participant "Order Service" as order
+database "Recommendation PostgreSQL" as db
+
+pos -> rec: [HTTP/REST] POST /api/v1/recommendations
+rec -> order: [HTTP/REST] Resolve current cart context
+order --> rec: OrderId + cartVersion + canonical lines
+rec -> db: Load active tenant rules + eligibility projection
+db --> rec: Rule versions + candidate states
+rec -> rec: Filter cart/branch/availability + deterministic rank
+rec -> db: Persist suggestion session/candidates
+db --> rec: suggestionId + session version
+rec --> pos: HTTP 200 candidates + rule/model/freshness metadata
+
+alt No valid rule/candidate
+  rec --> pos: HTTP 200 items=[]
+end
+@enduml
+....
+
+== 1. P0 cart recommendation — L2: Internal Flow
+
+[plantuml,recommendation-cart-l2,svg]
+....
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title P0 Cart Recommendation — L2: Internal Backend Flow
+
+participant RecommendationController as ctrl
+participant RecommendationApplicationService as app
+participant OrderContextClient as orderClient
+participant CandidateEligibilityProjection as elig
+participant RuleEngine/ModelRuntime as ranker
+database "Recommendation DB" as db
+
+ctrl -> app: getRecommendations(request)
+app -> app: Validate auth/tenant/branch/order/version
+app -> orderClient: resolveCart(orderId, cartVersion)
+orderClient --> app: Canonical cart context
+app -> elig: loadEligibleCandidates(tenant, branch)
+elig -> db: Read item/availability projection + watermark
+db --> elig: Candidate states/freshness
+elig --> app: Filter context
+app -> ranker: rank(cart, active rules/model, candidates)
+ranker -> db: Read active rule/model pointer
+db --> ranker: Versioned scoring inputs
+ranker --> app: Deterministic top-K + attribution
+app -> db: Insert suggestion session/candidates
+db --> app: suggestionId
+app --> ctrl: RecommendationResponse
+@enduml
+....
+
+== 2. Suggestion shown/accepted — L1: System Flow
+
+[plantuml,recommendation-interaction-l1,svg]
+....
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Suggestion Shown/Accepted — L1: System Flow
+
+actor "Cashier/POS" as pos
+participant "Recommendation Service" as rec
+participant "Order Service" as order
+database "Recommendation PostgreSQL" as db
+queue "EventBridge/SQS" as bus
+participant "Reporting/Audit" as consumers
+
+pos -> rec: [HTTP/REST] POST /recommendations/{suggestionId}/shown
+rec -> db: Validate session/candidate + dedupe interaction
+db --> rec: Impression committed
+rec ->> bus: [EventBridge async] SuggestionShown.v1
+rec --> pos: HTTP 200 shown recorded
+
+pos -> order: [HTTP/REST] Add suggested item to order
+order --> pos: HTTP 200 add-line success + orderLineId/version
+pos -> rec: [HTTP/REST] POST /recommendations/{suggestionId}/accept
+rec -> db: Validate evidence + dedupe acceptance
+db --> rec: Acceptance committed
+rec ->> bus: [EventBridge async] SuggestionAccepted.v1
+rec --> pos: HTTP 200 accepted recorded
+bus ->> consumers: [SQS async] Consume analytics/audit facts
+
+alt Add-line fails
+  order --> pos: HTTP 409/422 add-line rejected
+  pos -> rec: No acceptance command
+end
+@enduml
+....
+
+== 2. Suggestion shown/accepted — L2: Internal Flow
+
+[plantuml,recommendation-interaction-l2,svg]
+....
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Suggestion Shown/Accepted — L2: Internal Backend Flow
+
+participant RecommendationController as ctrl
+participant RecommendationApplicationService as app
+participant CandidateEligibilityProjection as elig
+database "Recommendation DB" as db
+participant "Outbox/ML Worker" as worker
+
+ctrl -> app: recordShown(command)
+app -> elig: validateSessionCandidate(command)
+elig -> db: Read session + candidate + scope/version
+db --> elig: Valid/duplicate/expired
+elig --> app: Validation result
+app -> db: INSERT suggestion_interaction SHOWN + outbox
+db --> app: Committed or idempotent result
+app --> ctrl: 200 shown
+
+ctrl -> app: recordAccepted(command + add-line evidence)
+app -> elig: validateAcceptanceEvidence(command)
+elig -> db: Verify session/item/order evidence
+db --> elig: Valid evidence
+app -> db: INSERT ACCEPTED interaction + outbox
+db --> app: Committed
+app --> ctrl: 200 accepted
+worker -> db: Publish pending interaction events
+@enduml
+....
+
+== 3. Stale availability projection — L1: System Flow
+
+[plantuml,recommendation-stale-l1,svg]
+....
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Stale Availability Projection — L1: System Flow
+
+actor "Cashier/POS" as pos
+participant "Recommendation Service" as rec
+participant "Catalog Service" as catalog
+participant "Inventory Service" as inventory
+participant "Order Service" as order
+queue "EventBridge/SQS" as bus
+
+catalog ->> bus: [EventBridge async] Availability event v10
+inventory ->> bus: [EventBridge async] Stock event v21
+bus ->> rec: [SQS async] Projection consumers update state
+
+pos -> rec: [HTTP/REST] Get recommendation cartVersion=12
+rec -> rec: Check source watermark/TTL
+alt Projection fresh
+  rec --> pos: HTTP 200 eligible candidates
+else Projection stale/missing
+  rec --> pos: HTTP 200 filtered/empty + freshness=STALE
+end
+
+pos -> order: [HTTP/REST] Add selected item
+order -> catalog: [HTTP/REST] Validate item/menu state
+order -> inventory: [HTTP/REST] Validate/reserve current stock
+alt Current state valid
+  order --> pos: HTTP 200 line added
+else Current state unavailable
+  order --> pos: HTTP 409 candidate_unavailable
+end
+@enduml
+....
+
+== 3. Stale availability projection — L2: Internal Flow
+
+[plantuml,recommendation-stale-l2,svg]
+....
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Stale Availability Projection — L2: Internal Backend Flow
+
+participant RecommendationController as ctrl
+participant RecommendationApplicationService as app
+participant CandidateEligibilityProjection as elig
+participant RuleEngine/ModelRuntime as ranker
+database "Recommendation DB" as db
+participant "Outbox/ML Worker" as worker
+
+ctrl -> app: getRecommendations(request)
+app -> elig: checkFreshness(tenant, branch, candidates)
+elig -> db: Read source watermarks/lastEventAt
+db --> elig: Freshness state
+alt Fresh projection
+  elig --> app: Eligible set
+  app -> ranker: rank candidates
+  ranker --> app: Suggestions
+else Stale projection
+  elig --> app: Empty/safe filtered set + stale metadata
+  app -> app: Do not call external provider
+end
+app --> ctrl: 200 safe response
+worker -> db: Persist/replay checkpoint after event commit
+@enduml
+....
+
+== 4. P1 ALS request and fallback — L1: System Flow
+
+[plantuml,recommendation-als-l1,svg]
+....
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title P1 ALS Personalization — L1: System Flow
+
+actor "Cashier/POS" as pos
+participant "Loyalty Service" as loyalty
+participant "Recommendation Service" as rec
+participant "Order Service" as order
+database "Recommendation PostgreSQL" as db
+
+pos -> loyalty: [HTTP/REST] Resolve phone to customer context
+loyalty --> pos: Opaque customerKey + eligibility/version
+pos -> rec: [HTTP/REST] Get recommendation + opaque customerKey
+rec -> order: [HTTP/REST] Resolve current cart context
+order --> rec: Cart lines/version
+rec -> db: Load active ALS pointer + customer feature context
+db --> rec: Model/customer signal or missing
+
+alt Healthy ALS + enough signal
+  rec -> rec: ALS score → cart/branch/availability filter
+  rec --> pos: HTTP 200 reason=PERSONALIZED_ALS
+else Missing signal/model unavailable/quality failed
+  rec -> db: Load active association rules
+  db --> rec: Rules
+  rec --> pos: HTTP 200 reason=COLD_START/ALS_FALLBACK
+end
+@enduml
+....
+
+== 4. P1 ALS request and fallback — L2: Internal Flow
+
+[plantuml,recommendation-als-l2,svg]
+....
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title P1 ALS Personalization — L2: Internal Backend Flow
+
+participant RecommendationController as ctrl
+participant RecommendationApplicationService as app
+participant OrderContextClient as orderClient
+participant CandidateEligibilityProjection as elig
+participant RuleEngine/ModelRuntime as runtime
+database "Recommendation DB" as db
+
+ctrl -> app: getRecommendations(customerKey)
+app -> app: Validate opaque key/tenant/consent context
+app -> orderClient: resolveCart(orderId, cartVersion)
+orderClient --> app: Canonical cart
+app -> runtime: scoreALS(customerKey, cart)
+runtime -> db: Read active model pointer + customer feature
+db --> runtime: Healthy model/signal or unavailable
+
+alt ALS usable
+  runtime -> elig: filterAndRankALS(candidates)
+  elig -> db: Read branch/catalog/inventory projection
+  db --> elig: Eligible candidates
+  elig --> runtime: Top-K
+else ALS unusable
+  runtime -> db: Read active association rules
+  db --> runtime: Rules
+  runtime -> elig: filterAndRankRules(candidates)
+  elig --> runtime: Fallback top-K/empty
+end
+runtime --> app: Suggestions + reason/version
+app --> ctrl: RecommendationResponse
+@enduml
+....
+
+== 5. Nightly ALS train and activation — L1: System Flow
+
+[plantuml,recommendation-training-l1,svg]
+....
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Nightly ALS Training — L1: System Flow
+
+participant Scheduler as scheduler
+participant "Recommendation/ML Worker" as worker
+participant "Order Service" as order
+participant "Recommendation Service" as rec
+database "Recommendation PostgreSQL" as db
+collections "Object Storage" as store
+queue "EventBridge/SQS" as bus
+
+scheduler -> worker: [HTTP/REST] Enqueue nightly training run
+worker -> rec: [HTTP/REST] Create idempotent training run
+rec -> db: Lock tenant/model-family run + source watermark
+db --> rec: Run accepted
+rec --> worker: HTTP 202 runId
+worker -> order: [HTTP/REST] Read/export paid-order snapshot boundary
+order --> worker: OrderPaid facts/source watermark
+worker -> store: [HTTPS] Write immutable training snapshot
+store --> worker: Snapshot URI/checksum
+worker -> worker: Train ALS per tenant in isolation
+worker -> rec: [HTTP/REST] Submit candidate metrics/artifact manifest
+
+alt Quality/privacy/isolation gates pass
+  rec -> db: CAS active pointer to candidate model
+  rec ->> bus: [EventBridge async] RecommendationModelActivated.v1
+  rec --> worker: HTTP 200 ACTIVE
+else Gate fails or training error
+  rec -> db: Keep previous active model; mark REJECTED/FAILED
+  rec ->> bus: [EventBridge async] RecommendationTrainingRunCompleted.v1
+  rec --> worker: HTTP 200 RETAIN_PREVIOUS
+end
+@enduml
+....
+
+== 5. Nightly ALS train and activation — L2: Internal Flow
+
+[plantuml,recommendation-training-l2,svg]
+....
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Nightly ALS Training — L2: Internal Backend Flow
+
+participant TrainingOrchestrator as orch
+participant PaidSnapshotBuilder as snap
+participant ALSTrainer as trainer
+participant ModelValidator as validator
+database "Recommendation DB" as db
+collections "Object Storage" as store
+participant ModelRegistry as registry
+
+orch -> db: Acquire tenant/model-family run lease
+db --> orch: Run + source watermark
+orch -> snap: buildPaidInteractionSnapshot(watermark)
+snap -> db: Read deduped paid interactions/features
+db --> snap: Tenant-isolated rows
+snap -> store: Write snapshot manifest/blob
+store --> snap: URI/checksum
+snap --> orch: Snapshot ready
+orch -> trainer: train(snapshot)
+trainer -> store: Write candidate artifact
+store --> trainer: Artifact URI/checksum
+trainer --> orch: Candidate metrics/manifest
+orch -> validator: validate(candidate)
+validator -> validator: Quality/coverage/leakage/checksum gates
+
+alt Valid
+  validator --> orch: PASS
+  orch -> registry: CAS activate candidate
+  registry -> db: Update active pointer + audit/outbox
+  db --> registry: ACTIVE
+else Invalid
+  validator --> orch: FAIL
+  orch -> db: Mark candidate rejected/failed
+end
+@enduml
+....
+
+== 6. Model failure, rollback and replay — L1: System Flow
+
+[plantuml,recommendation-model-recovery-l1,svg]
+....
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Model Failure/Rollback/Replay — L1: System Flow
+
+actor "Owner/Operations" as ops
+participant "Recommendation Service" as rec
+participant "ML Worker" as worker
+database "Recommendation PostgreSQL" as db
+collections "Object Storage" as store
+queue "EventBridge/SQS" as bus
+
+rec -> db: Detect model load/checksum/quality incident
+db --> rec: Active model unhealthy
+rec -> rec: Switch runtime to association fallback
+rec ->> bus: [EventBridge async] Model health/fallback metric
+
+ops -> rec: [HTTP/REST] Request rollback(activeModelVersion)
+rec -> db: Validate prior model + CAS active pointer
+db --> rec: Prior validated model
+rec ->> bus: [EventBridge async] RecommendationModelRolledBack.v1
+rec --> ops: HTTP 200 rollback complete
+
+ops -> worker: [HTTP/REST] Replay training run from snapshotId
+worker -> store: [HTTPS] Read immutable snapshot
+store --> worker: Snapshot/checksum
+worker -> rec: [HTTP/REST] Submit new candidate for validation
+rec --> worker: HTTP 202 candidate validation
+@enduml
+....
+
+== 6. Model failure, rollback and replay — L2: Internal Flow
+
+[plantuml,recommendation-model-recovery-l2,svg]
+....
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Model Failure/Rollback/Replay — L2: Internal Backend Flow
+
+participant RecommendationController as ctrl
+participant RecommendationApplicationService as app
+participant RuleEngine/ModelRuntime as runtime
+participant ModelRegistry as registry
+database "Recommendation DB" as db
+participant "Outbox/ML Worker" as worker
+
+runtime -> registry: loadActiveModel()
+registry -> db: Read pointer/checksum
+db --> registry: Artifact manifest
+registry -> registry: Verify checksum/load health
+alt Load failed
+  registry --> runtime: Unhealthy
+  runtime -> runtime: Activate association fallback
+else Healthy
+  registry --> runtime: Model ready
+end
+
+ctrl -> app: rollback(modelVersion)
+app -> registry: rollbackTo(previousValidated)
+registry -> db: CAS pointer + audit/outbox
+db --> registry: Rollback committed
+app --> ctrl: 200 rollback
+worker -> db: Replay run by immutable snapshot manifest
+@enduml
+....
+
+== 7. P2 DeepSeek cold-start — L1: System Flow
+
+[plantuml,recommendation-cold-start-l1,svg]
+....
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title DeepSeek Cold-Start Enrichment — L1: System Flow
+
+participant "Catalog Service" as catalog
+queue "EventBridge/SQS" as bus
+participant "Recommendation/ML Worker" as worker
+participant "DeepSeek Adapter" as adapter
+participant DeepSeek as llm
+database "Recommendation PostgreSQL" as db
+actor "Owner/Reviewer" as owner
+
+catalog ->> bus: [EventBridge async] ItemCreated/Updated.v1
+bus ->> worker: [SQS async] Enqueue cold-start job
+worker -> db: Create idempotent candidate job
+db --> worker: Job accepted
+worker -> adapter: Sanitize metadata + apply budget/prompt version
+adapter -> llm: [HTTP/REST async] Generate structured tags/features
+llm --> adapter: Candidate JSON/provenance
+adapter -> adapter: Validate schema/vocabulary/safety/confidence
+adapter -> db: Store PENDING_REVIEW feature candidate
+db --> adapter: Candidate ID
+adapter --> worker: Job completed
+worker ->> bus: [EventBridge async] ColdStartFeatureCandidateCreated.v1
+owner -> db: [HTTP/REST] Review/approve candidate
+db --> owner: Feature active/rejected
+@enduml
+....
+
+== 7. P2 DeepSeek cold-start — L2: Internal Flow
+
+[plantuml,recommendation-cold-start-l2,svg]
+....
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title DeepSeek Cold-Start Enrichment — L2: Internal Backend Flow
+
+participant ColdStartWorker as worker
+participant PromptSafetyAdapter as adapter
+participant StructuredOutputValidator as validator
+database "Recommendation DB" as db
+collections "Object Storage" as store
+participant "Outbox/ML Worker" as publisher
+
+worker -> db: Lease cold-start job
+db --> worker: Catalog metadata candidate
+worker -> adapter: sanitizeAndBuildPrompt(metadata)
+adapter --> worker: Allowed payload + prompt version
+worker -> adapter: callProvider(payload)
+adapter --> worker: Untrusted provider response
+worker -> validator: validate(response)
+validator -> validator: Schema/vocabulary/safety/confidence checks
+alt Valid
+  validator --> worker: Candidate accepted for review
+  worker -> db: INSERT PENDING_REVIEW feature candidate
+  db --> worker: Candidate ID
+else Invalid/timeout
+  validator --> worker: Reject/retry/DLQ
+  worker -> db: Record failure without Catalog mutation
+end
+publisher -> db: Publish candidate event/outbox
+@enduml
+....
+
+== Design notes
+
+* Recommendation không đọc trực tiếp Order/Catalog/Inventory/Loyalty DB; Order context là bounded internal API hoặc matching local projection, các nguồn còn lại đi qua versioned events/projections.
+* Order add-line là authority cuối. Recommendation stale hoặc analytics/provider failure không tự làm checkout fail.
+* `SuggestionAccepted` chỉ được ghi sau add-line success evidence; `OrderPaid.v1` vẫn là canonical revenue/training fact.
+* ALS model/rule versions và projection watermarks được trả/ghi để có thể replay, rollback và audit.
+* DeepSeek/weather không nằm trên P0/P1 realtime path.

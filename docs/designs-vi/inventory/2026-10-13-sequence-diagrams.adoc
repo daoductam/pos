@@ -1,0 +1,177 @@
+= Module 6 — Dịch Vụ Kho Nguyên Liệu (Inventory Service): Sơ Đồ Tuần Tự (Sequence Diagrams)
+:toc:
+:source-highlighter: highlight.js
+
+== Phạm vi và xác nhận
+
+Các sơ đồ này là chuỗi tương tác ở cấp độ thiết kế (design-level sequences) dựa trên tài liệu Kiến trúc hệ thống của Inventory Service đã được phê duyệt. Do repository hiện chưa có mã nguồn ứng dụng, tài liệu này mô tả các luồng giao tiếp chuẩn mực theo hợp đồng kỹ thuật thay vì vết thực thi code lúc runtime.
+
+Các thành phần và luồng tương tác đã được xác nhận:
+
+* POS / Order Service khởi tạo luồng checkout và AWS Step Functions điều phối quy trình Saga.
+* Step Functions gọi các API nội bộ của Inventory Service để giữ chỗ (`Reserve`), trừ kho (`Commit`) và hủy giữ chỗ (`Release`) thông qua giao thức REST nội bộ.
+* Payment Service phát sự kiện thanh toán thành công đã xác thực tới Saga; Inventory Service tuyệt đối không lắng nghe trực tiếp sự kiện `PaymentPaid`.
+* Inventory Service sử dụng database transaction trong PostgreSQL, cơ chế Transactional Outbox và phân phối sự kiện bất đồng bộ qua AWS EventBridge / SQS cho downstream.
+* Các tiến trình worker nền của Inventory xử lý việc quét hết hạn, quét đối soát ngoại lệ và phân phối outbox mà không bao giờ mở lại các reservation đã ở trạng thái kết thúc.
+
+== L1 — Chuỗi điều phối Checkout Saga và luồng hệ thống tổng thể (System Flow)
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Vòng đời giữ chỗ nguyên liệu đơn hàng — L1: Luồng Hệ Thống (System Flow)
+
+actor "Máy POS" as pos
+participant "Order Service" as order
+participant "Step Functions Saga" as saga
+participant "Inventory Service" as inv
+database "Inventory PostgreSQL" as db
+participant "Payment Service" as payment
+queue "EventBridge / SQS" as bus
+participant "Reporting / Audit / Notification" as downstream
+
+pos -> order: [HTTP/REST] POST checkout
+order -> saga: [HTTP/REST] Khởi động Saga (attemptId, orderId, branchId)
+
+== Giữ chỗ nguyên liệu (Reserve) ==
+saga -> inv: [HTTP/REST] POST /internal/v1/inventory/reservations
+activate inv
+inv -> db: Mở rộng công thức, khóa dòng số dư, tăng reserved
+alt Thiếu tồn kho hoặc thiếu công thức món
+  db --> inv: Rollback transaction
+  inv --> saga: HTTP 409 insufficient_stock / recipe_missing
+  deactivate inv
+  saga -> order: [HTTP/REST] Đánh dấu checkout thất bại
+  order --> pos: HTTP 409 CHECKOUT_FAILED
+else Giữ chỗ thành công (Reserved)
+  db --> inv: Commit reservation + ghi outbox
+  inv ->> bus: [EventBridge async] InventoryReserved.v1
+  inv --> saga: HTTP 201 RESERVED + reservationId + expiresAt
+  deactivate inv
+
+  == Thanh toán và trừ kho (Payment & Commit) ==
+  saga -> payment: [HTTP/REST] Khởi tạo / Thu tiền thanh toán
+  alt Thanh toán thất bại hoặc quá thời gian chờ (Timeout)
+    payment --> saga: PaymentFailed / Timeout
+    saga -> inv: [HTTP/REST] POST reservation/release
+    inv -> db: Khóa reservation, giảm reserved, ghi outbox
+    inv --> saga: HTTP 200 RELEASED
+    inv ->> bus: [EventBridge async] InventoryReservationReleased.v1
+    saga -> order: [HTTP/REST] Đánh dấu checkout thất bại
+    order --> pos: CHECKOUT_FAILED
+  else Thanh toán thành công (Payment Success)
+    payment ->> saga: [EventBridge async] PaymentPaid.v1
+    saga -> inv: [HTTP/REST] POST reservation/commit
+    inv -> db: Khóa reservation, khóa dòng số dư, ghi sổ cái SALE_COMMITTED
+    alt Trừ kho thành công
+      db --> inv: Trạng thái COMMITTED + ghi outbox
+      inv ->> bus: [EventBridge async] InventoryReservationCommitted.v1
+      inv --> saga: HTTP 200 COMMITTED
+      saga -> order: [HTTP/REST] Hoàn tất đơn hàng (Finalize Order)
+      order ->> bus: [EventBridge async] OrderPaid.v1
+      order --> pos: PAID (Đơn hoàn tất thành công)
+    else Lỗi nghiêm trọng không thể commit kho
+      db --> inv: Tạo hồ sơ đối soát (Reconciliation case) + ghi outbox
+      inv ->> bus: [EventBridge async] InventoryReconciliationRequired.v1
+      inv --> saga: HTTP 409 reconciliation_required
+      saga -> order: [HTTP/REST] Đánh dấu cần đối soát ngoại lệ
+      order --> pos: CHECKOUT_FAILED + trạng thái cần đối soát
+    end
+  end
+end
+
+== Các sự kiện Downstream ==
+bus ->> downstream: Lắng nghe các sự kiện định kiểu có phiên bản của Inventory/Order
+downstream --> downstream: Khử trùng lặp theo eventId và kiểm tra phạm vi tenant
+@enduml
+----
+
+== L2 — Chi tiết luồng transaction nội bộ bên trong Inventory Service
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Các lệnh xử lý giữ chỗ kho — L2: Luồng Transaction Nội Bộ Backend
+
+participant "Internal API Controller" as ctrl
+participant "Reservation Application Service" as app
+participant "Recipe Expansion Engine" as recipe
+participant "Stock Transaction Service" as stock
+database "Inventory PostgreSQL" as db
+participant "Outbox Publisher" as outbox
+participant "Expiry/Reconciliation Worker" as worker
+
+== Luồng Giữ Chỗ (Reserve) ==
+ctrl -> app: reserve(request, idempotencyKey)
+activate app
+app -> app: Xác thực workload scope và mã hash request
+app -> db: Đọc các phiên bản công thức đang ACTIVE
+db --> app: Danh sách dòng công thức tương ứng
+app -> recipe: Mở rộng định lượng cho từng món/biến thể/topping
+recipe --> app: Tổng hợp nhu cầu nguyên liệu + snapshot
+app -> db: Bắt đầu transaction; tái xác thực phiên bản công thức
+app -> stock: reserveDemand(demand)
+activate stock
+stock -> db: SELECT các dòng balance FOR UPDATE (theo thứ tự ingredientId tăng dần)
+db --> stock: Dữ liệu các dòng số dư đã sắp xếp
+alt Có bất kỳ nguyên liệu nào available < required
+  stock -> db: Rollback transaction toàn bộ
+  stock --> app: Lỗi insufficient_stock
+else Tất cả nguyên liệu đều đủ tồn khả dụng
+  stock -> db: Tăng chỉ số reserved và chèn các dòng reservation_lines
+  stock -> db: Ghi bản ghi sự kiện InventoryReserved vào outbox
+  stock -> db: Commit transaction
+  stock --> app: Trạng thái RESERVED thành công
+end
+deactivate stock
+app --> ctrl: Phản hồi HTTP response
+deactivate app
+
+== Luồng Xác Nhận Trừ Kho hoặc Hủy (Commit / Release) ==
+ctrl -> app: commit/release(reservationId, context)
+activate app
+app -> db: Bắt đầu transaction; SELECT reservation FOR UPDATE
+alt Reservation đã ở trạng thái kết thúc (Terminal state)
+  db --> app: Trạng thái terminal hiện tại
+  app --> ctrl: Kết quả idempotent hoặc lỗi xung đột định kiểu
+else Reservation đang ở trạng thái RESERVED
+  app -> stock: Thực hiện biến động trạng thái terminal
+  activate stock
+  stock -> db: SELECT các dòng balance FOR UPDATE theo thứ tự ingredientId tăng dần
+  alt Lệnh Commit (Trừ kho)
+    stock -> db: Chèn dòng sổ cái SALE_COMMITTED; giảm reserved và giảm onHand
+    stock -> db: Cập nhật reservation sang COMMITTED; ghi outbox
+  else Lệnh Release hoặc Hết Hạn (Expiry)
+    stock -> db: Giảm chỉ số reserved; cập nhật reservation sang RELEASED/EXPIRED; ghi outbox
+  end
+  stock -> db: Commit transaction
+  stock --> app: Kết quả terminal
+  deactivate stock
+end
+app --> ctrl: Phản hồi HTTP response
+deactivate app
+
+== Các Tiến Trình Nền (Background Workers) ==
+worker -> db: Nhận quyền xử lý (claim lease) các reservation quá hạn / hồ sơ đối soát
+worker -> db: Thực hiện cập nhật trạng thái idempotent hợp lệ
+worker -> outbox: Quét và phát hành các sự kiện pending trong outbox
+outbox ->> outbox: Retry có lease lock; chuyển lỗi vĩnh viễn vào hàng đợi DLQ
+@enduml
+----
+
+== Các ghi chú quan trọng về tranh chấp & xử lý lỗi
+
+* **Thứ tự khóa dòng:** Khóa dòng `reservation` luôn được thực hiện trước khi khóa các dòng số dư `stock_balances` cho cả 3 lệnh: Commit, Release, Expiry.
+* **Quy tắc bên chiến thắng:** Transaction đầu tiên giành được khóa trên dòng `reservation` là bên chiến thắng duy nhất xác định trạng thái terminal.
+* **An toàn khi giữ chỗ:** Lệnh Reserve chỉ khóa các dòng số dư đã được sắp xếp tăng dần theo ID và đã tổng hợp toàn bộ nhu cầu trước khi lock.
+* **Nguyên tắc "Tất cả hoặc không":** Nếu bất kỳ nguyên liệu nào bị thiếu, toàn bộ transaction giữ chỗ sẽ rollback hoàn toàn; tuyệt đối không giữ chỗ dở dang một phần.
+* **Biên giới sự kiện thanh toán:** Sự kiện `PaymentPaid.v1` được Step Functions Saga lắng nghe và xử lý, tuyệt đối không gửi trực tiếp vào Inventory Service.
+* **Tính bất biến của đối soát:** Trạng thái `RECONCILIATION_REQUIRED` là trạng thái kết thúc; các worker nền không bao giờ tự ý mở lại hoặc âm thầm trừ kho vật lý.

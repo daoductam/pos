@@ -1,0 +1,600 @@
+= Module 10 — Báo Cáo & Dashboard: Biểu Đồ Tuần Tự (Sequence Diagrams)
+:toc:
+:sectnums:
+
+Started at: 2026/10/13 00:00:00  
+Finished at: 2026/10/13 00:00:00  
+Total time: 0 minutes
+
+== Phạm vi và khả năng truy vết (Scope & Traceability)
+
+Các sơ đồ dưới đây là **biểu đồ thiết kế hướng hợp đồng (contract-driven design diagrams)**. Repository hiện chưa có mã nguồn triển khai cho Reporting, do đó các bên tham gia (participant) và thông điệp (message) được lấy trực tiếp từ tài liệu Yêu cầu (Requirements) và Kiến trúc (Architecture) đã được người dùng xác nhận; đây chưa phải là trace từ mã nguồn lúc chạy thực tế.
+
+* L1 biểu diễn giao tiếp ở cấp độ hệ thống giữa các service (System-level communication).
+* L2 biểu diễn các component quan trọng bên trong Reporting; repository/DAO được thu gọn vào ranh giới database.
+* Dashboard chỉ đọc từ read model của Reporting; không thực hiện truy vấn chéo cơ sở dữ liệu domain.
+* Mọi luồng xử lý đều bảo toàn phạm vi tenant/chi nhánh, watermark, phiên bản projection và ngữ nghĩa chất lượng dữ liệu (data quality).
+
+== 1. P0 `OrderPaid` projection thành công
+
+=== 1.1 L1 — Luồng Hệ Thống (System Flow)
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title P0 OrderPaid projection thành công — L1
+
+participant "Order Service" as order
+queue "EventBridge/SQS/DLQ" as bus
+participant "Reporting Projection Worker" as worker
+database "Reporting PostgreSQL" as db
+participant "Audit/Observability" as audit
+
+order ->> bus: [EventBridge async] phát hành OrderPaid.v1
+bus ->> worker: [SQS async] phân phối sự kiện
+worker -> db: Xác thực tenant/chi nhánh + dedupe inbox
+db --> worker: Sự kiện nguồn mới hợp lệ
+worker -> db: Upsert read models doanh số/món chạy/nhân viên/khuyến mãi
+worker -> db: Tăng tiến watermark + phiên bản projection
+db --> worker: Commit transaction projection thành công
+worker --> bus: Gửi ACK sau khi commit
+worker ->> audit: [EventBridge async] metric projection đã áp dụng / độ trễ
+
+@enduml
+----
+
+=== 1.2 L2 — Luồng Projection Nội Bộ (Internal Projection Flow)
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title P0 OrderPaid projection thành công — L2
+
+participant "SQS Consumer" as consumer
+participant "EventValidator + Dedupe" as validator
+participant "ProjectionRouter" as router
+participant "MetricProjectionHandlers" as handler
+participant "WatermarkManager" as wm
+database "Reporting PostgreSQL" as db
+queue "Outbox/Telemetry" as outbox
+
+consumer -> validator: validateEnvelopeAndScope(OrderPaid)
+activate validator
+validator -> db: INSERT sự kiện inbox / khóa nguồn duy nhất
+db --> validator: accepted
+deactivate validator
+validator -> router: route(OrderPaid.v1)
+router -> handler: applyPaidOrderSnapshot()
+activate handler
+handler -> db: Upsert các dòng daily/branch/hour/employee/top-item/promo
+handler --> wm: các phạm vi bị ảnh hưởng + watermark nguồn
+deactivate handler
+wm -> db: Tăng tiến watermark một cách nguyên tử
+db --> wm: phiên bản projection đã commit
+wm ->> outbox: phát telemetry hủy cache / độ trễ
+consumer --> consumer: Gửi ACK sau khi commit transaction
+
+@enduml
+----
+
+== 2. Sự kiện trùng lặp hoặc sai thứ tự (Duplicate/Out-of-order Event)
+
+=== 2.1 L1 — Luồng Hệ Thống (System Flow)
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Duplicate/out-of-order event — L1
+
+participant "Order/Correction Producer" as producer
+queue "EventBridge/SQS/DLQ" as bus
+participant "Reporting Projection Worker" as worker
+database "Reporting PostgreSQL" as db
+participant "Audit/Observability" as audit
+
+producer ->> bus: [EventBridge async] phát hành event retry / điều chỉnh muộn
+bus ->> worker: [SQS async] phân phối sự kiện trùng hoặc phiên bản cũ hơn
+worker -> db: Kiểm tra eventId/khóa nguồn + phiên bản nguồn hiện tại
+alt Sự kiện trùng lặp (Duplicate)
+  db --> worker: IGNORED_DUPLICATE
+  worker ->> audit: [EventBridge async] metric dedupe
+else Phiên bản nguồn cũ hơn (Older version)
+  db --> worker: Bỏ qua điều chỉnh cũ (Stale)
+  worker ->> audit: [EventBridge async] metric sai thứ tự
+else Điều chỉnh mới hơn (Newer correction)
+  worker -> db: Áp dụng điều chỉnh + tăng tiến watermark nguyên tử
+  db --> worker: Projection đã commit
+end
+worker --> bus: Gửi ACK sau khi có quyết định / commit xong
+
+@enduml
+----
+
+=== 2.2 L2 — Luồng Khử Trùng và Quản Lý Phiên Bản (Dedupe & Version Flow)
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Duplicate/out-of-order event — L2
+
+participant "ProjectionConsumer" as consumer
+participant "EventValidator" as validator
+participant "DedupeVersionPolicy" as policy
+database "Reporting PostgreSQL" as db
+participant "CorrectionProjectionHandler" as handler
+queue "DLQ/Telemetry" as dlq
+
+consumer -> validator: validate schema/tenant/phiên bản nguồn
+validator -> policy: classify(eventId, sourceKey, sourceVersion)
+policy -> db: Đọc inbox + watermark hiện tại
+db --> policy: trạng thái sự kiện/phiên bản trước đó
+alt Trùng lặp (Duplicate)
+  policy -> db: Đánh dấu IGNORED_DUPLICATE
+else Cũ hơn (Older)
+  policy -> db: Đánh dấu bỏ qua phiên bản cũ
+else Sai schema/phạm vi
+  policy ->> dlq: Cách ly kiểm dịch kèm lý do an toàn
+else Mới hơn (Newer)
+  policy -> handler: áp dụng điều chỉnh / tính lại tổng hợp có giới hạn
+  handler -> db: Cập nhật dòng + phả hệ nguồn + watermark
+end
+consumer --> consumer: Gửi ACK chỉ sau khi transaction kết thúc
+
+@enduml
+----
+
+== 3. Truy vấn KPI Dashboard cache miss / hit
+
+=== 3.1 L1 — Luồng Hệ Thống (System Flow)
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Dashboard KPI query — L1
+
+actor "Owner/Manager" as user
+participant "Dashboard Angular" as ui
+participant "Reporting Query API" as api
+participant "Identity Access" as id
+database "Redis Cache" as cache
+database "Reporting PostgreSQL" as db
+
+user -> ui: Chọn chi nhánh/kỳ/widget
+ui -> api: [HTTP/REST] GET /api/v1/reports/dashboard/overview
+api -> id: [HTTP/REST] Phân giải phạm vi report:read
+id --> api: ResolvedScope + authorizationVersion
+api -> cache: Đọc khóa cache an toàn phạm vi
+alt Cache hit
+  cache --> api: Phản hồi + dataQuality
+else Cache miss
+  api -> db: SELECT pre-aggregates với điều kiện tenant/chi nhánh
+  db --> api: Các bản ghi + watermark/phiên bản projection
+  api -> cache: Ghi cache an toàn phạm vi tối đa 15s
+end
+api --> ui: HTTP 200 data + độ tươi mới/watermark
+ui --> user: Render KPI/cards/trạng thái
+
+@enduml
+----
+
+=== 3.2 L2 — Luồng Truy Vấn và Bộ Nhớ Đệm (Query & Cache Flow)
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Dashboard KPI query — L2
+
+participant "ReportController" as ctrl
+participant "ReportScopeResolver" as scope
+participant "ReportFilterPolicy" as policy
+participant "ReportCacheAdapter" as cache
+participant "ReportQueryService" as query
+database "Reporting PostgreSQL" as db
+
+ctrl -> scope: resolve phạm vi report:read hiện tại
+scope -> policy: normalizeScopeAndFilters()
+policy --> scope: chính sách kỳ/múi giờ/chi nhánh
+scope -> cache: get(scopeHash + normalizedFilterHash + watermark)
+alt Cache Hit
+  cache --> ctrl: phong bì cache sẵn
+else Cache Miss
+  scope -> query: queryOverview(resolvedScope, filters)
+  query -> db: SELECT bảng tổng hợp sẵn có đánh chỉ mục
+  db --> query: dữ liệu dòng + trạng thái watermark
+  query --> scope: phong bì phản hồi
+  scope -> cache: put(response, TTL <= 15s)
+  scope --> ctrl: phong bì phản hồi
+end
+ctrl --> ctrl: Ánh xạ phản hồi chuẩn {data, meta}
+
+@enduml
+----
+
+== 4. Quản lý truy cập chi nhánh trái phép hoặc membership bị thu hồi
+
+=== 4.1 L1 — Luồng Hệ Thống (System Flow)
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Unauthorized branch/drill-down — L1
+
+actor "Manager" as user
+participant "Dashboard Angular" as ui
+participant "Reporting Query API" as api
+participant "Identity Access" as id
+database "Redis Cache" as cache
+database "Reporting PostgreSQL" as db
+participant "Audit/Observability" as audit
+
+user -> ui: Chọn ID chi nhánh giả mạo hoặc đã bị gỡ bỏ
+ui -> api: [HTTP/REST] GET report kèm branchIds
+api -> id: [HTTP/REST] Phân giải phạm vi report:read hiện hành
+alt Chi nhánh ngoài membership hoặc bị thu hồi
+  id --> api: allowed=false, từ chối an toàn
+  api ->> audit: [EventBridge async] ghi nhận từ chối phạm vi (redacted)
+  api --> ui: HTTP 403/409 scope_not_allowed
+else Tập con được phép
+  id --> api: ResolvedScope
+  api -> cache: Tra cứu chỉ với hash phạm vi đã cấp phép
+  api -> db: Truy vấn với điều kiện tenant/chi nhánh
+  db --> api: Các dòng được phép
+  api --> ui: HTTP 200 report
+end
+ui --> user: Lỗi an toàn hoặc báo cáo; không liệt kê chi nhánh lạ
+
+@enduml
+----
+
+=== 4.2 L2 — Luồng Thực Thi Phạm Vi (Scope Enforcement Flow)
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Unauthorized branch/drill-down — L2
+
+participant "ReportController" as ctrl
+participant "ReportScopeResolver" as scope
+participant "ReportPolicyEngine" as policy
+participant "ReportCacheAdapter" as cache
+database "Reporting PostgreSQL" as db
+queue "AuditPublisher" as audit
+
+ctrl -> scope: resolve(subject, tenant, requestedBranches)
+scope -> policy: xác thực vai trò/membership/tập con phạm vi
+alt Bị từ chối (Denied)
+  policy --> scope: mã từ chối an toàn
+  scope ->> audit: phát hành từ chối đã ẩn thông tin nhạy cảm
+  scope --> ctrl: forbidden/scope_not_allowed
+  ctrl --> ctrl: không tra cứu cache, không query DB
+else Được phép (Allowed)
+  policy --> scope: ResolvedScope + authorizationVersion
+  scope -> cache: khóa bao gồm phạm vi/phiên bản
+  cache --> scope: hit/miss
+  scope -> db: Query với điều kiện tenant/chi nhánh được sinh tự động
+  db --> scope: chỉ các dòng được cấp quyền
+  scope --> ctrl: phong bì báo cáo
+end
+
+@enduml
+----
+
+== 5. Ghi nhận gợi ý từ trạng thái chờ sang đã thanh toán (Recommendation Attribution)
+
+=== 5.1 L1 — Luồng Hệ Thống (System Flow)
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Recommendation attribution pending to paid — L1
+
+participant "Recommendation Service" as rec
+queue "EventBridge/SQS/DLQ" as bus
+participant "Reporting Projection Worker" as worker
+database "Reporting PostgreSQL" as db
+participant "Order Service" as order
+participant "Dashboard" as ui
+
+rec ->> bus: [EventBridge async] SuggestionShown.v1
+rec ->> bus: [EventBridge async] SuggestionAccepted.v1
+bus ->> worker: [SQS async] sự kiện tương tác
+worker -> db: Lưu ghi nhận hiển thị/chấp nhận ở trạng thái PENDING
+order ->> bus: [EventBridge async] OrderPaid.v1
+bus ->> worker: [SQS async] sự kiện thanh toán đơn
+worker -> db: Phân giải cùng ngữ cảnh đơn hàng/giỏ hàng
+alt Nhóm chấp nhận thanh toán hợp lệ
+  worker -> db: Upsert nhóm AOV chấp nhận/đối chứng duy nhất 1 lần/đơn
+else Thiếu hoặc sai lệch correlation
+  worker -> db: Đánh dấu trạng thái chất lượng pending/error
+end
+ui -> worker: [HTTP/REST] truy vấn hiệu quả gợi ý
+worker --> ui: [HTTP/REST] tỷ lệ chấp nhận + AOV nhóm + dataQuality
+
+@enduml
+----
+
+=== 5.2 L2 — Luồng Projection Ghi Nhận (Attribution Projection Flow)
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Recommendation attribution pending to paid — L2
+
+participant "InteractionConsumer" as consumer
+participant "AttributionResolver" as resolver
+participant "RecommendationProjectionHandler" as handler
+participant "WatermarkManager" as wm
+database "Reporting PostgreSQL" as db
+queue "DLQ/Telemetry" as dlq
+
+consumer -> resolver: thu nhận tương tác hiển thị/chấp nhận
+resolver -> db: tìm cùng ngữ cảnh đơn hàng/giỏ hàng
+alt Chưa nhận được OrderPaid
+  resolver -> db: Lưu bản ghi PENDING attribution
+else Đã có ngữ cảnh thanh toán
+  resolver -> handler: cụ thể hóa nhóm hiển thị/chấp nhận
+  handler -> db: Upsert nhóm đơn hàng chấp nhận/đối chứng duy nhất
+  handler -> wm: tăng tiến watermark gợi ý
+  wm -> db: commit watermark/phiên bản
+else Sai lệch correlation
+  resolver ->> dlq: cách ly lỗi ghi nhận đóng góp
+end
+consumer --> consumer: Gửi ACK sau khi hoàn tất quyết định/commit
+
+@enduml
+----
+
+== 6. Projection doanh thu theo phiên bản khuyến mãi
+
+=== 6.1 L1 — Luồng Hệ Thống (System Flow)
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Promotion version revenue projection — L1
+
+participant "Order Service" as order
+queue "EventBridge/SQS/DLQ" as bus
+participant "Reporting Projection Worker" as worker
+database "Reporting PostgreSQL" as db
+participant "Dashboard" as ui
+
+order ->> bus: [EventBridge async] OrderPaid.v1 + phân bổ khuyến mãi bất biến
+bus ->> worker: [SQS async] phân phối sự kiện thanh toán
+worker -> db: Kiểm tra phiên bản khuyến mãi / phân bổ chiết khấu
+alt Phân bổ hợp lệ
+  worker -> db: Upsert promotion_effectiveness theo phiên bản quy tắc
+else Thiếu hoặc sai phân bổ
+  worker -> db: Lưu cờ UNALLOCATED_PROMOTION + PARTIAL
+end
+worker -> db: Tăng tiến watermark nguồn
+ui -> worker: [HTTP/REST] GET promotion effectiveness
+worker --> ui: [HTTP/REST] chỉ số theo phiên bản + phân bổ/chất lượng dữ liệu
+
+@enduml
+----
+
+=== 6.2 L2 — Luồng Projection Khuyến Mãi (Promotion Projection Flow)
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Promotion version revenue projection — L2
+
+participant "ProjectionConsumer" as consumer
+participant "PromotionAllocationValidator" as validator
+participant "PromotionProjectionHandler" as handler
+database "Reporting PostgreSQL" as db
+participant "WatermarkManager" as wm
+queue "Outbox/Telemetry" as outbox
+
+consumer -> validator: kiểm tra phiên bản quy tắc bất biến / phân bổ
+validator -> db: Kiểm tra inbox + khóa nguồn khuyến mãi
+alt Phân bổ hợp lệ
+  validator -> handler: áp dụng nhóm khuyến mãi
+  handler -> db: Upsert số lượng/gộp/chiết khấu/thuần theo phiên bản
+else Chưa phân bổ
+  validator -> handler: áp dụng nhãn UNALLOCATED_PROMOTION
+  handler -> db: Upsert bản ghi phân bổ bán phần
+end
+handler -> wm: báo cáo watermark nguồn
+wm -> db: Commit watermark + phiên bản projection
+wm ->> outbox: hủy cache khuyến mãi bị ảnh hưởng
+
+@enduml
+----
+
+== 7. Hoàn tiền / điều chỉnh đến muộn (Late Refund/Correction)
+
+=== 7.1 L1 — Luồng Hệ Thống (System Flow)
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Late refund/correction — L1
+
+participant "Order/Correction Producer" as producer
+queue "EventBridge/SQS/DLQ" as bus
+participant "Reporting Projection Worker" as worker
+database "Reporting PostgreSQL" as db
+database "Redis Cache" as cache
+participant "Dashboard" as ui
+
+producer ->> bus: [EventBridge async] sự kiện hoàn tiền/điều chỉnh đã duyệt
+bus ->> worker: [SQS async] sự kiện có hiệu lực muộn
+worker -> db: Áp dụng điều chỉnh đơn điệu / tính lại bảng tổng hợp có giới hạn
+db --> worker: asOfWatermark / phiên bản projection mới
+worker -> cache: Hủy bỏ namespace phạm vi/kỳ bị ảnh hưởng
+ui -> worker: [HTTP/REST] truy vấn dashboard hiện hành
+worker -> db: Đọc chế độ xem hiện hành đã điều chỉnh
+db --> worker: Các chỉ số hiện hành + watermark
+worker --> ui: [HTTP/REST] các chỉ số đã điều chỉnh + asOfWatermark
+
+@enduml
+----
+
+=== 7.2 L2 — Luồng Điều Chỉnh và Hủy Bỏ Cache (Correction & Cache Invalidation)
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Late refund/correction — L2
+
+participant "CorrectionConsumer" as consumer
+participant "CorrectionPolicy" as policy
+participant "MetricProjectionHandlers" as handler
+database "Reporting PostgreSQL" as db
+participant "WatermarkManager" as wm
+database "Redis Cache" as cache
+
+consumer -> policy: kiểm tra phiên bản hiệu lực / phạm vi hoàn tiền
+policy -> db: đọc phả hệ nguồn hiện tại
+alt Trùng lặp hoặc điều chỉnh cũ hơn
+  db --> policy: quyết định bỏ qua (no-op)
+else Điều chỉnh mới hợp lệ
+  policy -> handler: tính toán lại các bảng tổng hợp bị ảnh hưởng
+  handler -> db: cập nhật các dòng hiện hành + phả hệ
+  handler -> wm: tăng tiến watermark / phiên bản
+  wm -> db: atomic commit
+  wm -> cache: hủy bỏ namespace bị ảnh hưởng
+end
+consumer --> consumer: Gửi ACK sau khi commit transaction / tín hiệu hủy cache
+
+@enduml
+----
+
+== 8. Rebuild / phát lại projection (Projection Rebuild/Replay)
+
+=== 8.1 L1 — Luồng Hệ Thống (System Flow)
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Projection rebuild/replay — L1
+
+actor "Authorized Ops" as ops
+participant "Reporting Query API" as api
+participant "Rebuild Worker" as worker
+queue "Event Archive/EventBridge" as bus
+database "Reporting PostgreSQL" as db
+database "Redis Cache" as cache
+participant "Audit/Observability" as audit
+
+ops -> api: [HTTP/REST] POST /internal/v1/reporting/rebuilds
+api -> worker: [HTTP/REST] đưa tác vụ rebuild có giới hạn vào hàng đợi
+worker ->> audit: [EventBridge async] audit yêu cầu rebuild
+worker -> bus: [SQS async] đọc sự kiện nguồn theo khoảng thời gian
+bus --> worker: danh sách sự kiện / watermark nguồn
+worker -> db: Ghi vào phiên bản projection mục tiêu
+alt Xác thực thành công
+  worker -> db: Hoán đổi nguyên tử con trỏ/phiên bản hiện hành
+  worker -> cache: Hủy cache phạm vi/kỳ bị ảnh hưởng
+  worker ->> audit: [EventBridge async] rebuild hoàn tất thành công
+  api --> ops: 202/200 COMPLETED
+else Thất bại / Gửi vào DLQ
+  worker ->> audit: [EventBridge async] rebuild thất bại + mã lỗi an toàn
+  api --> ops: 202/FAILED hoặc 409 conflict
+end
+
+@enduml
+----
+
+=== 8.2 L2 — Luồng Rebuild Worker Nội Bộ (Rebuild Worker Flow)
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Projection rebuild/replay — L2
+
+participant "RebuildController" as ctrl
+participant "RebuildWorker" as worker
+participant "SourceEventReader" as reader
+participant "ProjectionHandlers" as handlers
+database "Reporting PostgreSQL" as db
+participant "WatermarkManager" as wm
+database "Redis Cache" as cache
+
+ctrl -> worker: nhận tác vụ rebuild có tính lũy kế (idempotent)
+worker -> db: tạo phiên bản projection mục tiêu + giữ lease
+loop các trang sự kiện nguồn có giới hạn
+  worker -> reader: đọc các sự kiện sau checkpoint
+  reader --> worker: trang sự kiện
+  worker -> handlers: áp dụng vào projection mục tiêu
+  handlers -> db: upsert các dòng mục tiêu / dedupe
+end
+worker -> wm: kiểm tra số lượng/watermark/độ hoàn tất
+alt Xác thực thành công
+  wm -> db: hoán đổi con trỏ hiện hành nguyên tử
+  wm -> cache: hủy cache phạm vi/kỳ mục tiêu
+  worker -> db: đánh dấu COMPLETED
+else Xác thực thất bại
+  worker -> db: đánh dấu FAILED / lý do DLQ
+end
+worker --> ctrl: trạng thái tác vụ
+
+@enduml
+----

@@ -1,0 +1,680 @@
+= Module 12 — Sequence Diagrams cho Tích hợp & Điều phối Demo (Integration & Demo Orchestration)
+
+Started at: 2026/10/13 00:00:00  
+Finished at: 2026/10/13 00:00:00  
+Total time: 0 minutes  
+---
+
+**Trạng thái:** Biểu đồ cấp thiết kế; tập hợp participant đã được người dùng xác nhận.  
+**Ghi chú nguồn:** Repository chưa có application source; các biểu đồ theo dấu parent contracts đã phê duyệt và kiến trúc Module 12, không phải runtime trace.
+
+== 1. Ghi nhận sự đồng thuận của người nhận hóa đơn (Capture invoice recipient consent)
+
+=== 1.1 L1 — Luồng hệ thống (System flow)
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Ghi nhận sự đồng thuận người nhận hóa đơn — L1: Luồng hệ thống
+
+actor "Thu ngân/POS" as pos
+participant "Identity" as id
+participant "Integration Runtime" as int
+database "Integration PostgreSQL" as db
+
+pos -> id: [HTTP/REST] Phân giải quyền hạn + phạm vi chi nhánh (branch scope)
+id --> pos: Phạm vi đã ủy quyền (Authorized scope)
+pos -> int: [HTTP/REST] POST /api/v1/invoice-recipient-intents
+int -> id: [HTTP/REST] Xác minh phạm vi đơn hàng/chi nhánh
+id --> int: Quyết định phạm vi (Scope decision)
+alt Liên hệ hoặc đồng thuận không hợp lệ
+  int --> pos: HTTP 422 invalid_contact_or_consent
+else Tùy chọn hợp lệ
+  int -> db: [SQL] INSERT snapshot đồng thuận + bản ghi idempotency
+  db --> int: invoiceRecipientRef + phiên bản
+  int --> pos: HTTP 201 opaque invoiceRecipientRef
+end
+
+@enduml
+----
+
+=== 1.2 L2 — Luồng backend nội bộ (Internal backend flow)
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Ghi nhận sự đồng thuận người nhận hóa đơn — L2: Luồng backend nội bộ
+
+participant "InvoiceRecipientController" as ctrl
+participant "ScopeClient" as scope
+participant "RecipientPreferenceService" as svc
+database "Integration DB" as db
+queue "Outbox" as outbox
+
+ctrl -> ctrl: Xác thực JWT, idempotency key và body
+ctrl -> scope: [HTTP/REST] Ủy quyền ngữ cảnh chi nhánh/đơn hàng
+scope --> ctrl: Phạm vi đã phân giải (Resolved scope)
+ctrl -> svc: prepareRecipient(request, scope)
+activate svc
+svc -> svc: Chuẩn hóa kênh/liên hệ và phiên bản đồng thuận
+alt Dữ liệu đầu vào hoặc phạm vi không hợp lệ
+  svc --> ctrl: Lỗi xác thực/ủy quyền
+else Dữ liệu hợp lệ
+  svc -> db: [SQL] SELECT idempotency + snapshot hiện hoạt
+  db --> svc: Đã tồn tại / chưa có
+  svc -> db: [SQL] INSERT snapshot người nhận bất biến
+  db --> svc: Opaque recipient ref
+  svc -> outbox: [SQL] Xếp hàng tham chiếu audit đã che giấu (redacted)
+  svc --> ctrl: RecipientResponse
+end
+deactivate svc
+ctrl --> ctrl: Ánh xạ phản hồi an toàn
+
+@enduml
+----
+
+== 2. OrderPaid sang hóa đơn kỹ thuật (OrderPaid to technical invoice)
+
+=== 2.1 L1 — Luồng hệ thống (System flow)
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title OrderPaid sang hóa đơn kỹ thuật — L1: Luồng hệ thống
+
+participant "Order Service" as order
+queue "EventBridge/SQS + DLQ" as bus
+participant "Integration Runtime" as int
+database "Integration PostgreSQL" as db
+participant "Nhà cung cấp Sandbox Hóa đơn" as provider
+
+order ->> bus: [EventBridge/SQS async] publish OrderPaid.v1
+bus ->> int: [EventBridge/SQS async] deliver OrderPaid.v1
+int -> db: [SQL] Khử trùng lặp inbox + tạo tác vụ hóa đơn
+db --> int: REQUESTED / tác vụ đã tồn tại
+alt Trùng lặp hoặc đã phát hành trước đó
+  int -> db: [SQL] Đọc tác vụ hiện tại
+  db --> int: Trạng thái hiện có
+else Tác vụ mới
+  int ->> bus: [EventBridge/SQS async] InvoiceOperationRequested.v1
+  int -> provider: [HTTP/REST] Phát hành hóa đơn kỹ thuật + idempotency key
+  alt Provider chấp nhận
+    provider --> int: 200 provider ref
+    int -> db: [SQL] Commit ISSUED + lượt thử provider + outbox
+    int ->> bus: [EventBridge/SQS async] InvoiceIssued.v1
+  else Timeout/lỗi có thể thử lại (retryable failure)
+    provider --> int: Timeout/429/5xx
+    int -> db: [SQL] Commit FAILED_RETRYABLE + lượt thử tiếp theo
+  else Lỗi cuối cùng (terminal failure)
+    provider --> int: 4xx/payload không hỗ trợ
+    int -> db: [SQL] Commit FAILED_TERMINAL + mã lỗi an toàn
+    int ->> bus: [EventBridge/SQS async] InvoiceFailed.v1
+  end
+end
+
+@enduml
+----
+
+=== 2.2 L2 — Luồng backend nội bộ (Internal backend flow)
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title OrderPaid sang hóa đơn — L2: Luồng backend nội bộ
+
+participant "OrderPaidConsumer" as consumer
+participant "Inbox/Dedupe" as inbox
+participant "InvoiceOrchestrator" as svc
+database "Integration DB" as db
+participant "InvoiceProviderClient" as client
+queue "Outbox/DLQ" as outbox
+
+consumer -> inbox: Xác thực envelope + phiên bản nguồn
+inbox -> db: [SQL] INSERT sự kiện inbox / khóa nguồn duy nhất
+db --> inbox: APPLIED / duplicate
+alt Trùng lặp
+  inbox --> consumer: no-op; ACK
+else Lần gửi đầu tiên
+  inbox -> svc: createOrLoadInvoiceOperation()
+  activate svc
+  svc -> db: [SQL] INSERT/SELECT tác vụ hóa đơn + các mục
+  db --> svc: Tác vụ REQUESTED
+  svc -> outbox: [SQL] Xếp hàng InvoiceOperationRequested.v1
+  svc --> inbox: Giao dịch cục bộ đã commit
+  deactivate svc
+  consumer --> consumer: ACK SQS sau khi commit
+end
+
+client -> svc: issueDueOperations()
+activate svc
+svc -> db: [SQL] Thu giữ lease tác vụ + lượt thử provider
+db --> svc: Lease + idempotency key
+svc -> client: [HTTP/REST] issue(command, idempotencyKey)
+client --> svc: Kết quả provider đã chuẩn hóa
+svc -> db: [SQL] CAS trạng thái + lượt thử + outbox
+db --> svc: Đã commit ISSUED/FAILED
+deactivate svc
+
+@enduml
+----
+
+== 3. Hóa đơn đã phát hành sang phân phối email/Zalo (Invoice issued to email/Zalo delivery)
+
+=== 3.1 L1 — Luồng hệ thống (System flow)
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Phân phối hóa đơn — L1: Luồng hệ thống
+
+participant "Integration Runtime" as int
+queue "EventBridge/SQS + DLQ" as bus
+database "Integration PostgreSQL" as db
+participant "Email Provider" as email
+participant "Zalo Provider" as zalo
+
+bus ->> int: [EventBridge/SQS async] InvoiceIssued.v1
+int -> db: [SQL] Tải snapshot đồng thuận + tạo các tác vụ phân phối
+db --> int: (Các) kênh đã chọn / NO_RECIPIENT
+alt Không có đồng thuận/thông tin liên hệ
+  int -> db: [SQL] Đánh dấu phân phối NOT_REQUESTED / NO_RECIPIENT
+else Kênh Email được chọn
+  int -> email: [HTTP/REST] Gửi hóa đơn + idempotency key
+  alt Chấp nhận
+    email --> int: 202 provider message ref
+    int -> db: [SQL] Commit SENT + trạng thái outbox
+  else Lỗi có thể thử lại
+    email --> int: 429/5xx/timeout
+    int -> db: [SQL] Commit FAILED_RETRYABLE + backoff
+  end
+else Kênh Zalo được chọn
+  int -> zalo: [HTTP/REST] Gửi hóa đơn + idempotency key
+  alt Chấp nhận
+    zalo --> int: 202 provider message ref
+    int -> db: [SQL] Commit SENT + trạng thái outbox
+  else Lỗi có thể thử lại/lỗi cuối cùng
+    zalo --> int: Kết quả provider
+    int -> db: [SQL] Commit trạng thái đã chuẩn hóa
+  end
+end
+int ->> bus: [EventBridge/SQS async] InvoiceDeliveryStatusChanged.v1
+
+@enduml
+----
+
+=== 3.2 L2 — Luồng backend nội bộ (Internal backend flow)
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Phân phối hóa đơn — L2: Luồng backend nội bộ
+
+participant "DeliveryWorker" as worker
+participant "DeliveryPolicy" as policy
+database "Integration DB" as db
+participant "ChannelProviderClient" as client
+queue "Outbox/DLQ" as outbox
+
+worker -> db: [SQL] Thu giữ lease phân phối PENDING
+db --> worker: Tác vụ phân phối + tham chiếu snapshot đồng thuận
+worker -> policy: evaluateConsentChannelRateLimit()
+policy --> worker: Allowed / NO_RECIPIENT / BLOCKED
+alt Không được phép
+  worker -> db: [SQL] Đánh dấu NOT_REQUESTED/FAILED_TERMINAL
+else Được phép
+  worker -> db: [SQL] INSERT lượt thử provider + trạng thái SENDING
+  db --> worker: Khóa idempotency của kênh
+  worker -> client: [HTTP/REST] send(invoice artifact, idempotency key)
+  client --> worker: Kết quả provider đã chuẩn hóa
+  worker -> db: [SQL] CAS trạng thái phân phối + lượt thử
+  db --> worker: SENT/FAILED/EXPIRED
+  worker -> outbox: [SQL] Xếp hàng sự kiện trạng thái + tham chiếu audit
+end
+
+@enduml
+----
+
+== 4. Kịch bản Demo thành công end-to-end (Demo success end-to-end)
+
+=== 4.1 L1 — Luồng hệ thống (System flow)
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Demo thành công — L1: Luồng hệ thống
+
+actor "Người vận hành Demo" as op
+participant "Demo Control Plane" as demo
+participant "POS/Angular" as pos
+participant "Shift Service" as shift
+participant "Order Service" as order
+participant "Recommendation" as rec
+participant "Loyalty" as loyalty
+participant "Payment/VNPAY" as pay
+participant "Step Functions Saga" as saga
+participant "Inventory" as inv
+participant "Reporting" as rep
+participant "AI Assistant" as ai
+queue "EventBridge/SQS" as bus
+participant "AWS X-Ray" as xray
+
+op -> demo: [HTTP/REST] POST /internal/v1/demo/runs
+demo -> shift: [HTTP/REST] preflight/mở ca làm việc
+demo -> pos: [HTTP/REST] thực thi kịch bản POS
+pos -> order: [HTTP/REST] tạo đơn hàng gà rán
+order -> rec: [HTTP/REST] yêu cầu gợi ý giỏ hàng
+rec --> pos: Gợi ý Coca
+pos -> rec: [HTTP/REST] ghi nhận đã hiển thị/được chấp nhận (shown/accepted)
+pos -> order: [HTTP/REST] thêm Coca kèm gán ghi nhận (attribution)
+pos -> loyalty: [HTTP/REST] ngữ cảnh số điện thoại khách hàng
+pos -> order: [HTTP/REST] thanh toán (checkout)
+order -> saga: [HTTP/REST] bắt đầu Saga checkout
+saga -> pay: [HTTP/REST] tạo mã VNPAY QR
+pay --> pos: QR đang chờ (pending)
+pay -> pay: [HTTP/REST] xác minh sandbox IPN
+pay ->> bus: [EventBridge/SQS async] PaymentPaid.v1
+saga -> inv: [HTTP/REST] commit lượng giữ chỗ nguyên liệu
+saga -> order: [HTTP/REST] chốt PAID
+order ->> bus: [EventBridge/SQS async] OrderPaid.v1
+bus ->> loyalty: [EventBridge/SQS async] tích lũy điểm
+bus ->> inv: [EventBridge/SQS async] projection đã thanh toán/tồn kho
+bus ->> rep: [EventBridge/SQS async] doanh thu đã thanh toán + attribution
+demo -> ai: [HTTP/REST] hỏi câu hỏi về doanh thu gia tăng từ Coca (uplift)
+ai -> rep: [HTTP/REST] công cụ đóng góp/AOV đã phê duyệt
+ai -> rec: [HTTP/REST] công cụ attribution đã phê duyệt
+rep --> ai: Dữ kiện thực tế + độ tươi mới/nguồn gốc (provenance)
+rec --> ai: Dữ kiện thực tế về attribution
+ai --> demo: Câu trả lời an toàn + định nghĩa chỉ số
+demo -> xray: [AWS X-Ray/OpenTelemetry] lấy tóm tắt trace
+xray --> demo: Các tham chiếu trace
+demo --> op: VƯỢT QUA các checkpoint + trace + câu trả lời AI
+
+@enduml
+----
+
+=== 4.2 L2 — Luồng nội bộ Demo Control Plane (Demo Control Plane internal flow)
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Demo thành công — L2: Luồng nội bộ Demo Control Plane
+
+participant "DemoRunController" as ctrl
+participant "PreflightEvaluator" as pre
+participant "ScenarioOrchestrator" as orch
+participant "ParentApiAdapters" as adapters
+participant "CheckpointEvaluator" as check
+database "Demo Control DB" as db
+participant "TraceAdapter" as trace
+
+ctrl -> db: [SQL] Tạo đợt chạy + phiên bản kịch bản/dữ liệu mẫu (seed)
+ctrl -> pre: preflight(run)
+pre -> adapters: [HTTP/REST] kiểm tra sức khỏe/khả năng của parent
+adapters --> pre: Ma trận sức khỏe (Health matrix)
+pre -> db: [SQL] Ghi lại checkpoint PREFLIGHT/READY
+pre --> ctrl: READY / PREFLIGHT_FAILED
+alt READY
+  ctrl -> orch: execute(run)
+  activate orch
+  loop Các bước kịch bản theo thứ tự
+    orch -> adapters: [HTTP/REST] thực thi bước thông qua contract thật
+    adapters --> orch: Kết quả an toàn + correlation
+    orch -> check: đánh giá checkpoint kỳ vọng
+    check -> db: [SQL] Lưu kết quả kỳ vọng/quan sát được
+    check -> trace: [AWS X-Ray/OpenTelemetry] phân giải tham chiếu trace
+    trace --> check: Tham chiếu trace đã che giấu (redacted)
+    check --> orch: PASS/FAIL/QUALITY
+  end
+  orch -> db: [SQL] Commit tóm tắt đợt chạy
+  deactivate orch
+end
+ctrl --> ctrl: Trả về trạng thái đợt chạy/các tham chiếu trace
+
+@enduml
+----
+
+== 5. Demo bồi hoàn khi Payment không khả dụng (Demo Payment unavailable compensation)
+
+=== 5.1 L1 — Luồng hệ thống (System flow)
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Demo Payment không khả dụng — L1: Luồng hệ thống
+
+participant "Demo Control Plane" as demo
+participant "Ranh giới sự cố Payment" as fault
+participant "Order Service" as order
+participant "Step Functions Saga" as saga
+participant "Payment Service" as pay
+participant "Inventory" as inv
+queue "EventBridge/SQS" as bus
+participant "AWS X-Ray" as xray
+
+demo -> fault: [HTTP/REST] thu giữ lease PAYMENT_UNAVAILABLE
+fault --> demo: faultLeaseId + thời hạn hết hạn
+demo -> order: [HTTP/REST] checkout kèm demoRunId/faultLeaseId
+order -> saga: [HTTP/REST] bắt đầu checkout
+saga -> inv: [HTTP/REST] giữ chỗ nguyên liệu (reserve)
+inv --> saga: Đang giữ chỗ nguyên liệu
+saga -> pay: [HTTP/REST] khởi tạo thanh toán
+pay -> fault: [HTTP/REST] đánh giá lease trong phạm vi đợt chạy
+fault --> pay: Không khả dụng / timeout
+pay --> saga: Payment không khả dụng
+saga -> inv: [HTTP/REST] giải phóng lượng giữ chỗ (release reservation)
+inv --> saga: Đã giải phóng đúng một lần
+saga -> order: [HTTP/REST] đánh dấu CHECKOUT_FAILED + bồi hoàn (compensation)
+order ->> bus: [EventBridge/SQS async] OrderCheckoutFailed.v1
+demo -> xray: [AWS X-Ray/OpenTelemetry] lấy trace sự cố
+xray --> demo: Trace đã che giấu + các span bồi hoàn
+demo --> demo: Khẳng định không có OrderPaid / không cộng điểm / không commit tồn kho
+demo --> demo: VƯỢT QUA kịch bản lỗi (PASS)
+
+@enduml
+----
+
+=== 5.2 L2 — Luồng lease sự cố và checkpoint (Fault lease and checkpoint flow)
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Demo Payment không khả dụng — L2: Luồng sự cố/checkpoint
+
+participant "DemoRunController" as ctrl
+participant "FaultLeaseManager" as lease
+participant "PaymentFaultAdapter" as fault
+participant "CheckpointEvaluator" as check
+database "Demo Control DB" as db
+participant "TraceAdapter" as trace
+
+ctrl -> lease: acquire(run, PAYMENT_UNAVAILABLE)
+lease -> db: [SQL] Xác thực DEMO/TEST + chèn lease có thời hạn
+db --> lease: faultLeaseId
+lease --> ctrl: Lease đang kích hoạt
+ctrl -> fault: [HTTP/REST] Gắn lease vào ngữ cảnh đợt chạy
+fault --> ctrl: Ngữ cảnh được chấp nhận
+ctrl -> check: waitForCompensation(run)
+check -> check: Polling các checkpoint có thẩm quyền của Order/Inventory
+check -> db: [SQL] Lưu các xác nhận lỗi/giải phóng/không có paid quan sát được
+check -> trace: [AWS X-Ray/OpenTelemetry] phân giải trace saga
+trace --> check: Các tham chiếu trace
+check --> ctrl: PASS / TIMEOUT / FAILED
+ctrl -> lease: thu hồi/làm hết hạn lease
+lease -> db: [SQL] Đánh dấu lease REVOKED/EXPIRED
+
+@enduml
+----
+
+== 6. Truy vấn AI về doanh thu gia tăng (AI uplift query)
+
+=== 6.1 L1 — Luồng hệ thống (System flow)
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Truy vấn AI về doanh thu gia tăng từ Coca — L1: Luồng hệ thống
+
+actor "Chủ chuỗi/Quản lý" as user
+participant "Console Demo/Chủ chuỗi" as console
+participant "Identity" as id
+participant "AI Assistant" as ai
+participant "Reporting" as rep
+participant "Recommendation" as rec
+
+user -> console: Hỏi “Tuần này gợi ý Coca giúp tăng bao nhiêu doanh thu?”
+console -> ai: [HTTP/REST] POST conversation/turn + phạm vi yêu cầu
+ai -> id: [HTTP/REST] phân giải quyền hạn tenant/chi nhánh
+id --> ai: Phiên bản/phạm vi đã ủy quyền
+ai -> rep: [HTTP/REST] hàm đóng góp/AOV đã phê duyệt
+rep --> ai: Dữ kiện thực tế về doanh thu đã thanh toán/chỉ số/độ tươi mới
+ai -> rec: [HTTP/REST] hàm attribution đã hiển thị/chấp nhận được phê duyệt
+rec --> ai: Dữ kiện thực tế về attribution + chất lượng
+alt Đầy đủ và tươi mới
+  ai --> console: Câu trả lời an toàn + định nghĩa/nguồn gốc (provenance)
+else Một phần/cũ/thiếu attribution
+  ai --> console: Giới hạn an toàn + trạng thái chất lượng dữ liệu
+end
+console --> user: Hiển thị câu trả lời kèm phạm vi/chu kỳ/độ tươi mới
+
+@enduml
+----
+
+=== 6.2 L2 — Luồng adapter truy vấn Demo/Tích hợp (Demo/Integration query adapter flow)
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Truy vấn AI về doanh thu gia tăng từ Coca — L2: Luồng adapter truy vấn
+
+participant "DemoRunController" as ctrl
+participant "AIClient" as client
+participant "ScopeContext" as scope
+participant "CheckpointEvaluator" as check
+database "Demo Control DB" as db
+participant "TraceAdapter" as trace
+
+ctrl -> scope: Phân giải ngữ cảnh chủ sở hữu/phạm vi đợt chạy
+scope --> ctrl: Phạm vi đáng tin cậy + tương quan đợt chạy
+ctrl -> client: [HTTP/REST] Hỏi đường dẫn hàm AI đã phê duyệt
+client --> ctrl: Câu trả lời an toàn + provenance
+ctrl -> check: xác thực chỉ số/chất lượng/provenance
+check -> db: [SQL] Lưu checkpoint AI + tham chiếu câu trả lời
+check -> trace: [AWS X-Ray/OpenTelemetry] liên kết trace câu trả lời
+trace --> check: Tham chiếu trace
+check --> ctrl: PASS / DATA_LATE / INCOMPLETE
+
+@enduml
+----
+
+== 7. Khôi phục trùng lặp/replay/sự cố provider (Duplicate/replay/provider crash recovery)
+
+=== 7.1 L1 — Luồng hệ thống (System flow)
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Khôi phục sau replay tích hợp — L1: Luồng hệ thống
+
+queue "EventBridge/SQS + DLQ" as bus
+participant "Integration Runtime" as int
+database "Integration PostgreSQL" as db
+participant "Nhà cung cấp Sandbox Hóa đơn" as provider
+
+bus ->> int: [EventBridge/SQS async] Gửi lại cùng sự kiện OrderPaid.v1
+int -> db: [SQL] Khóa duy nhất inbox/nguồn
+db --> int: IGNORED_DUPLICATE
+int --> bus: ACK mà không tạo tác dụng phụ
+int -> db: [SQL] Thu giữ lượt thử provider bị kẹt ISSUING
+db --> int: Cùng khóa idempotency
+int -> provider: [HTTP/REST] Truy vấn/thử lại cùng một khóa
+alt Provider đã chấp nhận trước đó
+  provider --> int: ISSUED + cùng tham chiếu an toàn
+  int -> db: [SQL] Đối soát ISSUED đúng một lần
+else Provider không xác định
+  provider --> int: UNKNOWN
+  int -> db: [SQL] Duy trì trạng thái thử lại/đối soát
+  int ->> bus: [EventBridge/SQS async] IntegrationDataQualityChanged.v1
+else Provider báo lỗi dứt khoát
+  provider --> int: FAILED
+  int -> db: [SQL] Commit trạng thái chuẩn hóa lỗi cuối cùng/có thể thử lại
+end
+
+@enduml
+----
+
+=== 7.2 L2 — Luồng khôi phục nội bộ (Internal recovery flow)
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Khôi phục sau replay tích hợp — L2: Luồng khôi phục nội bộ
+
+participant "EventConsumer" as consumer
+participant "InboxDedupe" as inbox
+participant "ReconciliationWorker" as worker
+database "Integration DB" as db
+participant "ProviderClient" as client
+queue "DLQ/Outbox" as queue
+
+consumer -> inbox: xác thực/replay sự kiện
+inbox -> db: [SQL] SELECT khóa nguồn duy nhất
+db --> inbox: Duplicate / lần đầu
+alt Trùng lặp
+  inbox --> consumer: ACK no-op
+else Sự kiện đầu tiên
+  inbox -> db: [SQL] Áp dụng projection tác vụ hóa đơn
+  db --> inbox: Commit
+  inbox --> consumer: ACK
+end
+worker -> db: [SQL] Thu giữ lượt thử provider đã hết hạn
+db --> worker: Tác vụ + cùng khóa idempotency
+worker -> client: [HTTP/REST] truy vấn/thử lại provider
+client --> worker: ISSUED/UNKNOWN/FAILED
+worker -> db: [SQL] CAS trạng thái + bản ghi đối soát
+worker -> queue: [SQL] Xếp hàng sự kiện chất lượng/trạng thái hoặc đẩy vào DLQ
+
+@enduml
+----
+
+== 8. Reset demo và hết hạn fault-lease (Demo reset and fault-lease expiry)
+
+=== 8.1 L1 — Luồng hệ thống (System flow)
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Reset Demo và hết hạn Lease — L1: Luồng hệ thống
+
+actor "Người vận hành Demo" as op
+participant "Demo Control Plane" as demo
+database "Demo Control DB" as db
+participant "Adapters Dọn dẹp Parent" as cleanup
+participant "Audit Service" as audit
+participant "AWS X-Ray" as xray
+
+op -> demo: [HTTP/REST] POST /internal/v1/demo/runs/{id}/reset
+demo -> db: [SQL] Thu giữ reset lease + tải manifest tài nguyên
+db --> demo: Manifest / xung đột (conflict)
+alt Đang chạy/reset đồng thời
+  demo --> op: HTTP 409 demo_run_conflict
+else Được phép reset
+  demo -> cleanup: [HTTP/REST] Dọn dẹp tài nguyên theo thứ tự phụ thuộc ngược
+  cleanup --> demo: Kết quả dọn dẹp an toàn theo từng service
+  demo -> db: [SQL] Ghi lại tác vụ reset + đánh dấu RESET
+  demo -> audit: [HTTP/REST] Tham chiếu audit che giấu về reset/sự cố
+  demo -> xray: [AWS X-Ray/OpenTelemetry] đóng/liên kết trace đợt chạy
+  xray --> demo: Tham chiếu trace
+  demo --> op: HTTP 200 RESET + bản tóm tắt
+end
+demo -> db: [SQL] Worker hết hạn đánh dấu các fault lease cũ là EXPIRED
+
+@enduml
+----
+
+=== 8.2 L2 — Luồng reset nội bộ (Internal reset flow)
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Reset Demo và hết hạn Lease — L2: Luồng reset nội bộ
+
+participant "DemoRunController" as ctrl
+participant "ResetService" as reset
+participant "ResourceManifestStore" as manifest
+participant "ParentCleanupAdapter" as adapter
+database "Demo Control DB" as db
+participant "AuditTraceAdapter" as obs
+
+ctrl -> reset: reset(runId, idempotencyKey)
+reset -> db: [SQL] Thu giữ lease chạy/reset
+db --> reset: Đã cấp lease / xung đột
+alt Xung đột lease
+  reset --> ctrl: demo_run_conflict
+else Đã cấp lease
+  reset -> manifest: loadCleanupManifest(run)
+  manifest -> db: [SQL] Đọc các tài nguyên opaque có thứ tự
+  db --> manifest: Danh sách dọn dẹp
+  loop Các tài nguyên theo thứ tự phụ thuộc ngược
+    manifest -> adapter: [HTTP/REST] dọn dẹp tài nguyên trong namespace
+    adapter --> manifest: Kết quả an toàn
+  end
+  manifest -> db: [SQL] Ghi lại kết quả dọn dẹp + trạng thái RESET
+  reset -> obs: [HTTP/REST] audit việc reset + tham chiếu trace
+  obs --> reset: Đã ghi nhận
+  reset --> ctrl: Bản tóm tắt reset
+end
+
+@enduml
+----
+
+== Ghi chú biểu đồ (Diagram notes)
+
+* Tất cả các mũi tên sự kiện đều sử dụng EventBridge/SQS với cơ chế phân phối ít nhất một lần (at-least-once delivery); các consumer khử trùng lặp trước khi sinh ra side effect.
+* Mọi lệnh gọi provider đều sử dụng ranh giới adapter và các idempotency key ổn định; phản hồi của provider được chuẩn hóa trước khi lưu trữ bền vững.
+* `OrderPaid.v1` vẫn là sự kiện đơn hàng đã thanh toán chuẩn duy nhất (canonical fact); `PaymentPaid.v1` không kích hoạt xuất hóa đơn.
+* Demo Control Plane không bao giờ đọc hoặc ghi trực tiếp vào cơ sở dữ liệu của các service cha và chỉ được triển khai trên môi trường non-production.
+* Các tham chiếu X-Ray/OpenTelemetry đã được che giấu (redacted) và có thể suy giảm mà không làm thay đổi trạng thái nghiệp vụ; checkpoint sẽ ghi nhận chất lượng trace.

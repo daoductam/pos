@@ -1,0 +1,536 @@
+= Module 9 — AI Assistant Sequence Diagrams
+:toc:
+:sectnums:
+
+Started at: 2026/10/13 00:00:00  
+Finished at: 2026/10/13 00:00:00  
+Total time: 0 minutes
+
+== Scope and traceability
+
+Các sơ đồ dưới đây là **contract-driven design diagrams**. Repository chưa có AI Assistant/Reporting implementation source, nên participant/message được lấy từ Requirements và Architecture đã được user xác nhận; đây chưa phải runtime trace.
+
+* L1 biểu diễn system-level communication.
+* L2 biểu diễn component-level flow trong AI Assistant; repository/DAO được collapse vào database boundary.
+* Chat chỉ dùng read-only Reporting tools; Order/Payment/Inventory/Loyalty/Catalog không nằm trên mutation path.
+* DeepSeek không được nhận PII/raw transaction identity; Reporting là metric authority.
+
+== 1. P1 chat thành công
+
+=== 1.1 L1 — System Flow
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+
+title P1 Chat thành công — L1: Tool-backed Report Answer
+
+actor "Owner/Manager Dashboard" as ui
+participant "AI Assistant Service" as ai
+participant "Identity Access" as id
+participant "Reporting Service" as rep
+participant "DeepSeek Provider" as llm
+database "AI Assistant PostgreSQL" as db
+queue "EventBridge/SQS/DLQ" as bus
+participant "Audit/Observability" as audit
+
+ui -> ai: [HTTP/REST] POST /api/v1/ai/conversations/{id}/turns
+ai -> id: [HTTP/REST] Resolve ai:report:read + requested scope
+id --> ai: HTTP 200 allow + ResolvedScope + membershipVersion
+ai -> db: Persist idempotent turn + scope revision
+ai -> llm: [HTTP/REST] Redacted question + allowlisted tool schemas
+llm --> ai: Function call getSalesSummary(arguments)
+ai -> rep: [HTTP/REST] Internal reporting tool + trusted ResolvedScope
+rep --> ai: Aggregate facts + freshness + watermark + calculationVersion
+ai -> llm: [HTTP/REST] Structured facts for rendering
+llm --> ai: Valid answer schema + provenance wording
+ai -> db: Persist safe answer/tool metadata/response hash
+ai ->> bus: [EventBridge async] AIReportTurnCompleted.v1
+bus ->> audit: [SQS async] Redacted audit evidence
+ai --> ui: HTTP 200 ANSWERED + scope/period/source/freshness
+
+@enduml
+----
+
+=== 1.2 L2 — Internal Backend Flow
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+
+title P1 Chat thành công — L2: Internal Backend Flow
+
+participant "AI Assistant Controller" as ctrl
+participant "ScopePolicyEngine + IdentityClient" as scope
+participant "TurnOrchestrator" as orch
+participant "ToolGateway + ReportingClient" as tools
+participant "DeepSeekAdapter" as llm
+database "AI Assistant PostgreSQL" as db
+queue "OutboxPublisher" as outbox
+
+ctrl -> scope: resolveScope(request, ai:report:read)
+activate scope
+scope -> scope: Validate tenant/role/branch/membershipVersion
+scope --> ctrl: ResolvedScope / deny
+deactivate scope
+
+ctrl -> db: INSERT idempotent AI turn
+ctrl -> orch: executeTurn(turn, ResolvedScope)
+activate orch
+orch -> llm: [HTTP/REST] plan(question, toolSchemas)
+llm --> orch: functionCall
+orch -> tools: validateAndExecute(functionCall, ResolvedScope)
+activate tools
+tools -> tools: Validate tool/args/range/limit/redaction
+tools -> tools: [HTTP/REST] Reporting aggregate query
+tools --> orch: DataQualityEnvelope + facts
+deactivate tools
+orch -> llm: [HTTP/REST] render(structuredFacts)
+llm --> orch: AnswerSchema
+orch -> orch: Validate facts/provenance/wording
+orch -> db: UPDATE turn + tool metadata + hash
+orch -> outbox: INSERT AIReportTurnCompleted event
+deactivate orch
+ctrl --> ctrl: HTTP 200 response envelope
+
+@enduml
+----
+
+== 2. Scope refusal hoặc prompt injection
+
+=== 2.1 L1 — System Flow
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+
+title Scope/Prompt Refusal — L1: Fail Closed
+
+actor "Manager Dashboard" as ui
+participant "AI Assistant Service" as ai
+participant "Identity Access" as id
+participant "DeepSeek Provider" as llm
+participant "Reporting Service" as rep
+database "AI Assistant PostgreSQL" as db
+queue "EventBridge/SQS/DLQ" as bus
+
+ui -> ai: [HTTP/REST] POST turn
+ai -> id: [HTTP/REST] Resolve requested branch + ai:report:read
+
+alt Branch ngoài membership
+  id --> ai: HTTP 200 allowed=false / scope_not_allowed
+  ai -> db: Persist refusal + redacted scope summary
+  ai ->> bus: [EventBridge async] AIAccessRefused.v1
+  ai --> ui: HTTP 403 NEEDS_SCOPE/scope_not_allowed
+else Scope allowed, prompt injection detected
+  id --> ai: HTTP 200 allow + ResolvedScope
+  ai -> llm: [HTTP/REST] Redacted question + fixed policy
+  llm --> ai: Request SQL/system prompt/scope escalation
+  ai -> db: Persist policy refusal
+  ai ->> bus: [EventBridge async] AIAccessRefused.v1
+  ai --> ui: HTTP 200 UNSUPPORTED/refused; no tool call
+else Valid scope and unsupported intent
+  id --> ai: HTTP 200 allow + ResolvedScope
+  ai -> llm: [HTTP/REST] Classify allowlisted intent
+  llm --> ai: UNSUPPORTED
+  ai --> ui: HTTP 200 UNSUPPORTED + safe guidance
+end
+
+note over ai,rep
+Reporting is never called in any refusal branch.
+end note
+
+@enduml
+----
+
+=== 2.2 L2 — Internal Backend Flow
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+
+title Scope/Prompt Refusal — L2: Policy Boundary
+
+participant "AI Assistant Controller" as ctrl
+participant "ScopePolicyEngine + IdentityClient" as scope
+participant "TurnOrchestrator" as orch
+participant "ToolGateway + ReportingClient" as tools
+participant "DeepSeekAdapter" as llm
+database "AI Assistant PostgreSQL" as db
+queue "OutboxPublisher" as outbox
+
+ctrl -> scope: resolveScope(request)
+scope -> scope: Check membership/branch/permission
+alt Authorization denied
+  scope --> ctrl: DeniedDecision
+  ctrl -> db: Persist redacted refusal
+  ctrl -> outbox: Queue AIAccessRefused.v1
+  ctrl --> ctrl: HTTP 403
+else Authorization allowed
+  scope --> ctrl: ResolvedScope
+  ctrl -> orch: executeTurn
+  orch -> llm: [HTTP/REST] plan with fixed policy
+  alt Prompt injection or unknown intent
+    llm --> orch: Invalid/unsupported function intent
+    orch -> orch: Reject before ToolGateway
+    orch -> db: Persist safe refusal
+    orch -> outbox: Queue AIAccessRefused.v1
+  else Valid intent
+    llm --> orch: Valid function call
+    orch -> tools: validateAndExecute
+    tools -> tools: Scope/tool/range/policy validation
+    tools --> orch: Rejected before Reporting if invalid
+  end
+end
+
+@enduml
+----
+
+== 3. Reporting/provider failure
+
+=== 3.1 L1 — System Flow
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+
+title Reporting/Provider Failure — L1: Safe Structured Outcome
+
+actor "Owner/Manager Dashboard" as ui
+participant "AI Assistant Service" as ai
+participant "Identity Access" as id
+participant "Reporting Service" as rep
+participant "DeepSeek Provider" as llm
+database "AI Assistant PostgreSQL" as db
+queue "EventBridge/SQS/DLQ" as bus
+
+ui -> ai: [HTTP/REST] POST turn
+ai -> id: [HTTP/REST] Resolve scope
+id --> ai: HTTP 200 ResolvedScope
+ai -> llm: [HTTP/REST] Plan allowlisted tool
+llm --> ai: getSalesSummary
+ai -> rep: [HTTP/REST] Query aggregate + quality envelope
+
+alt Reporting stale/incomplete
+  rep --> ai: HTTP 200 STALE/INCOMPLETE + facts/watermark
+  ai -> db: Persist warning/partial state
+  ai --> ui: HTTP 200 STALE_DATA or PARTIAL + freshness warning
+else Reporting unavailable/timeout
+  rep --> ai: HTTP 503/reporting_unavailable
+  ai -> db: Persist failed tool state
+  ai --> ui: HTTP 503 safe error; no number invented
+else Reporting facts valid, DeepSeek timeout
+  rep --> ai: Facts + FRESH/COMPLETE
+  ai -> llm: [HTTP/REST] Render structured facts
+  llm --> ai: timeout/5xx
+  ai -> db: Persist provider failure + facts lineage
+  ai --> ui: HTTP 200 PARTIAL structured facts or 503 provider_unavailable
+end
+
+ai ->> bus: [EventBridge async] AIReportTurnCompleted.v1/status
+
+@enduml
+----
+
+=== 3.2 L2 — Internal Backend Flow
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+
+title Reporting/Provider Failure — L2: Bounded Retry and Fallback
+
+participant "AI Assistant Controller" as ctrl
+participant "ScopePolicyEngine + IdentityClient" as scope
+participant "TurnOrchestrator" as orch
+participant "ToolGateway + ReportingClient" as tools
+participant "DeepSeekAdapter" as llm
+database "AI Assistant PostgreSQL" as db
+queue "OutboxPublisher" as outbox
+
+ctrl -> scope: resolveScope
+scope --> ctrl: ResolvedScope
+ctrl -> orch: executeTurn
+orch -> llm: [HTTP/REST] plan
+llm --> orch: functionCall
+orch -> tools: executeValidatedTool
+alt Tool stale/incomplete
+  tools --> orch: Facts + quality warning
+  orch -> orch: Mark STALE_DATA/PARTIAL
+else Tool timeout/unavailable
+  tools --> orch: Typed tool error
+  orch -> orch: No unbounded retry; mark failure
+else Facts valid
+  tools --> orch: Facts + provenance
+  orch -> llm: [HTTP/REST] render
+  alt Provider timeout/invalid schema
+    llm --> orch: Error/invalid answer
+    orch -> orch: One bounded retry/repair if budget remains
+    orch -> orch: Fallback structured facts/error
+  else Answer valid
+    llm --> orch: AnswerSchema
+  end
+end
+orch -> db: Persist final safe state
+orch -> outbox: Queue completion/error event
+
+@enduml
+----
+
+== 4. P2 daily summary publish
+
+=== 4.1 L1 — System Flow
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+
+title Daily Summary — L1: Cutoff to Published Revision
+
+participant "Scheduler/Worker" as worker
+participant "AI Assistant Service" as ai
+participant "Reporting Service" as rep
+participant "DeepSeek Provider" as llm
+database "AI Assistant PostgreSQL" as db
+queue "EventBridge/SQS/DLQ" as bus
+participant "Owner/Manager Dashboard" as ui
+
+worker -> ai: [HTTP/REST] Create idempotent summary job
+ai -> db: INSERT SCHEDULED job
+worker -> ai: [HTTP/REST] Run job at cutoff + 15m
+ai -> rep: [HTTP/REST] Check freshness/completeness
+alt Not complete within wait policy
+  rep --> ai: WAITING_FOR_DATA/DATA_LATE
+  ai -> db: Persist waiting/terminal safe state
+  ai ->> bus: [EventBridge async] AIReportTurnCompleted.v1/status
+else Complete
+  rep --> ai: COMPLETE watermark
+  ai -> rep: [HTTP/REST] Resolve baseline + contribution drivers
+  rep --> ai: Facts + same-weekday/7-day baseline + drivers
+  ai -> llm: [HTTP/REST] Redacted structured summary facts
+  llm --> ai: SummarySchema
+  ai -> db: Persist immutable PUBLISHED revision
+  ai ->> bus: [EventBridge async] AIDailySummaryPublished.v1
+  ai --> ui: [HTTP/REST] Summary available in authorized scope
+end
+
+@enduml
+----
+
+=== 4.2 L2 — Internal Backend Flow
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+
+title Daily Summary — L2: Worker/Revision Flow
+
+participant "SummaryWorker" as worker
+participant "ScopePolicyEngine + IdentityClient" as scope
+participant "ToolGateway + ReportingClient" as tools
+participant "DeepSeekAdapter" as llm
+participant "SummaryValidator" as valid
+database "AI Assistant PostgreSQL" as db
+queue "OutboxPublisher" as outbox
+
+worker -> db: Claim SCHEDULED job lease
+worker -> scope: Resolve branch summary policy/scope
+scope --> worker: ResolvedScope + membership/policy version
+worker -> tools: Check completeness watermark
+alt Incomplete
+  tools --> worker: WAITING_FOR_DATA
+  worker -> db: Update job retry/terminal state
+else Complete
+  tools --> worker: COMPLETE
+  worker -> tools: getBaseline + getContributionDrivers
+  tools --> worker: Structured facts + calculationVersion
+  worker -> llm: [HTTP/REST] render structured summary
+  llm --> worker: SummarySchema
+  worker -> valid: validate numbers/baseline/wording/provenance
+  alt Invalid output
+    valid --> worker: Reject/one bounded repair
+    worker -> db: Persist PROVIDER_UNAVAILABLE/structured fallback
+  else Valid output
+    valid --> worker: Accepted
+    worker -> db: INSERT immutable summary revision
+    worker -> outbox: Queue AIDailySummaryPublished.v1
+  end
+end
+
+@enduml
+----
+
+== 5. P2 late fact and rerun
+
+=== 5.1 L1 — System Flow
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+
+title Daily Summary Late Fact — L1: New Revision Supersedes Old
+
+participant "Reporting Service" as rep
+queue "EventBridge/SQS/DLQ" as bus
+participant "Scheduler/Worker" as worker
+participant "AI Assistant Service" as ai
+participant "DeepSeek Provider" as llm
+database "AI Assistant PostgreSQL" as db
+participant "Owner/Manager Dashboard" as ui
+
+rep ->> bus: [EventBridge async] ReportProjectionWatermarkUpdated.v1
+bus ->> worker: [SQS async] Trigger affected business date
+worker -> ai: [HTTP/REST] Rerun with source watermark/idempotency key
+ai -> rep: [HTTP/REST] Read current completeness/baseline/contribution
+rep --> ai: Updated facts + watermark v902
+ai -> llm: [HTTP/REST] Render revised structured summary
+llm --> ai: SummarySchema
+ai -> db: INSERT revision 2; mark revision 1 SUPERSEDED
+ai ->> bus: [EventBridge async] AIDailySummarySuperseded.v1
+ai ->> bus: [EventBridge async] AIDailySummaryPublished.v1
+ai --> ui: [HTTP/REST] Revision 2 with lineage
+
+@enduml
+----
+
+=== 5.2 L2 — Internal Backend Flow
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+
+participant "SummaryWorker" as worker
+participant "ToolGateway + ReportingClient" as tools
+participant "DeepSeekAdapter" as llm
+participant "SummaryValidator" as valid
+database "AI Assistant PostgreSQL" as db
+queue "OutboxPublisher" as outbox
+
+worker -> db: Receive/claim watermark-triggered rerun
+worker -> db: Read current published revision/source watermark
+worker -> tools: Query freshness + updated contribution facts
+tools --> worker: New watermark/calculation version
+worker -> llm: [HTTP/REST] Render revised facts
+llm --> worker: SummarySchema
+worker -> valid: Validate lineage/numbers/wording
+valid --> worker: Accepted revision
+worker -> db: INSERT revision 2
+worker -> db: UPDATE revision 1 = SUPERSEDED
+worker -> outbox: Queue superseded + published events
+
+@enduml
+----
+
+== 6. Authorization revocation between turns
+
+=== 6.1 L1 — System Flow
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+
+actor "Manager Dashboard" as ui
+participant "Identity Access" as id
+queue "EventBridge/SQS/DLQ" as bus
+participant "AI Assistant Service" as ai
+database "AI Assistant PostgreSQL" as db
+participant "Reporting Service" as rep
+
+id ->> bus: [EventBridge async] AuthorizationContextChanged.v1
+bus ->> ai: [SQS async] Invalidate optimization only
+ui -> ai: [HTTP/REST] Next chat turn for prior branch
+ai -> id: [HTTP/REST] Resolve current ai:report:read
+id --> ai: HTTP 200 allowed=false membership revoked/narrowed
+ai -> db: Persist redacted AIAccessRefused evidence
+ai ->> bus: [EventBridge async] AIAccessRefused.v1
+ai --> ui: HTTP 403 scope_not_allowed
+note over ai,rep
+Reporting is not called after revocation.
+end note
+
+@enduml
+----
+
+=== 6.2 L2 — Internal Backend Flow
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+
+participant "AI Assistant Controller" as ctrl
+participant "ScopePolicyEngine + IdentityClient" as scope
+participant "TurnOrchestrator" as orch
+participant "ToolGateway + ReportingClient" as tools
+database "AI Assistant PostgreSQL" as db
+queue "OutboxPublisher" as outbox
+
+ctrl -> scope: resolveScope(current subject/permission)
+scope -> scope: Online Identity decision
+scope --> ctrl: DeniedDecision + current membershipVersion
+ctrl -> db: INSERT denied turn/audit reference
+ctrl -> outbox: Queue AIAccessRefused.v1
+ctrl --> ctrl: HTTP 403; do not invoke TurnOrchestrator
+note over orch,tools
+No provider/tool execution after denied authorization.
+end note
+
+@enduml
+----
+
+== Design invariants
+
+* Identity online decision is the authorization authority; client/LLM scope is never trusted.
+* Reporting tools return canonical aggregate facts, freshness and calculation version.
+* DeepSeek cannot call mutation endpoints or arbitrary SQL and receives no raw PII/transaction identity.
+* Every final answer/summary is schema-validated; provider failure never becomes invented business data.
+* Daily summary revisions are immutable and lineage-preserving; late facts supersede rather than overwrite.
+* Outbox/event delivery is at-least-once; consumers deduplicate by event ID/source version.
+

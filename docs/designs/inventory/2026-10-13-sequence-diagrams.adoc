@@ -1,0 +1,177 @@
+= Module 6 — Inventory service: Sequence diagrams
+:toc:
+:source-highlighter: highlight.js
+
+== Scope and confirmation
+
+These diagrams are design-level sequences based on the approved Inventory Architecture. No Inventory application source exists yet, so they document the intended contract flow rather than a runtime code trace.
+
+Confirmed participants and flows:
+
+* POS/Order starts checkout and Step Functions orchestrates the Saga.
+* Step Functions calls Inventory reserve, commit and release over internal REST.
+* Payment emits a verified payment fact to Saga; Inventory does not consume `PaymentPaid` directly.
+* Inventory uses PostgreSQL transactions, transactional outbox and EventBridge/SQS downstream delivery.
+* Inventory workers handle expiry, reconciliation scanning and outbox delivery without reopening terminal reservations.
+
+== L1 — Checkout Saga and Inventory system flow
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Inventory checkout reservation lifecycle — L1: System Flow
+
+actor "POS" as pos
+participant "Order Service" as order
+participant "Step Functions Saga" as saga
+participant "Inventory Service" as inv
+database "Inventory PostgreSQL" as db
+participant "Payment Service" as payment
+queue "EventBridge / SQS" as bus
+participant "Reporting / Audit / Notification" as downstream
+
+pos -> order: [HTTP/REST] POST checkout
+order -> saga: [HTTP/REST] start saga(attemptId, orderId, branchId)
+
+== Reserve ==
+saga -> inv: [HTTP/REST] POST /internal/v1/inventory/reservations
+activate inv
+inv -> db: Expand recipe, lock balances, increase reserved
+alt Insufficient stock or missing recipe
+  db --> inv: Rollback
+  inv --> saga: HTTP 409 insufficient_stock / recipe_missing
+  deactivate inv
+  saga -> order: [HTTP/REST] mark checkout failed
+  order --> pos: HTTP 409 CHECKOUT_FAILED
+else Reserved
+  db --> inv: Commit reservation + outbox
+  inv ->> bus: [EventBridge async] InventoryReserved.v1
+  inv --> saga: HTTP 201 RESERVED + reservationId + expiresAt
+  deactivate inv
+
+  == Payment and commit ==
+  saga -> payment: [HTTP/REST] initiate/capture payment
+  alt Payment failed or timeout
+    payment --> saga: PaymentFailed / timeout
+    saga -> inv: [HTTP/REST] POST reservation/release
+    inv -> db: Lock reservation, decrease reserved, write outbox
+    inv --> saga: HTTP 200 RELEASED
+    inv ->> bus: [EventBridge async] InventoryReservationReleased.v1
+    saga -> order: [HTTP/REST] mark checkout failed
+    order --> pos: CHECKOUT_FAILED
+  else Payment success
+    payment ->> saga: [EventBridge async] PaymentPaid.v1
+    saga -> inv: [HTTP/REST] POST reservation/commit
+    inv -> db: Lock reservation, lock balances, append SALE_COMMITTED
+    alt Commit succeeds
+      db --> inv: COMMITTED + outbox
+      inv ->> bus: [EventBridge async] InventoryReservationCommitted.v1
+      inv --> saga: HTTP 200 COMMITTED
+      saga -> order: [HTTP/REST] finalize Order
+      order ->> bus: [EventBridge async] OrderPaid.v1
+      order --> pos: PAID
+    else Commit terminal failure
+      db --> inv: Reconciliation case + outbox
+      inv ->> bus: [EventBridge async] InventoryReconciliationRequired.v1
+      inv --> saga: HTTP 409 reconciliation_required
+      saga -> order: [HTTP/REST] mark reconciliation required
+      order --> pos: CHECKOUT_FAILED + reconciliation status
+    end
+  end
+end
+
+== Downstream facts ==
+bus ->> downstream: Consume versioned Inventory/Order facts
+downstream --> downstream: Deduplicate by eventId and validate tenant scope
+@enduml
+----
+
+== L2 — Inventory internal transaction flow
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Inventory reservation commands — L2: Internal Backend Flow
+
+participant "Internal API Controller" as ctrl
+participant "Reservation Application Service" as app
+participant "Recipe Expansion Engine" as recipe
+participant "Stock Transaction Service" as stock
+database "Inventory PostgreSQL" as db
+participant "Outbox Publisher" as outbox
+participant "Expiry/Reconciliation Worker" as worker
+
+== Reserve ==
+ctrl -> app: reserve(request, idempotencyKey)
+activate app
+app -> app: Validate workload scope and request hash
+app -> db: Read active recipe versions
+db --> app: Recipe version rows
+app -> recipe: Expand item/variant/modifiers
+recipe --> app: Aggregated ingredient demand + snapshots
+app -> db: Begin transaction; revalidate recipe versions
+app -> stock: reserveDemand(demand)
+activate stock
+stock -> db: SELECT balance rows FOR UPDATE
+db --> stock: Sorted balances
+alt Any available < required
+  stock -> db: Rollback transaction
+  stock --> app: insufficient_stock
+else All available
+  stock -> db: Increase reserved and insert reservation lines
+  stock -> db: Insert InventoryReserved outbox
+  stock -> db: Commit transaction
+  stock --> app: RESERVED
+end
+deactivate stock
+app --> ctrl: HTTP response
+deactivate app
+
+== Commit or release ==
+ctrl -> app: commit/release(reservationId, context)
+activate app
+app -> db: Begin transaction; SELECT reservation FOR UPDATE
+alt Reservation is terminal
+  db --> app: Current terminal state
+  app --> ctrl: Idempotent result or typed conflict
+else Reservation is RESERVED
+  app -> stock: Apply terminal mutation
+  activate stock
+  stock -> db: SELECT balance rows FOR UPDATE in ingredientId order
+  alt Commit
+    stock -> db: Insert SALE_COMMITTED; decrease reserved/onHand
+    stock -> db: Set reservation COMMITTED; insert outbox
+  else Release or expiry
+    stock -> db: Decrease reserved; set RELEASED/EXPIRED; insert outbox
+  end
+  stock -> db: Commit transaction
+  stock --> app: Terminal result
+  deactivate stock
+end
+app --> ctrl: HTTP response
+deactivate app
+
+== Background workers ==
+worker -> db: Claim expired reservations / reconciliation cases
+worker -> db: Apply only allowed idempotent state/alert updates
+worker -> outbox: Publish pending outbox messages
+outbox ->> outbox: Retry with lease; route permanent failure to DLQ
+@enduml
+----
+
+== Race and failure notes
+
+* Reservation row lock is acquired before balance locks for commit/release/expiry.
+* The first transaction acquiring the reservation lock is the terminal winner.
+* Reserve locks only sorted balance rows and aggregates demand before locking.
+* A failed reserve rolls back all ingredient holds; there is no partial reservation.
+* `PaymentPaid.v1` is consumed by Saga, not by Inventory.
+* `RECONCILIATION_REQUIRED` is terminal; workers never reopen it or silently consume stock.

@@ -1,0 +1,601 @@
+= Module 10 — Reporting & Dashboard Sequence Diagrams
+:toc:
+:sectnums:
+
+Started at: 2026/10/13 00:00:00  
+Finished at: 2026/10/13 00:00:00  
+Total time: 0 minutes
+
+== Scope and traceability
+
+Các sơ đồ dưới đây là **contract-driven design diagrams**. Repository chưa có Reporting implementation source, nên participant/message được lấy từ Requirements và Architecture đã được user xác nhận; đây chưa phải runtime code trace.
+
+* L1 biểu diễn system-level communication.
+* L2 biểu diễn các component quan trọng bên trong Reporting; repository/DAO được collapse vào database boundary.
+* Dashboard chỉ đọc Reporting read model; không query chéo database domain.
+* Mọi flow giữ tenant/branch scope, watermark, projection version và data-quality semantics.
+
+== 1. P0 `OrderPaid` projection thành công
+
+=== 1.1 L1 — System Flow
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title P0 OrderPaid projection thành công — L1
+
+participant "Order Service" as order
+queue "EventBridge/SQS/DLQ" as bus
+participant "Reporting Projection Worker" as worker
+database "Reporting PostgreSQL" as db
+participant "Audit/Observability" as audit
+
+order ->> bus: [EventBridge async] publish OrderPaid.v1
+bus ->> worker: [SQS async] deliver event
+worker -> db: Validate tenant/branch + inbox dedupe
+db --> worker: New source event
+worker -> db: Upsert sales/top-items/employee/promotion read models
+worker -> db: Advance watermark + projection version
+db --> worker: Commit applied projection
+worker --> bus: ACK after commit
+worker ->> audit: [EventBridge async] projection applied/lag metric
+
+@enduml
+----
+
+=== 1.2 L2 — Internal Projection Flow
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title P0 OrderPaid projection thành công — L2
+
+participant "SQS Consumer" as consumer
+participant "EventValidator + Dedupe" as validator
+participant "ProjectionRouter" as router
+participant "MetricProjectionHandlers" as handler
+participant "WatermarkManager" as wm
+database "Reporting PostgreSQL" as db
+queue "Outbox/Telemetry" as outbox
+
+consumer -> validator: validateEnvelopeAndScope(OrderPaid)
+activate validator
+validator -> db: INSERT inbox event / unique source key
+db --> validator: accepted
+deactivate validator
+validator -> router: route(OrderPaid.v1)
+router -> handler: applyPaidOrderSnapshot()
+activate handler
+handler -> db: Upsert daily/branch/hour/employee/top-item/promo rows
+handler --> wm: affected scopes + source watermark
+deactivate handler
+wm -> db: Advance watermark atomically
+db --> wm: committed projection version
+wm ->> outbox: publish cache invalidation/lag telemetry
+consumer --> consumer: ACK after transaction commit
+
+@enduml
+----
+
+== 2. Duplicate hoặc out-of-order event
+
+=== 2.1 L1 — System Flow
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Duplicate/out-of-order event — L1
+
+participant "Order/Correction Producer" as producer
+queue "EventBridge/SQS/DLQ" as bus
+participant "Reporting Projection Worker" as worker
+database "Reporting PostgreSQL" as db
+participant "Audit/Observability" as audit
+
+producer ->> bus: [EventBridge async] publish event retry/late correction
+bus ->> worker: [SQS async] deliver duplicate or older version
+worker -> db: Check eventId/source key + current source version
+alt Duplicate event
+  db --> worker: IGNORED_DUPLICATE
+  worker ->> audit: [EventBridge async] dedupe metric
+else Older source version
+  db --> worker: IGNORE stale correction
+  worker ->> audit: [EventBridge async] out-of-order metric
+else Newer correction
+  worker -> db: Apply correction + advance watermark atomically
+  db --> worker: Projection committed
+end
+worker --> bus: ACK after decision/commit
+
+@enduml
+----
+
+=== 2.2 L2 — Dedupe and Version Flow
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Duplicate/out-of-order event — L2
+
+participant "ProjectionConsumer" as consumer
+participant "EventValidator" as validator
+participant "DedupeVersionPolicy" as policy
+database "Reporting PostgreSQL" as db
+participant "CorrectionProjectionHandler" as handler
+queue "DLQ/Telemetry" as dlq
+
+consumer -> validator: validate schema/tenant/source version
+validator -> policy: classify(eventId, sourceKey, sourceVersion)
+policy -> db: Read inbox + current watermark
+db --> policy: prior event/version state
+alt Duplicate
+  policy -> db: Mark IGNORED_DUPLICATE
+else Older
+  policy -> db: Mark ignored stale version
+else Invalid schema/scope
+  policy ->> dlq: Quarantine with redacted reason
+else Newer
+  policy -> handler: apply correction/recompute bounded aggregate
+  handler -> db: Update rows + source lineage + watermark
+end
+consumer --> consumer: ACK only after terminal transaction
+
+@enduml
+----
+
+== 3. Dashboard KPI query cache miss/hit
+
+=== 3.1 L1 — System Flow
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Dashboard KPI query — L1
+
+actor "Owner/Manager" as user
+participant "Dashboard Angular" as ui
+participant "Reporting Query API" as api
+participant "Identity Access" as id
+database "Redis Cache" as cache
+database "Reporting PostgreSQL" as db
+
+user -> ui: Select branch/period/widget
+ui -> api: [HTTP/REST] GET /api/v1/reports/dashboard/overview
+api -> id: [HTTP/REST] Resolve report:read scope
+id --> api: ResolvedScope + authorizationVersion
+api -> cache: Read scope-safe key
+alt Cache hit
+  cache --> api: Response + dataQuality
+else Cache miss
+  api -> db: SELECT pre-aggregates with tenant/branch predicate
+  db --> api: Rows + watermark/projection version
+  api -> cache: Write max 15s scope-safe response
+end
+api --> ui: HTTP 200 data + freshness/watermark
+ui --> user: Render KPI/cards/status
+
+@enduml
+----
+
+=== 3.2 L2 — Query and Cache Flow
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Dashboard KPI query — L2
+
+participant "ReportController" as ctrl
+participant "ReportScopeResolver" as scope
+participant "ReportFilterPolicy" as policy
+participant "ReportCacheAdapter" as cache
+participant "ReportQueryService" as query
+database "Reporting PostgreSQL" as db
+
+ctrl -> scope: resolve current report:read scope
+scope -> policy: normalizeScopeAndFilters()
+policy --> scope: period/timezone/branch policy
+scope -> cache: get(scopeHash + normalizedFilterHash + watermark)
+alt Hit
+  cache --> ctrl: cached envelope
+else Miss
+  scope -> query: queryOverview(resolvedScope, filters)
+  query -> db: SELECT indexed pre-aggregates
+  db --> query: rows + watermark state
+  query --> scope: response envelope
+  scope -> cache: put(response, TTL <= 15s)
+  scope --> ctrl: response envelope
+end
+ctrl --> ctrl: Map standard {data, meta} response
+
+@enduml
+----
+
+== 4. Manager truy cập branch trái phép hoặc membership bị revoke
+
+=== 4.1 L1 — System Flow
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Unauthorized branch/drill-down — L1
+
+actor "Manager" as user
+participant "Dashboard Angular" as ui
+participant "Reporting Query API" as api
+participant "Identity Access" as id
+database "Redis Cache" as cache
+database "Reporting PostgreSQL" as db
+participant "Audit/Observability" as audit
+
+user -> ui: Select forged/removed branch ID
+ui -> api: [HTTP/REST] GET report with branchIds
+api -> id: [HTTP/REST] Resolve current report:read scope
+alt Branch outside membership/revoked
+  id --> api: allowed=false, safe denial
+  api ->> audit: [EventBridge async] redacted scope refusal
+  api --> ui: HTTP 403/409 scope_not_allowed
+else Allowed subset
+  id --> api: ResolvedScope
+  api -> cache: Lookup only with authorized scope hash
+  api -> db: Query with tenant/branch predicates
+  db --> api: Authorized rows
+  api --> ui: HTTP 200 report
+end
+ui --> user: Safe error or report; no foreign branch enumeration
+
+@enduml
+----
+
+=== 4.2 L2 — Scope Enforcement Flow
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Unauthorized branch/drill-down — L2
+
+participant "ReportController" as ctrl
+participant "ReportScopeResolver" as scope
+participant "ReportPolicyEngine" as policy
+participant "ReportCacheAdapter" as cache
+database "Reporting PostgreSQL" as db
+queue "AuditPublisher" as audit
+
+ctrl -> scope: resolve(subject, tenant, requestedBranches)
+scope -> policy: validate role/membership/scope subset
+alt Denied
+  policy --> scope: safe denial code
+  scope ->> audit: publish redacted refusal
+  scope --> ctrl: forbidden/scope_not_allowed
+  ctrl --> ctrl: no cache lookup, no DB query
+else Allowed
+  policy --> scope: ResolvedScope + authorizationVersion
+  scope -> cache: key includes scope/version
+  cache --> scope: hit/miss
+  scope -> db: Query with generated tenant/branch predicate
+  db --> scope: only authorized rows
+  scope --> ctrl: report envelope
+end
+
+@enduml
+----
+
+== 5. Recommendation attribution pending to paid
+
+=== 5.1 L1 — System Flow
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Recommendation attribution pending to paid — L1
+
+participant "Recommendation Service" as rec
+queue "EventBridge/SQS/DLQ" as bus
+participant "Reporting Projection Worker" as worker
+database "Reporting PostgreSQL" as db
+participant "Order Service" as order
+participant "Dashboard" as ui
+
+rec ->> bus: [EventBridge async] SuggestionShown.v1
+rec ->> bus: [EventBridge async] SuggestionAccepted.v1
+bus ->> worker: [SQS async] interaction events
+worker -> db: Store exposure/accepted pending attribution
+order ->> bus: [EventBridge async] OrderPaid.v1
+bus ->> worker: [SQS async] paid order
+worker -> db: Resolve same order/cart context
+alt Valid paid accepted cohort
+  worker -> db: Upsert accepted/control AOV cohort once per order
+else Missing/invalid correlation
+  worker -> db: Mark pending/error quality state
+end
+ui -> worker: [HTTP/REST] query recommendation effectiveness
+worker --> ui: [HTTP/REST] acceptance + cohort AOV + dataQuality
+
+@enduml
+----
+
+=== 5.2 L2 — Attribution Projection Flow
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Recommendation attribution pending to paid — L2
+
+participant "InteractionConsumer" as consumer
+participant "AttributionResolver" as resolver
+participant "RecommendationProjectionHandler" as handler
+participant "WatermarkManager" as wm
+database "Reporting PostgreSQL" as db
+queue "DLQ/Telemetry" as dlq
+
+consumer -> resolver: ingest shown/accepted interaction
+resolver -> db: find same order/cart context
+alt OrderPaid not received
+  resolver -> db: Store PENDING attribution
+else Paid context available
+  resolver -> handler: materialize shown/accepted cohort
+  handler -> db: Upsert unique accepted/control order cohort
+  handler -> wm: advance recommendation watermark
+  wm -> db: commit watermark/version
+else Invalid correlation
+  resolver ->> dlq: quarantine attribution error
+end
+consumer --> consumer: ACK after decision/commit
+
+@enduml
+----
+
+== 6. Promotion version revenue projection
+
+=== 6.1 L1 — System Flow
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Promotion version revenue projection — L1
+
+participant "Order Service" as order
+queue "EventBridge/SQS/DLQ" as bus
+participant "Reporting Projection Worker" as worker
+database "Reporting PostgreSQL" as db
+participant "Dashboard" as ui
+
+order ->> bus: [EventBridge async] OrderPaid.v1 + immutable promotion breakdown
+bus ->> worker: [SQS async] deliver paid fact
+worker -> db: Validate promotion version/allocation
+alt Allocation valid
+  worker -> db: Upsert promotion_effectiveness by rule version
+else Allocation missing/invalid
+  worker -> db: Store UNALLOCATED_PROMOTION + PARTIAL marker
+end
+worker -> db: Advance source watermark
+ui -> worker: [HTTP/REST] GET promotion effectiveness
+worker --> ui: [HTTP/REST] version metrics + allocation/data quality
+
+@enduml
+----
+
+=== 6.2 L2 — Promotion Projection Flow
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Promotion version revenue projection — L2
+
+participant "ProjectionConsumer" as consumer
+participant "PromotionAllocationValidator" as validator
+participant "PromotionProjectionHandler" as handler
+database "Reporting PostgreSQL" as db
+participant "WatermarkManager" as wm
+queue "Outbox/Telemetry" as outbox
+
+consumer -> validator: validate immutable rule version/allocation
+validator -> db: Check inbox + promotion source key
+alt Valid allocation
+  validator -> handler: apply promotion cohort
+  handler -> db: Upsert counts/gross/discount/net by version
+else Unallocated
+  validator -> handler: apply UNALLOCATED_PROMOTION marker
+  handler -> db: Upsert partial allocation row
+end
+handler -> wm: report source watermark
+wm -> db: Commit watermark + projection version
+wm ->> outbox: invalidate affected promotion cache
+
+@enduml
+----
+
+== 7. Late refund/correction
+
+=== 7.1 L1 — System Flow
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Late refund/correction — L1
+
+participant "Order/Correction Producer" as producer
+queue "EventBridge/SQS/DLQ" as bus
+participant "Reporting Projection Worker" as worker
+database "Reporting PostgreSQL" as db
+database "Redis Cache" as cache
+participant "Dashboard" as ui
+
+producer ->> bus: [EventBridge async] approved refund/correction event
+bus ->> worker: [SQS async] late effective fact
+worker -> db: Apply monotonic correction/recompute bounded aggregates
+db --> worker: New asOfWatermark/projection version
+worker -> cache: Invalidate affected scope/period namespace
+ui -> worker: [HTTP/REST] query current dashboard
+worker -> db: Read corrected current view
+db --> worker: Current metrics + watermark
+worker --> ui: [HTTP/REST] corrected metrics + asOfWatermark
+
+@enduml
+----
+
+=== 7.2 L2 — Correction and Cache Invalidation
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Late refund/correction — L2
+
+participant "CorrectionConsumer" as consumer
+participant "CorrectionPolicy" as policy
+participant "MetricProjectionHandlers" as handler
+database "Reporting PostgreSQL" as db
+participant "WatermarkManager" as wm
+database "Redis Cache" as cache
+
+consumer -> policy: validate effective version/refund scope
+policy -> db: read current source lineage
+alt Duplicate/older correction
+  db --> policy: no-op decision
+else New correction
+  policy -> handler: recompute affected aggregates
+  handler -> db: update current rows + lineage
+  handler -> wm: advance watermark/version
+  wm -> db: atomic commit
+  wm -> cache: invalidate affected namespace
+end
+consumer --> consumer: ACK after transaction/invalidation signal
+
+@enduml
+----
+
+== 8. Projection rebuild/replay
+
+=== 8.1 L1 — System Flow
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Projection rebuild/replay — L1
+
+actor "Authorized Ops" as ops
+participant "Reporting Query API" as api
+participant "Rebuild Worker" as worker
+queue "Event Archive/EventBridge" as bus
+database "Reporting PostgreSQL" as db
+database "Redis Cache" as cache
+participant "Audit/Observability" as audit
+
+ops -> api: [HTTP/REST] POST /internal/v1/reporting/rebuilds
+api -> worker: [HTTP/REST] enqueue bounded rebuild job
+worker ->> audit: [EventBridge async] audit rebuild requested
+worker -> bus: [SQS async] read source events by range
+bus --> worker: events/source watermark
+worker -> db: Write target projection version
+alt Validation complete
+  worker -> db: Atomic current pointer/version swap
+  worker -> cache: Invalidate affected scope/period
+  worker ->> audit: [EventBridge async] rebuild completed
+  api --> ops: 202/200 COMPLETED
+else Failure/DLQ
+  worker ->> audit: [EventBridge async] rebuild failed + safe error
+  api --> ops: 202/FAILED or 409 conflict
+end
+
+@enduml
+----
+
+=== 8.2 L2 — Rebuild Worker Flow
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Projection rebuild/replay — L2
+
+participant "RebuildController" as ctrl
+participant "RebuildWorker" as worker
+participant "SourceEventReader" as reader
+participant "ProjectionHandlers" as handlers
+database "Reporting PostgreSQL" as db
+participant "WatermarkManager" as wm
+database "Redis Cache" as cache
+
+ctrl -> worker: claim idempotent rebuild operation
+worker -> db: create target projection version + lease
+loop bounded source event pages
+  worker -> reader: read events after checkpoint
+  reader --> worker: event page
+  worker -> handlers: apply to target projection
+  handlers -> db: upsert target rows/dedupe
+end
+worker -> wm: validate counts/watermark/completeness
+alt Validation passed
+  wm -> db: atomic current pointer swap
+  wm -> cache: invalidate target scope/period
+  worker -> db: mark COMPLETED
+else Validation failed
+  worker -> db: mark FAILED/DLQ reason
+end
+worker --> ctrl: operation status
+
+@enduml
+----
+

@@ -1,0 +1,575 @@
+= Module 7 — Ca làm việc: Sequence Diagrams
+:toc:
+:sectnums:
+
+Ngày: 2026-10-13
+
+Các sơ đồ dưới đây là design-level diagrams. Shift service chưa có implementation source trong repository; các service ngoài boundary được biểu diễn theo contracts đã xác nhận.
+
+== Danh sách các thành phần tham gia (Participants)
+
+L1 dùng các participant ở system boundary: POS Client, Shift Service, Order/Checkout Saga, Payment Service, Shift PostgreSQL, EventBridge/SQS và Reporting/Audit.
+
+L2 dùng các participant có ý nghĩa kiến trúc trong Shift Service: Controller, Application Service, Admission/Fence Coordinator, Cash Summary/Reconciliation Engine, Shift DB và Outbox/Close Worker.
+
+== 1. Tranh chấp mở ca (Open race) — L1: Luồng hệ thống (System Flow)
+
+[plantuml,shift-open-race-l1,svg]
+....
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Shift Open Race — L1: System Flow
+
+actor "POS Client" as pos
+participant "Shift Service" as shift
+database "Shift PostgreSQL" as db
+queue "EventBridge/SQS" as bus
+participant "Reporting/Audit" as consumers
+
+par Thu ngân A
+  pos -> shift: [HTTP/REST] POST /api/v1/branches/{branchId}/shifts
+  shift -> db: Khóa slot chi nhánh + kiểm tra ca active
+  db --> shift: Slot khả dụng
+  shift -> db: Chèn ca ACTIVE + outbox ShiftOpened
+  db --> shift: Commit ca của thu ngân A
+  shift --> pos: HTTP 201 Shift A ACTIVE
+else Thu ngân B mở đồng thời
+  pos -> shift: [HTTP/REST] POST /api/v1/branches/{branchId}/shifts
+  shift -> db: Chờ slot chi nhánh / kiểm tra ràng buộc duy nhất
+  db --> shift: Đã tồn tại ca A đang ACTIVE
+  shift --> pos: HTTP 409 shift_already_open
+end
+
+shift ->> bus: [EventBridge async] phát sự kiện ShiftOpened.v1
+bus ->> consumers: [SQS async] tiêu thụ sự kiện lũy nghiệm
+@enduml
+....
+
+== 1. Tranh chấp mở ca (Open race) — L2: Luồng nội bộ backend (Internal Flow)
+
+[plantuml,shift-open-race-l2,svg]
+....
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Shift Open Race — L2: Internal Backend Flow
+
+participant Controller as ctrl
+participant ShiftApplicationService as app
+participant AdmissionFenceCoordinator as fence
+database "Shift DB" as db
+queue "Outbox/Close Worker" as worker
+
+par Yêu cầu A
+  ctrl -> app: openShift(request A)
+  app -> app: Thẩm định tenant/chi nhánh/vai trò/idempotency
+  app -> fence: acquireOpenSlot()
+  fence -> db: SELECT branch/active slot FOR UPDATE
+  db --> fence: Slot khả dụng
+  fence -> db: INSERT shift + outbox
+  db --> fence: Commit ca A ACTIVE
+  fence --> app: Shift A
+  app --> ctrl: 201 Shift A
+else Yêu cầu B
+  ctrl -> app: openShift(request B)
+  app -> fence: acquireOpenSlot()
+  fence -> db: SELECT branch/active slot FOR UPDATE
+  db --> fence: Ca A đã tồn tại
+  fence --> app: shift_already_open
+  app --> ctrl: 409 Conflict
+end
+
+worker -> db: Xuất bản outbox ShiftOpened đang chờ
+@enduml
+....
+
+== 2. Tiếp nhận trước và sau rào chắn đóng ca (Admission before/after fence) — L1: Luồng hệ thống (System Flow)
+
+[plantuml,shift-admission-fence-l1,svg]
+....
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Admission Before/After Close Fence — L1: System Flow
+
+actor "POS Client" as pos
+participant "Order Service / Checkout Saga" as order
+participant "Shift Service" as shift
+participant "Payment Service" as payment
+database "Shift PostgreSQL" as db
+
+pos -> order: [HTTP/REST] Bắt đầu checkout kèm shiftId
+order -> shift: [HTTP/REST] POST internal transaction-admissions
+shift -> db: Khóa ca ACTIVE, tăng admission_seq
+db --> shift: admissionId=A, seq=N
+shift --> order: HTTP 201 Admission A
+order --> pos: Tiếp nhận checkout để xử lý
+
+par Đóng ca tranh chấp với thanh toán
+  pos -> shift: [HTTP/REST] POST close
+  shift -> db: Khóa ca; chuyển pha OPEN -> CLOSING
+  db --> shift: closeFenceSeq=N
+  shift --> pos: HTTP 202 closeStatus=PROCESSING
+else Tiếp nhận hiện có hoàn tất thành công
+  order -> payment: [HTTP/REST] Khởi tạo thanh toán tiền mặt với admissionId=A
+  payment -> shift: [HTTP/REST] POST cash fact/completion cho admission A
+  shift -> db: Chấp nhận fact seq N; đánh dấu admission kết thúc
+  db --> shift: Fact đã khử trùng lặp và commit
+  shift --> payment: HTTP 202/200 accepted
+end
+
+order -> shift: [HTTP/REST] Yêu cầu tiếp nhận mới sau rào chắn
+shift -> db: Quan sát thấy pha CLOSING
+db --> shift: Từ chối tiếp nhận
+shift --> order: HTTP 409 transaction_after_close_fence
+@enduml
+....
+
+== 2. Tiếp nhận trước và sau rào chắn đóng ca (Admission before/after fence) — L2: Luồng nội bộ backend (Internal Flow)
+
+[plantuml,shift-admission-fence-l2,svg]
+....
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Admission Before/After Close Fence — L2: Internal Backend Flow
+
+participant Controller as ctrl
+participant ShiftApplicationService as app
+participant AdmissionFenceCoordinator as fence
+participant CashSummaryReconciliationEngine as cash
+database "Shift DB" as db
+participant "Outbox/Close Worker" as worker
+
+par Yêu cầu tiếp nhận chiếm được khóa hàng (row lock)
+  ctrl -> app: admitTransaction(request)
+  app -> fence: admit(request)
+  fence -> db: Khóa ca + xác thực pha OPEN
+  db --> fence: seq N, admission A
+  fence -> db: Chèn bản ghi admission A
+  fence --> app: admission A
+  app --> ctrl: 201 admission A
+else Lệnh đóng ca chiếm được khóa hàng
+  ctrl -> app: closeShift(request)
+  app -> fence: establishFence(shift)
+  fence -> db: Khóa ca + chuyển pha OPEN -> CLOSING
+  db --> fence: closeFenceSeq=N
+  fence --> app: thao tác đóng ca PROCESSING
+  app --> ctrl: 202 PROCESSING
+end
+
+worker -> db: Thăm dò các admission trước rào chắn
+worker -> cash: finalizeWhenTerminal(shift, fence)
+cash -> db: Đọc các fact đã khử trùng lặp + watermark admission
+db --> cash: Tóm tắt hoàn tất hoặc chưa giải quyết
+@enduml
+....
+
+== 3. Đóng ca P0 (P0 close) — L1: Luồng hệ thống (System Flow)
+
+[plantuml,shift-p0-close-l1,svg]
+....
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title P0 Close Shift — L1: System Flow
+
+actor "Thu ngân / Quản lý" as user
+participant "Shift Service" as shift
+participant "Payment Service" as payment
+database "Shift PostgreSQL" as db
+queue "EventBridge/SQS" as bus
+participant "Reporting/Audit" as consumers
+
+user -> shift: [HTTP/REST] POST /api/v1/shifts/{shiftId}/close
+shift -> db: Khóa ca ACTIVE; chuyển pha OPEN -> CLOSING
+db --> shift: Rào chắn đã commit
+shift --> user: HTTP 202 closeStatus=PROCESSING
+
+loop Cho đến khi tất cả admission trước rào chắn kết thúc
+  shift -> db: Đọc các admission đang chờ <= closeFenceSeq
+  db --> shift: Trạng thái admission / watermark fact
+end
+
+alt Quá trình drain hoàn tất
+  shift -> db: CLOSING/FROZEN -> CLOSED + audit + outbox ShiftClosed
+  db --> shift: Commit đóng ca kết thúc
+  shift --> user: HTTP 200 CLOSED
+  shift ->> bus: [EventBridge async] phát sự kiện ShiftClosed.v1
+  bus ->> consumers: [SQS async] tiêu thụ sự kiện đóng ca
+else Drain timeout hoặc sự kiện chưa giải quyết
+  shift -> db: CLOSING -> PENDING_REVIEW + hồ sơ ca đối soát
+  db --> shift: Commit trạng thái chờ duyệt an toàn
+  shift --> user: HTTP 200 PENDING_REVIEW
+end
+
+payment -> shift: [HTTP/REST] Sự kiện đến trễ với admission sau rào chắn
+shift -> db: Tạo hồ sơ đối soát; không làm thay đổi ca đã đóng
+@enduml
+....
+
+== 3. Đóng ca P0 (P0 close) — L2: Luồng nội bộ backend (Internal Flow)
+
+[plantuml,shift-p0-close-l2,svg]
+....
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title P0 Close Shift — L2: Internal Backend Flow
+
+participant Controller as ctrl
+participant ShiftApplicationService as app
+participant AdmissionFenceCoordinator as fence
+participant CashSummaryReconciliationEngine as cash
+database "Shift DB" as db
+participant "Outbox/Close Worker" as worker
+
+ctrl -> app: closeShift(command)
+app -> fence: establishFence(shiftId)
+fence -> db: Khóa hàng; thiết lập CLOSING + số thứ tự/thời điểm rào chắn
+db --> fence: Phiên bản rào chắn
+fence --> app: Thao tác đóng ca
+app --> ctrl: 202 PROCESSING
+
+worker -> db: Nạp các admission trước rào chắn đang chờ
+worker -> cash: drainAndSummarize(shift, fence)
+cash -> db: Đọc các admission + sự kiện tiền mặt
+db --> cash: Kết thúc hoặc chưa giải quyết
+
+alt Tất cả giao dịch kết thúc
+  cash --> worker: Tóm tắt hoàn tất
+  worker -> db: Thiết lập FROZEN/CLOSED + outbox + audit
+  db --> worker: Commit
+else Quá thời gian chờ (Timeout)
+  cash --> worker: Còn admission trước rào chắn chưa giải quyết
+  worker -> db: Thiết lập PENDING_REVIEW + hồ sơ đối soát
+  db --> worker: Commit trạng thái an toàn
+end
+@enduml
+....
+
+== 4. Kiểm đếm và phê duyệt P1 (P1 count and review) — L1: Luồng hệ thống (System Flow)
+
+[plantuml,shift-p1-review-l1,svg]
+....
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title P1 Count and Review — L1: System Flow
+
+actor "Thu ngân" as cashier
+actor "Quản lý / Chủ chuỗi" as manager
+participant "Shift Service" as shift
+participant "Payment Service" as payment
+database "Shift PostgreSQL" as db
+queue "EventBridge/SQS" as bus
+participant "Reporting/Audit" as consumers
+
+cashier -> shift: [HTTP/REST] Đóng ca kèm countedCashMinor
+shift -> db: Thiết lập rào chắn + drain admission
+payment -> shift: [HTTP/REST] Sự kiện tiền mặt kèm admissionId
+shift -> db: Khử trùng lặp fact và tính toán tiền mặt kỳ vọng
+db --> shift: Ảnh chụp tiền kỳ vọng, tiền lệch, ngưỡng lệch
+
+alt Nằm trong ngưỡng cho phép
+  shift -> db: Chèn bản ghi đếm bất biến; ACTIVE -> CLOSED
+  shift ->> bus: [EventBridge async] ShiftCountSubmitted + ShiftClosed
+  shift --> cashier: HTTP 200 CLOSED
+else Vượt ngưỡng cho phép
+  shift -> db: Chèn bản ghi đếm bất biến; ACTIVE -> PENDING_REVIEW
+  shift ->> bus: [EventBridge async] ShiftReviewRequired.v1
+  shift --> cashier: HTTP 200 PENDING_REVIEW
+  manager -> shift: [HTTP/REST] Phê duyệt kết quả đếm mới nhất
+  shift -> db: Khóa ca + kiểm tra phiên bản review qua If-Match
+  db --> shift: Phiên bản hợp lệ
+  shift -> db: PENDING_REVIEW -> CLOSED + audit/outbox
+  shift --> manager: HTTP 200 CLOSED
+end
+
+bus ->> consumers: [SQS async] Tiêu thụ sự kiện kiểm đếm / xem xét / đóng ca
+@enduml
+....
+
+== 4. Kiểm đếm và phê duyệt P1 (P1 count and review) — L2: Luồng nội bộ backend (Internal Flow)
+
+[plantuml,shift-p1-review-l2,svg]
+....
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title P1 Count and Review — L2: Internal Backend Flow
+
+participant Controller as ctrl
+participant ShiftApplicationService as app
+participant AdmissionFenceCoordinator as fence
+participant CashSummaryReconciliationEngine as cash
+database "Shift DB" as db
+participant "Outbox/Close Worker" as worker
+
+ctrl -> app: closeWithCount(command)
+app -> fence: establishFenceAndDrain()
+fence -> db: Thiết lập CLOSING; đọc watermark admission
+db --> fence: Tính toàn vẹn của rào chắn/fact
+fence -> cash: calculateExpectedCash(snapshot)
+cash -> db: Đọc tiền đầu ca + sự kiện tiền mặt + chính sách
+db --> cash: expected / discrepancy / threshold
+
+alt Trong ngưỡng cho phép
+  cash --> app: Đủ điều kiện đóng
+  app -> db: Chèn bản ghi đếm bất biến + CLOSED + outbox
+  db --> app: Commit
+else Vượt ngưỡng
+  cash --> app: Yêu cầu xem xét duyệt
+  app -> db: Chèn bản ghi đếm bất biến + PENDING_REVIEW + outbox
+  db --> app: Commit trạng thái chờ duyệt
+  ctrl -> app: approveCount(If-Match)
+  app -> db: Khóa lượt đếm mới nhất + thẩm định phiên bản review
+  db --> app: Phiên bản hợp lệ
+  app -> db: CLOSED + audit phê duyệt + outbox
+end
+
+worker -> db: Xuất bản các sự kiện đang chờ
+@enduml
+....
+
+== 5. Đếm lại (Recount) — L1: Luồng hệ thống (System Flow)
+
+[plantuml,shift-recount-l1,svg]
+....
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Recount — L1: System Flow
+
+actor "Thu ngân" as cashier
+actor "Quản lý / Chủ chuỗi" as manager
+participant "Shift Service" as shift
+database "Shift PostgreSQL" as db
+queue "EventBridge/SQS" as bus
+
+manager -> shift: [HTTP/REST] Yêu cầu đếm lại lượt đếm mới nhất
+shift -> db: Khóa PENDING_REVIEW; đánh dấu lượt đếm RECOUNT_REQUIRED
+db --> shift: Phiên bản review mới
+shift ->> bus: [EventBridge async] phát sự kiện ShiftRecountRequested.v1
+shift --> manager: HTTP 200 yêu cầu đếm lại
+
+cashier -> shift: [HTTP/REST] Gửi bản ghi đếm bất biến mới
+shift -> db: Tính toán tiền lệch dựa trên cùng tập sự kiện rào chắn
+db --> shift: Đã lưu lượt đếm thứ 2
+alt Trong ngưỡng cho phép
+  shift -> db: Giữ PENDING_REVIEW cho đến khi quản lý phê duyệt
+else Vẫn vượt ngưỡng
+  shift -> db: Giữ PENDING_REVIEW + bắt buộc nhập ghi chú giải trình
+end
+
+manager -> shift: [HTTP/REST] Phê duyệt lượt đếm mới nhất kèm If-Match
+shift -> db: PENDING_REVIEW -> CLOSED
+shift --> manager: HTTP 200 CLOSED
+@enduml
+....
+
+== 5. Đếm lại (Recount) — L2: Luồng nội bộ backend (Internal Flow)
+
+[plantuml,shift-recount-l2,svg]
+....
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Recount — L2: Internal Backend Flow
+
+participant Controller as ctrl
+participant ShiftApplicationService as app
+participant AdmissionFenceCoordinator as fence
+participant CashSummaryReconciliationEngine as cash
+database "Shift DB" as db
+participant "Outbox/Close Worker" as worker
+
+ctrl -> app: requestRecount(countAttemptId)
+app -> db: Khóa ca + lượt đếm mới nhất; đánh dấu RECOUNT_REQUIRED
+db --> app: Tăng phiên bản review
+app --> ctrl: 200 yêu cầu đếm lại
+
+ctrl -> app: submitRecount(countCommand)
+app -> fence: verify shift remains fenced/frozen
+fence -> db: Xác nhận không mở lại ca + nạp snapshot rào chắn
+db --> fence: Snapshot khả dụng
+app -> cash: calculateAttempt(snapshot, countedCash)
+cash -> db: Chèn bản ghi bất biến lượt đếm 2
+db --> cash: Lượt đếm 2
+app --> ctrl: 201 lượt đếm
+
+ctrl -> app: approveLatest(If-Match)
+app -> db: Khóa lượt đếm mới nhất + đóng ca
+db --> app: CLOSED
+app ->> worker: Xếp hàng xuất bản outbox
+@enduml
+....
+
+== 6. Hủy ca bị bỏ quên (Cancel abandoned shift) — L1: Luồng hệ thống (System Flow)
+
+[plantuml,shift-cancel-l1,svg]
+....
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+
+title Cancel Abandoned Shift — L1: System Flow
+
+actor "Quản lý / Chủ chuỗi" as manager
+participant "Shift Service" as shift
+participant "Payment Service" as payment
+database "Shift PostgreSQL" as db
+queue "EventBridge/SQS" as bus
+
+manager -> shift: [HTTP/REST] POST /api/v1/shifts/{shiftId}/cancel
+shift -> db: Khóa ca ACTIVE; kiểm tra các tiếp nhận tiền mặt
+db --> shift: Chưa có giao dịch tiền mặt nào được tiếp nhận
+
+shift -> shift: Thẩm định lý do + openingFloatReturnedMinor = openingFloatMinor
+alt Đã hoàn trả đủ tiền đầu ca
+  shift -> db: ACTIVE -> CANCELLED + audit hoàn tiền + outbox
+  db --> shift: Commit hủy ca
+  shift ->> bus: [EventBridge async] phát sự kiện ShiftCancelled.v1
+  shift --> manager: HTTP 200 CANCELLED
+else Đã phát sinh giao dịch tiền mặt hoặc hoàn thiếu tiền
+  shift --> manager: HTTP 409 opening_float_not_returned / shift_not_cancellable
+end
+
+payment -> shift: [HTTP/REST] Sự kiện tiền mặt đến trễ
+shift -> db: Kiểm tra lại nguồn/tiếp nhận; từ chối luồng hủy hoặc tạo ca đối soát
+@enduml
+....
+
+== 6. Hủy ca bị bỏ quên (Cancel abandoned shift) — L2: Luồng nội bộ backend (Internal Flow)
+
+[plantuml,shift-cancel-l2,svg]
+....
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Cancel Abandoned Shift — L2: Internal Backend Flow
+
+participant Controller as ctrl
+participant ShiftApplicationService as app
+participant AdmissionFenceCoordinator as fence
+participant CashSummaryReconciliationEngine as cash
+database "Shift DB" as db
+participant "Outbox/Close Worker" as worker
+
+ctrl -> app: cancelShift(command)
+app -> fence: verifyCancellable(shift)
+fence -> db: Khóa ca ACTIVE + truy vấn tiếp nhận tiền mặt
+db --> fence: Không có tiếp nhận tiền mặt
+app -> cash: validateOpeningFloatReturn(command)
+cash --> app: Xác nhận đã hoàn đủ tiền
+app -> db: Thiết lập CANCELLED + audit + outbox
+db --> app: Commit
+app --> ctrl: 200 CANCELLED
+
+worker -> db: Xuất bản outbox ShiftCancelled
+@enduml
+....
+
+== 7. Sự kiện tiền mặt đến trễ hoặc trùng lặp (Late/duplicate cash fact) — L1: Luồng hệ thống (System Flow)
+
+[plantuml,shift-late-fact-l1,svg]
+....
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Late/Duplicate Cash Fact — L1: System Flow
+
+participant "Payment Service" as payment
+participant "Shift Service" as shift
+database "Shift PostgreSQL" as db
+queue "EventBridge/SQS" as bus
+participant "Reporting/Audit" as consumers
+
+payment -> shift: [HTTP/REST] POST cash fact
+shift -> db: Xác thực tenant / chi nhánh / ca / tiếp nhận / khóa nguồn
+
+alt Trùng lặp nguồn đã biết (Known source duplicate)
+  db --> shift: Đã tồn tại sự kiện / khóa nguồn cũ
+  shift --> payment: HTTP 200 idempotent no-op
+else Tiếp nhận sau rào chắn hoặc dữ liệu không xác định / sai lệch
+  shift -> db: Chèn hồ sơ đối soát + audit; không làm thay đổi ca đã đóng
+  db --> shift: Đã tạo ca đối soát
+  shift ->> bus: [EventBridge async] phát sự kiện ShiftReconciliationCaseOpened.v1
+  shift --> payment: HTTP 409 late_cash_fact_reconciliation_required
+end
+
+bus ->> consumers: [SQS async] Tiêu thụ sự kiện đối soát
+@enduml
+....
+
+== 7. Sự kiện tiền mặt đến trễ hoặc trùng lặp (Late/duplicate cash fact) — L2: Luồng nội bộ backend (Internal Flow)
+
+[plantuml,shift-late-fact-l2,svg]
+....
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Late/Duplicate Cash Fact — L2: Internal Backend Flow
+
+participant Controller as ctrl
+participant ShiftApplicationService as app
+participant AdmissionFenceCoordinator as fence
+participant CashSummaryReconciliationEngine as cash
+database "Shift DB" as db
+participant "Outbox/Close Worker" as worker
+
+ctrl -> app: ingestCashFact(fact)
+app -> fence: validateAdmissionAndFence(fact)
+fence -> db: Kiểm tra pha của ca, số thứ tự rào chắn và khóa nguồn
+db --> fence: Kết quả: Đã tồn tại / Đến trễ / Sai lệch
+
+alt Trùng khóa nguồn
+  fence --> app: Trả lại sự kiện cũ an toàn (lũy nghiệm)
+  app --> ctrl: 200 no-op
+else Đến trễ hoặc sai lệch
+  app -> cash: createReconciliationCase(fact, reason)
+  cash -> db: Chèn hồ sơ đối soát + tham chiếu audit + outbox
+  db --> cash: ID ca đối soát
+  cash --> app: Bắt buộc đối soát
+  app --> ctrl: 409 reconciliation_required
+end
+
+worker -> db: Xuất bản sự kiện đối soát / thử lại nếu cần
+@enduml
+....
+
+== Ghi chú thiết kế (Design notes)
+
+* `CLOSING` và `FROZEN` là các pha tiếp nhận nội bộ (internal admission phases); vòng đời công khai vẫn giữ nguyên: `ACTIVE`, `PENDING_REVIEW`, `CLOSED`, `CANCELLED`.
+* Lệnh đóng ca không giữ database transaction mở trong suốt thời gian chờ drain. Rào chắn commit trước, worker đóng ca xử lý bất đồng bộ dựa trên phiên bản và tính lũy nghiệm.
+* Một sự kiện tiền mặt chỉ được tính vào tiền mặt kỳ vọng khi có đủ phạm vi tenant/chi nhánh/ca, quyền tiếp nhận hợp lệ cấp trước rào chắn, khóa nguồn chưa từng được xử lý và trạng thái thanh toán/hoàn tiền hợp lệ.
+* Tuyệt đối không có luồng tự động mở lại ca (reopen) hoặc sửa đổi lượt đếm/sự kiện đã nộp.

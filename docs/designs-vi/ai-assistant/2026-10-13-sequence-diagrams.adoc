@@ -1,0 +1,537 @@
+= Module 9 — Biểu đồ tuần tự Trợ lý AI (AI Assistant Sequence Diagrams)
+:toc:
+:sectnums:
+
+Started at: 2026/10/13 00:00:00  
+Finished at: 2026/10/13 00:00:00  
+Total time: 0 minutes
+
+== Phạm vi và khả năng truy vết (Scope & Traceability)
+
+Các sơ đồ dưới đây là **biểu đồ thiết kế dựa trên giao ước (contract-driven design diagrams)**. Repository hiện chưa có mã nguồn triển khai thực tế của AI Assistant/Reporting, do đó các thành phần tham gia (participants) và thông điệp (messages) được trích xuất trực tiếp từ tài liệu Yêu cầu nghiệp vụ (Requirements) và Kiến trúc (Architecture) đã được người dùng phê duyệt; đây chưa phải là bản vết thực thi lúc runtime.
+
+* Mức L1 biểu diễn luồng giao tiếp ở cấp độ hệ thống giữa các dịch vụ (system-level communication).
+* Mức L2 biểu diễn luồng chi tiết giữa các thành phần nội bộ bên trong AI Assistant; các tầng repository/DAO được gộp chung vào ranh giới database.
+* Luồng chat chỉ sử dụng các công cụ Reporting chỉ đọc; các dịch vụ Order/Payment/Inventory/Loyalty/Catalog tuyệt đối không nằm trên đường dẫn thay đổi trạng thái (mutation path).
+* DeepSeek tuyệt đối không nhận thông tin định danh cá nhân (PII) hoặc định danh giao dịch thô; Reporting là thẩm quyền duy nhất về số liệu.
+
+== 1. Luồng chat P1 thành công
+
+=== 1.1 L1 — Luồng cấp hệ thống (System Flow)
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+
+title P1 Chat thành công — L1: Câu trả lời báo cáo kèm dữ liệu từ công cụ
+
+actor "Bảng điều khiển Owner/Manager" as ui
+participant "AI Assistant Service" as ai
+participant "Identity Access" as id
+participant "Reporting Service" as rep
+participant "Nhà cung cấp DeepSeek" as llm
+database "PostgreSQL AI Assistant" as db
+queue "EventBridge/SQS/DLQ" as bus
+participant "Audit/Observability" as audit
+
+ui -> ai: [HTTP/REST] POST /api/v1/ai/conversations/{id}/turns
+ai -> id: [HTTP/REST] Giải quyết quyền ai:report:read + phạm vi yêu cầu
+id --> ai: HTTP 200 Cho phép + ResolvedScope + membershipVersion
+ai -> db: Lưu lượt hỏi lũy quyền + bản hiệu chỉnh phạm vi
+ai -> llm: [HTTP/REST] Câu hỏi đã che giấu PII + schema công cụ cho phép
+llm --> ai: Gọi hàm getSalesSummary(arguments)
+ai -> rep: [HTTP/REST] Gọi công cụ Reporting nội bộ + ResolvedScope tin cậy
+rep --> ai: Dữ kiện tổng hợp + độ tươi mới + mốc watermark + calculationVersion
+ai -> llm: [HTTP/REST] Gửi dữ kiện cấu trúc để sinh văn bản trả lời
+llm --> ai: Schema câu trả lời hợp lệ + cách diễn đạt xuất xứ nguồn
+ai -> db: Lưu câu trả lời an toàn / metadata công cụ / mã băm phản hồi
+ai ->> bus: [EventBridge async] Phát sự kiện AIReportTurnCompleted.v1
+bus ->> audit: [SQS async] Ghi nhận bằng chứng kiểm toán đã che giấu
+ai --> ui: HTTP 200 ANSWERED + phạm vi/thời gian/nguồn/độ tươi mới
+
+@enduml
+----
+
+=== 1.2 L2 — Luồng nội bộ Backend (Internal Backend Flow)
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+
+title P1 Chat thành công — L2: Luồng xử lý nội bộ Backend
+
+participant "AI Assistant Controller" as ctrl
+participant "ScopePolicyEngine + IdentityClient" as scope
+participant "TurnOrchestrator" as orch
+participant "ToolGateway + ReportingClient" as tools
+participant "DeepSeekAdapter" as llm
+database "PostgreSQL AI Assistant" as db
+queue "OutboxPublisher" as outbox
+
+ctrl -> scope: resolveScope(request, ai:report:read)
+activate scope
+scope -> scope: Thẩm định tenant/vai trò/chi nhánh/membershipVersion
+scope --> ctrl: ResolvedScope / Từ chối (deny)
+deactivate scope
+
+ctrl -> db: INSERT lượt hỏi AI lũy quyền
+ctrl -> orch: executeTurn(turn, ResolvedScope)
+activate orch
+orch -> llm: [HTTP/REST] plan(question, toolSchemas)
+llm --> orch: functionCall
+orch -> tools: validateAndExecute(functionCall, ResolvedScope)
+activate tools
+tools -> tools: Kiểm tra tính hợp lệ của tool/đối số/khoảng thời gian/giới hạn/che giấu dữ liệu
+tools -> tools: [HTTP/REST] Thực thi truy vấn tổng hợp sang Reporting
+tools --> orch: DataQualityEnvelope + dữ kiện cấu trúc
+deactivate tools
+orch -> llm: [HTTP/REST] render(structuredFacts)
+llm --> orch: AnswerSchema
+orch -> orch: Xác thực dữ kiện/nguồn gốc/ngôn từ chuẩn
+orch -> db: UPDATE turn + metadata công cụ + mã băm
+orch -> outbox: INSERT sự kiện AIReportTurnCompleted
+deactivate orch
+ctrl --> ctrl: Phong bì phản hồi HTTP 200
+
+@enduml
+----
+
+== 2. Từ chối phạm vi hoặc phát hiện tấn công Prompt Injection
+
+=== 2.1 L1 — Luồng cấp hệ thống (System Flow)
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+
+title Từ chối phạm vi / Tấn công Prompt — L1: Đóng ngắt an toàn (Fail Closed)
+
+actor "Bảng điều khiển Manager" as ui
+participant "AI Assistant Service" as ai
+participant "Identity Access" as id
+participant "Nhà cung cấp DeepSeek" as llm
+participant "Reporting Service" as rep
+database "PostgreSQL AI Assistant" as db
+queue "EventBridge/SQS/DLQ" as bus
+
+ui -> ai: [HTTP/REST] POST turn (gửi lượt hỏi mới)
+ai -> id: [HTTP/REST] Thẩm định chi nhánh yêu cầu + quyền ai:report:read
+
+alt Chi nhánh nằm ngoài quyền thành viên
+  id --> ai: HTTP 200 allowed=false / scope_not_allowed
+  ai -> db: Lưu lý do từ chối + tóm tắt phạm vi an toàn
+  ai ->> bus: [EventBridge async] Phát sự kiện AIAccessRefused.v1
+  ai --> ui: HTTP 403 NEEDS_SCOPE/scope_not_allowed
+else Phạm vi hợp lệ, phát hiện Prompt Injection
+  id --> ai: HTTP 200 Cho phép + ResolvedScope
+  ai -> llm: [HTTP/REST] Câu hỏi đã che giấu + chính sách hệ thống cố định
+  llm --> ai: Yêu cầu mã SQL / prompt hệ thống / leo thang đặc quyền
+  ai -> db: Lưu bản ghi từ chối do vi phạm chính sách
+  ai ->> bus: [EventBridge async] Phát sự kiện AIAccessRefused.v1
+  ai --> ui: HTTP 200 UNSUPPORTED/từ chối; không gọi công cụ
+else Phạm vi hợp lệ nhưng ý định không hỗ trợ
+  id --> ai: HTTP 200 Cho phép + ResolvedScope
+  ai -> llm: [HTTP/REST] Phân loại ý định trong danh mục trắng
+  llm --> ai: UNSUPPORTED
+  ai --> ui: HTTP 200 UNSUPPORTED + hướng dẫn an toàn
+end
+
+note over ai,rep
+Reporting tuyệt đối không bao giờ được gọi trong bất kỳ nhánh từ chối nào.
+end note
+
+@enduml
+----
+
+=== 2.2 L2 — Luồng nội bộ Backend (Internal Backend Flow)
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+
+title Từ chối phạm vi / Tấn công Prompt — L2: Ranh giới chính sách
+
+participant "AI Assistant Controller" as ctrl
+participant "ScopePolicyEngine + IdentityClient" as scope
+participant "TurnOrchestrator" as orch
+participant "ToolGateway + ReportingClient" as tools
+participant "DeepSeekAdapter" as llm
+database "PostgreSQL AI Assistant" as db
+queue "OutboxPublisher" as outbox
+
+ctrl -> scope: resolveScope(request)
+scope -> scope: Kiểm tra tư cách thành viên / chi nhánh / quyền hạn
+alt Quyền truy cập bị từ chối
+  scope --> ctrl: DeniedDecision (Quyết định từ chối)
+  ctrl -> db: Lưu thông tin từ chối đã che giấu
+  ctrl -> outbox: Đưa sự kiện AIAccessRefused.v1 vào hàng đợi
+  ctrl --> ctrl: Phản hồi mã HTTP 403
+else Phân quyền hợp lệ
+  scope --> ctrl: ResolvedScope
+  ctrl -> orch: executeTurn
+  orch -> llm: [HTTP/REST] Lập kế hoạch với chính sách cố định
+  alt Phát hiện Prompt injection hoặc ý định lạ
+    llm --> orch: Ý định hàm không hợp lệ / không hỗ trợ
+    orch -> orch: Chặn từ chối ngay trước ToolGateway
+    orch -> db: Lưu lý do từ chối an toàn
+    orch -> outbox: Đưa sự kiện AIAccessRefused.v1 vào hàng đợi
+  else Ý định hợp lệ
+    llm --> orch: Lệnh gọi hàm hợp lệ
+    orch -> tools: validateAndExecute
+    tools -> tools: Kiểm tra phạm vi/công cụ/khoảng thời gian/chính sách
+    tools --> orch: Từ chối trước khi gọi Reporting nếu không hợp lệ
+  end
+end
+
+@enduml
+----
+
+== 3. Xử lý sự cố Reporting hoặc nhà cung cấp LLM
+
+=== 3.1 L1 — Luồng cấp hệ thống (System Flow)
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+
+title Sự cố Reporting / Nhà cung cấp — L1: Kết quả cấu trúc an toàn
+
+actor "Bảng điều khiển Owner/Manager" as ui
+participant "AI Assistant Service" as ai
+participant "Identity Access" as id
+participant "Reporting Service" as rep
+participant "Nhà cung cấp DeepSeek" as llm
+database "PostgreSQL AI Assistant" as db
+queue "EventBridge/SQS/DLQ" as bus
+
+ui -> ai: [HTTP/REST] POST turn
+ai -> id: [HTTP/REST] Thẩm định phạm vi quyền
+id --> ai: HTTP 200 ResolvedScope
+ai -> llm: [HTTP/REST] Lập kế hoạch gọi công cụ trong danh mục trắng
+llm --> ai: getSalesSummary
+ai -> rep: [HTTP/REST] Truy vấn dữ liệu tổng hợp + phong bì chất lượng
+
+alt Dữ liệu Reporting bị chậm hoặc chưa đủ
+  rep --> ai: HTTP 200 STALE/INCOMPLETE + dữ kiện/mốc kiểm chứng
+  ai -> db: Lưu cảnh báo / trạng thái kết quả từng phần
+  ai --> ui: HTTP 200 STALE_DATA hoặc PARTIAL + cảnh báo độ tươi mới
+else Reporting bị gián đoạn hoặc quá thời gian chờ (timeout)
+  rep --> ai: HTTP 503/reporting_unavailable
+  ai -> db: Lưu trạng thái công cụ thất bại
+  ai --> ui: HTTP 503 mã lỗi an toàn; tuyệt đối không tự bịa con số
+else Dữ kiện Reporting hợp lệ nhưng DeepSeek bị quá thời gian chờ
+  rep --> ai: Dữ kiện + FRESH/COMPLETE
+  ai -> llm: [HTTP/REST] Yêu cầu sinh văn bản từ dữ kiện cấu trúc
+  llm --> ai: timeout/5xx
+  ai -> db: Lưu sự cố nhà cung cấp + phả hệ dữ kiện
+  ai --> ui: HTTP 200 PARTIAL dữ kiện cấu trúc hoặc 503 provider_unavailable
+end
+
+ai ->> bus: [EventBridge async] Phát sự kiện AIReportTurnCompleted.v1/status
+
+@enduml
+----
+
+=== 3.2 L2 — Luồng nội bộ Backend (Internal Backend Flow)
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+
+title Sự cố Reporting / Nhà cung cấp — L2: Thử lại có giới hạn và Phương án dự phòng
+
+participant "AI Assistant Controller" as ctrl
+participant "ScopePolicyEngine + IdentityClient" as scope
+participant "TurnOrchestrator" as orch
+participant "ToolGateway + ReportingClient" as tools
+participant "DeepSeekAdapter" as llm
+database "PostgreSQL AI Assistant" as db
+queue "OutboxPublisher" as outbox
+
+ctrl -> scope: resolveScope
+scope --> ctrl: ResolvedScope
+ctrl -> orch: executeTurn
+orch -> llm: [HTTP/REST] plan
+llm --> orch: functionCall
+orch -> tools: executeValidatedTool
+alt Công cụ bị chậm hoặc chưa đủ dữ liệu
+  tools --> orch: Dữ kiện + cảnh báo chất lượng
+  orch -> orch: Đánh dấu trạng thái STALE_DATA/PARTIAL
+else Công cụ quá thời gian chờ hoặc không khả dụng
+  tools --> orch: Mã lỗi công cụ có phân loại
+  orch -> orch: Không retry vô hạn; đánh dấu thất bại
+else Dữ kiện hợp lệ
+  tools --> orch: Dữ kiện + nguồn gốc xuất xứ
+  orch -> llm: [HTTP/REST] render
+  alt Nhà cung cấp timeout hoặc schema không hợp lệ
+    llm --> orch: Lỗi / câu trả lời sai schema
+    orch -> orch: Cho phép thử lại/sửa 1 lần có giới hạn nếu còn ngân sách
+    orch -> orch: Chuyển sang phương án dự phòng số liệu cấu trúc / thông báo lỗi
+  else Câu trả lời hợp lệ
+    llm --> orch: AnswerSchema
+  end
+end
+orch -> db: Lưu trạng thái an toàn cuối cùng
+orch -> outbox: Đưa sự kiện hoàn tất / lỗi vào hàng đợi
+
+@enduml
+----
+
+== 4. Công bố bản tóm tắt ngày P2 (Daily Summary Publish)
+
+=== 4.1 L1 — Luồng cấp hệ thống (System Flow)
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+
+title Tóm tắt ngày — L1: Từ giờ chốt ca tới Phiên bản công bố
+
+participant "Scheduler/Worker" as worker
+participant "AI Assistant Service" as ai
+participant "Reporting Service" as rep
+participant "Nhà cung cấp DeepSeek" as llm
+database "PostgreSQL AI Assistant" as db
+queue "EventBridge/SQS/DLQ" as bus
+participant "Bảng điều khiển Owner/Manager" as ui
+
+worker -> ai: [HTTP/REST] Tạo tác vụ tóm tắt ngày lũy quyền
+ai -> db: INSERT tác vụ trạng thái SCHEDULED
+worker -> ai: [HTTP/REST] Thực thi tác vụ tại thời điểm chốt ca + 15 phút
+ai -> rep: [HTTP/REST] Kiểm tra độ tươi mới và tính đầy đủ
+alt Chưa đủ dữ liệu trong thời hạn chờ
+  rep --> ai: WAITING_FOR_DATA/DATA_LATE
+  ai -> db: Lưu trạng thái chờ / kết thúc an toàn
+  ai ->> bus: [EventBridge async] AIReportTurnCompleted.v1/status
+else Dữ liệu đã đầy đủ hoàn tất
+  rep --> ai: Mốc kiểm chứng COMPLETE
+  ai -> rep: [HTTP/REST] Xác định mốc so sánh + các yếu tố đóng góp
+  rep --> ai: Dữ kiện + mốc so sánh cùng thứ/7 ngày + yếu tố đóng góp
+  ai -> llm: [HTTP/REST] Gửi dữ kiện tóm tắt có cấu trúc đã che giấu PII
+  llm --> ai: SummarySchema
+  ai -> db: Lưu phiên bản tóm tắt bất biến PUBLISHED
+  ai ->> bus: [EventBridge async] Phát sự kiện AIDailySummaryPublished.v1
+  ai --> ui: [HTTP/REST] Bản tóm tắt sẵn sàng hiển thị trong phạm vi phân quyền
+end
+
+@enduml
+----
+
+=== 4.2 L2 — Luồng nội bộ Backend (Internal Backend Flow)
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+
+title Tóm tắt ngày — L2: Luồng xử lý Worker / Phiên bản
+
+participant "SummaryWorker" as worker
+participant "ScopePolicyEngine + IdentityClient" as scope
+participant "ToolGateway + ReportingClient" as tools
+participant "DeepSeekAdapter" as llm
+participant "SummaryValidator" as valid
+database "PostgreSQL AI Assistant" as db
+queue "OutboxPublisher" as outbox
+
+worker -> db: Nhận khóa thuê (lease) cho tác vụ SCHEDULED
+worker -> scope: Giải quyết chính sách / phạm vi tóm tắt của chi nhánh
+scope --> worker: ResolvedScope + phiên bản thành viên/chính sách
+worker -> tools: Kiểm tra mốc kiểm chứng tính đầy đủ
+alt Chưa đủ dữ liệu
+  tools --> worker: WAITING_FOR_DATA
+  worker -> db: Cập nhật thời gian thử lại / trạng thái kết thúc
+else Dữ liệu đầy đủ
+  tools --> worker: COMPLETE
+  worker -> tools: getBaseline + getContributionDrivers
+  tools --> worker: Dữ kiện cấu trúc + calculationVersion
+  worker -> llm: [HTTP/REST] Sinh văn bản tóm tắt từ dữ kiện cấu trúc
+  llm --> worker: SummarySchema
+  worker -> valid: Kiểm tra tính hợp lệ số học/mốc so sánh/ngôn từ/nguồn gốc
+  alt Kết quả không hợp lệ
+    valid --> worker: Từ chối / cho phép sửa 1 lần có giới hạn
+    worker -> db: Lưu PROVIDER_UNAVAILABLE / cấu trúc dự phòng
+  else Kết quả hợp lệ
+    valid --> worker: Chấp thuận
+    worker -> db: INSERT phiên bản tóm tắt bất biến
+    worker -> outbox: Đưa sự kiện AIDailySummaryPublished.v1 vào hàng đợi
+  end
+end
+
+@enduml
+----
+
+== 5. Xử lý dữ kiện muộn và chạy lại tóm tắt P2
+
+=== 5.1 L1 — Luồng cấp hệ thống (System Flow)
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+
+title Dữ kiện muộn tóm tắt ngày — L1: Phiên bản mới thay thế phiên bản cũ
+
+participant "Reporting Service" as rep
+queue "EventBridge/SQS/DLQ" as bus
+participant "Scheduler/Worker" as worker
+participant "AI Assistant Service" as ai
+participant "Nhà cung cấp DeepSeek" as llm
+database "PostgreSQL AI Assistant" as db
+participant "Bảng điều khiển Owner/Manager" as ui
+
+rep ->> bus: [EventBridge async] Phát sự kiện ReportProjectionWatermarkUpdated.v1
+bus ->> worker: [SQS async] Kích hoạt xử lý cho ngày kinh doanh bị ảnh hưởng
+worker -> ai: [HTTP/REST] Yêu cầu chạy lại kèm mốc nguồn / khóa lũy quyền
+ai -> rep: [HTTP/REST] Đọc dữ liệu tính đầy đủ / mốc so sánh / đóng góp hiện hành
+rep --> ai: Dữ kiện cập nhật mới + mốc watermark v902
+ai -> llm: [HTTP/REST] Sinh tóm tắt cấu trúc hiệu chỉnh
+llm --> ai: SummarySchema
+ai -> db: INSERT bản hiệu chỉnh revision 2; đánh dấu revision 1 là SUPERSEDED
+ai ->> bus: [EventBridge async] Phát sự kiện AIDailySummarySuperseded.v1
+ai ->> bus: [EventBridge async] Phát sự kiện AIDailySummaryPublished.v1
+ai --> ui: [HTTP/REST] Hiển thị revision 2 kèm vết phả hệ đầy đủ
+
+@enduml
+----
+
+=== 5.2 L2 — Luồng nội bộ Backend (Internal Backend Flow)
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+
+participant "SummaryWorker" as worker
+participant "ToolGateway + ReportingClient" as tools
+participant "DeepSeekAdapter" as llm
+participant "SummaryValidator" as valid
+database "PostgreSQL AI Assistant" as db
+queue "OutboxPublisher" as outbox
+
+worker -> db: Nhận / xác lập quyền xử lý tác vụ chạy lại do mốc nguồn kích hoạt
+worker -> db: Đọc phiên bản đã công bố hiện tại / mốc kiểm chứng nguồn
+worker -> tools: Truy vấn độ tươi mới + các dữ kiện đóng góp cập nhật
+tools --> worker: Mốc nguồn mới / phiên bản tính toán mới
+worker -> llm: [HTTP/REST] Sinh lại văn bản từ dữ kiện cập nhật
+llm --> worker: SummarySchema
+worker -> valid: Kiểm tra tính phả hệ / số liệu / ngôn từ
+valid --> worker: Chấp thuận phiên bản mới
+worker -> db: INSERT phiên bản revision 2
+worker -> db: UPDATE phiên bản revision 1 = SUPERSEDED
+worker -> outbox: Đưa sự kiện superseded + published vào hàng đợi
+
+@enduml
+----
+
+== 6. Thu hồi phân quyền giữa các lượt hỏi (Authorization Revocation)
+
+=== 6.1 L1 — Luồng cấp hệ thống (System Flow)
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+
+actor "Bảng điều khiển Manager" as ui
+participant "Identity Access" as id
+queue "EventBridge/SQS/DLQ" as bus
+participant "AI Assistant Service" as ai
+database "PostgreSQL AI Assistant" as db
+participant "Reporting Service" as rep
+
+id ->> bus: [EventBridge async] Phát sự kiện AuthorizationContextChanged.v1
+bus ->> ai: [SQS async] Hủy bỏ bộ nhớ cache tối ưu cục bộ
+ui -> ai: [HTTP/REST] Gửi câu hỏi tiếp theo cho chi nhánh trước đó
+ai -> id: [HTTP/REST] Thẩm định quyền ai:report:read hiện hành trực tuyến
+id --> ai: HTTP 200 allowed=false (quyền thành viên đã bị thu hồi hoặc thu hẹp)
+ai -> db: Lưu bằng chứng kiểm toán AIAccessRefused đã che giấu
+ai ->> bus: [EventBridge async] Phát sự kiện AIAccessRefused.v1
+ai --> ui: HTTP 403 scope_not_allowed
+
+note over ai,rep
+Reporting tuyệt đối không được gọi sau khi quyền đã bị thu hồi.
+end note
+
+@enduml
+----
+
+=== 6.2 L2 — Luồng nội bộ Backend (Internal Backend Flow)
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+
+participant "AI Assistant Controller" as ctrl
+participant "ScopePolicyEngine + IdentityClient" as scope
+participant "TurnOrchestrator" as orch
+participant "ToolGateway + ReportingClient" as tools
+database "PostgreSQL AI Assistant" as db
+queue "OutboxPublisher" as outbox
+
+ctrl -> scope: resolveScope(subject và quyền hạn hiện tại)
+scope -> scope: Thực hiện gọi quyết định phân quyền trực tuyến tới Identity
+scope --> ctrl: DeniedDecision + membershipVersion hiện hành
+ctrl -> db: INSERT bản ghi từ chối lượt hỏi / tham chiếu kiểm toán
+ctrl -> outbox: Đưa sự kiện AIAccessRefused.v1 vào hàng đợi
+ctrl --> ctrl: Phản hồi mã lỗi HTTP 403; không kích hoạt TurnOrchestrator
+
+note over orch,tools
+Tuyệt đối không thực thi nhà cung cấp hoặc gọi công cụ sau khi phân quyền bị từ chối.
+end note
+
+@enduml
+----
+
+== Các bất biến thiết kế (Design Invariants)
+
+* Quyết định trực tuyến từ Identity là thẩm quyền phân quyền duy nhất; phạm vi do client/LLM tự gửi không bao giờ được tin tưởng.
+* Các công cụ Reporting chỉ trả về các dữ kiện tổng hợp chuẩn, độ tươi mới và phiên bản tính toán.
+* DeepSeek tuyệt đối không thể gọi các endpoint làm thay đổi dữ liệu (mutation) hoặc câu lệnh SQL tùy ý và không bao giờ nhận PII/định danh giao dịch thô.
+* Mọi câu trả lời hoặc tóm tắt cuối cùng đều bắt buộc phải được xác thực theo schema; sự cố nhà cung cấp không bao giờ được biến thành số liệu nghiệp vụ tự bịa.
+* Các phiên bản tóm tắt ngày là bất biến và bảo toàn phả hệ; dữ kiện phát sinh muộn sẽ tạo bản hiệu chỉnh thay thế (supersede) chứ không ghi đè vật lý.
+* Cơ chế chuyển phát Outbox/Event đảm bảo tính chất ít nhất một lần; phía nhận khử trùng lặp dựa trên ID sự kiện và phiên bản nguồn.

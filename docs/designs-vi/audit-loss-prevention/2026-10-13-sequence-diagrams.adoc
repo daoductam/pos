@@ -1,0 +1,650 @@
+= Module 11 — Giám Sát & Chống Thất Thoát: Biểu Đồ Tuần Tự (Sequence Diagrams)
+
+Started at: 2026/10/13 00:00:00  
+Finished at: 2026/10/13 00:00:00  
+Total time: 0 minutes
+
+== Phạm vi và Quy ước ký hiệu (Scope & Notation)
+
+Các sơ đồ này là các biểu đồ thiết kế (design-level diagrams) được sinh ra sau khi người dùng đã xác nhận 8 luồng nghiệp vụ và ranh giới các bên tham gia. Repository hiện chưa có mã nguồn triển khai ứng dụng; tên component, hàng đợi và endpoint phản ánh chính xác tài liệu Hợp đồng (Contracts) và Kiến trúc (Architecture), không phải là trace từ mã nguồn lúc chạy thực tế.
+
+* L1: Luồng cấp độ hệ thống giữa các tác nhân, service, message broker, database và kho lưu trữ object storage.
+* L2: Luồng nội bộ backend; Repository/DAO được thu gọn vào ranh giới Service → DB.
+* Các dữ kiện doanh thu `OrderPaid`/Payment không được Audit tự ý suy diễn; Audit chỉ tiêu thụ các dữ kiện nguồn đã được phê duyệt.
+* Audit & Loss Prevention tuyệt đối không chặn các thao tác của Order, Payment, Shift hay POS.
+
+== Các Bên Tham Gia (Participants)
+
+Cấp L1 sử dụng các bên tham gia đã được xác nhận: Owner/Manager/Cashier, Angular/POS, Order, Promotion, Payment, Shift/POS Device, Identity, EventBridge/SQS, Audit, PostgreSQL, Loss Worker, Case Service và kho lưu trữ Encrypted Object Storage.
+
+== 1. Hủy đơn thành công → ghi nhận bằng chứng kiểm toán
+
+=== 1.1 L1 — Luồng Hệ Thống (System Flow)
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Order cancel → Audit evidence — L1: System Flow
+
+actor "Manager/POS" as actor
+participant "Order Service" as order
+queue "EventBridge/SQS" as bus
+participant "Audit Service" as audit
+database "Audit PostgreSQL" as db
+
+actor -> order: [HTTP/REST] POST /api/v1/orders/{id}/lines/{lineId}/cancel
+order -> order: Kiểm tra quyền, lý do, If-Match và phạm vi đơn hàng
+alt Phạm vi / trạng thái / lý do không hợp lệ
+  order --> actor: Trả lỗi an toàn HTTP 403/409/422
+else Hủy hợp lệ
+  order -> order: Commit trạng thái dòng món + outbox OrderLineCancelled.v1
+  order ->> bus: [EventBridge/SQS] OrderLineCancelled.v1
+  bus ->> audit: [SQS async] phân phối sự kiện
+  audit -> audit: Xác thực, làm sạch dữ liệu và khử trùng sourceEventId
+  audit -> db: INSERT bằng chứng kiểm toán bất biến + projection
+  db --> audit: commit bằng chứng / watermark
+  audit --> actor: Lệnh nguồn đã trả về thành công trước đó
+end
+
+alt Consumer Audit retry / gửi vào DLQ
+  audit ->> bus: [SQS async] retry rồi chuyển vào DLQ sau số lần thử có hạn
+end
+@enduml
+----
+
+=== 1.2 L2 — Luồng Backend Nội Bộ (Internal Backend Flow)
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Order cancel → Audit evidence — L2: Internal Backend Flow
+
+participant "Order Command Service" as orderSvc
+database "Order DB" as orderDb
+queue "Order Outbox" as outbox
+participant "Audit Consumer" as consumer
+participant "Schema/Redaction Validator" as validator
+database "Audit DB" as auditDb
+
+orderSvc -> orderSvc: Kiểm tra phạm vi, lý do, If-Match và dòng đang hoạt động
+alt Xác thực thất bại
+  orderSvc --> orderSvc: Trả lỗi nghiệp vụ an toàn
+else Xác thực thành công
+  orderSvc -> orderDb: Transaction: hủy dòng món + cập nhật phiên bản trạng thái
+  orderDb --> orderSvc: trạng thái đơn hàng đã commit
+  orderSvc -> outbox: Insert sự kiện OrderLineCancelled.v1
+  outbox --> orderSvc: ID outbox bền vững
+end
+
+consumer -> validator: Xác thực phong bì / phiên bản / làm sạch dữ liệu
+alt Schema không hợp lệ hoặc payload nhạy cảm
+  validator --> consumer: Cách ly kiểm dịch / lỗi DLQ an toàn
+else Sự kiện hợp lệ
+  consumer -> auditDb: INSERT inbox / khử trùng nguồn
+  auditDb --> consumer: sự kiện mới / trùng lặp
+  alt Sự kiện nguồn mới
+    consumer -> auditDb: INSERT audit_events + projection + watermark
+    auditDb --> consumer: bằng chứng đã commit
+  else Sự kiện nguồn trùng lặp
+    consumer --> consumer: Bỏ qua (no-op) tác động projection
+  end
+end
+@enduml
+----
+
+== 2. Giảm giá thủ công / khuyến mãi → ghi nhận bằng chứng kiểm toán
+
+=== 2.1 L1 — Luồng Hệ Thống (System Flow)
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Discount/promotion → Audit evidence — L1: System Flow
+
+actor "Cashier/POS" as actor
+participant "Order Service" as order
+participant "Promotion/Loyalty" as promo
+queue "EventBridge/SQS" as bus
+participant "Audit Service" as audit
+database "Audit PostgreSQL" as db
+
+actor -> order: [HTTP/REST] Áp dụng giảm giá cho đơn hàng / dòng món
+order -> promo: [HTTP/REST] Xác thực chính sách khuyến mãi / voucher / ghi đè
+promo --> order: Phiên bản áp dụng / phân bổ hoặc từ chối
+alt Ghi đè thủ công (Manual override)
+  order -> order: Bắt buộc có lý do có giới hạn + tác nhân / thu ngân thao tác
+else Khuyến mãi / Voucher
+  order -> order: Snapshot phiên bản bất biến của khuyến mãi / quy tắc / voucher
+end
+alt Giảm giá bị từ chối hoặc không hợp lệ
+  order --> actor: Trả lỗi an toàn HTTP 403/409/422
+else Áp dụng thành công
+  order -> order: Commit giá đơn hàng + outbox DiscountApplied.v1
+  order ->> bus: [EventBridge/SQS] DiscountApplied.v1
+  bus ->> audit: [SQS async] phân phối sự kiện
+  audit -> db: INSERT bằng chứng giảm giá đã chuẩn hóa / projection
+  db --> audit: bằng chứng đã commit
+  order --> actor: HTTP 200 snapshot đơn hàng đã áp dụng
+end
+@enduml
+----
+
+=== 2.2 L2 — Luồng Backend Nội Bộ (Internal Backend Flow)
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Discount/promotion → Audit evidence — L2: Internal Backend Flow
+
+participant "Order Pricing Service" as orderSvc
+participant "Promotion Client" as promoClient
+database "Order DB" as orderDb
+queue "Order Outbox" as outbox
+participant "Audit Normalizer" as normalizer
+database "Audit DB" as auditDb
+
+orderSvc -> promoClient: [HTTP sync - client] Phân giải quy tắc / voucher / ghi đè áp dụng
+promoClient --> orderSvc: phiên bản + phân bổ + kết quả chính sách
+orderSvc -> orderSvc: Kiểm tra minor-unit VND và bất biến phân bổ
+alt Lý do thủ công thiếu hoặc không hợp lệ
+  orderSvc --> orderSvc: Từ chối mà không phát dữ kiện giảm giá thành công
+else Giảm giá hợp lệ
+  orderSvc -> orderDb: Commit snapshot giá + phiên bản đơn hàng
+  orderSvc -> outbox: Insert sự kiện DiscountApplied.v1
+end
+
+normalizer -> auditDb: INSERT inbox / khóa nguồn
+auditDb --> normalizer: mới / trùng lặp
+alt Sự kiện mới
+  normalizer -> normalizer: Ánh xạ discountSource + làm sạch lý do / snapshot
+  normalizer -> auditDb: INSERT bằng chứng bất biến + projection phân bổ
+else Trùng lặp
+  normalizer --> normalizer: Bỏ qua (no-op)
+end
+@enduml
+----
+
+== 3. Lệnh / kết quả mở két tiền → ghi nhận bằng chứng kiểm toán
+
+=== 3.1 L1 — Luồng Hệ Thống (System Flow)
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Cash drawer command/result → Audit evidence — L1: System Flow
+
+actor "Cashier/POS" as actor
+participant "POS Device" as device
+participant "Shift Service" as shift
+participant "Drawer Hardware" as hardware
+queue "EventBridge/SQS" as bus
+participant "Audit Service" as audit
+database "Audit PostgreSQL" as db
+
+actor -> device: [HTTP/REST] Yêu cầu mở két tiền
+device -> shift: [HTTP/REST] Kiểm tra hợp lệ ca làm việc / thu ngân / thiết bị
+shift --> device: ngữ cảnh thao tác được ủy quyền
+device -> hardware: [Device protocol] Mở két tiền (commandId)
+hardware --> device: kết quả (thành công / thất bại)
+device -> device: Commit thao tác/kết quả + outbox CashDrawerOpened.v1
+device ->> bus: [EventBridge/SQS] CashDrawerOpened.v1
+bus ->> audit: [SQS async] phân phối bằng chứng két tiền
+audit -> db: INSERT bằng chứng mở két bất biến / projection
+db --> audit: bằng chứng / watermark đã commit
+device --> actor: HTTP 200 kết quả hoặc lỗi thiết bị an toàn
+
+alt Kết quả phần cứng bị trễ
+  device ->> bus: [EventBridge/SQS] kết quả đến sau với cùng operationKey
+  audit -> audit: Đối soát lệnh/kết quả mà không tính trùng lặp
+end
+@enduml
+----
+
+=== 3.2 L2 — Luồng Backend Nội Bộ (Internal Backend Flow)
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Cash drawer command/result → audit evidence — L2: Internal Backend Flow
+
+participant "Drawer Controller" as ctrl
+participant "Drawer Operation Service" as drawerSvc
+participant "Shift Client" as shiftClient
+participant "Hardware Adapter" as hw
+database "POS/Shift DB" as sourceDb
+participant "Audit Normalizer" as normalizer
+database "Audit DB" as auditDb
+
+ctrl -> drawerSvc: openDrawer(request)
+drawerSvc -> shiftClient: [HTTP sync - client] Phân giải phạm vi ca / thu ngân / thiết bị
+shiftClient --> drawerSvc: ngữ cảnh thao tác
+drawerSvc -> hw: [Device protocol] open(commandId)
+hw --> drawerSvc: kết quả phần cứng hoặc timeout
+drawerSvc -> sourceDb: Lưu thao tác/kết quả + outbox(operationKey)
+sourceDb --> drawerSvc: dữ kiện nguồn đã commit
+
+normalizer -> auditDb: INSERT inbox theo sourceEventId/operationKey
+alt Kết quả đầu tiên
+  normalizer -> auditDb: INSERT bằng chứng CashDrawerOpened + projection
+else Kết quả retry / trùng lặp
+  normalizer -> auditDb: Chỉ cập nhật tham chiếu đối soát
+end
+@enduml
+----
+
+== 4. Owner/Manager truy vấn dòng thời gian kèm xử lý từ chối phạm vi
+
+=== 4.1 L1 — Luồng Hệ Thống (System Flow)
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Audit timeline query — L1: System Flow
+
+actor "Owner/Manager" as user
+participant "Angular Audit Console" as ui
+participant "Audit API" as api
+participant "Identity" as identity
+database "Audit PostgreSQL" as db
+
+user -> ui: Chọn bộ lọc chi nhánh / ngày / hành động
+ui -> api: [HTTP/REST] GET /api/v1/audit/events
+api -> identity: [HTTP/REST] Phân giải quyền audit:read + phạm vi / phiên bản
+alt Bị từ chối hoặc chi nhánh ngoại lai
+  identity --> api: 403/scope_not_allowed
+  api --> ui: Lỗi an toàn 403/409 không liệt kê tài nguyên
+  ui --> user: Hiển thị không có quyền truy cập
+else Được cấp quyền
+  identity --> api: phạm vi tenant / chi nhánh đã phân giải
+  api -> api: Xác thực giới hạn tối đa 90 ngày / cursor / allowlist bộ lọc
+  api -> db: SELECT projection dòng thời gian an toàn theo phạm vi
+  db --> api: các bản ghi + watermark / chất lượng dữ liệu
+  api --> ui: HTTP 200 data + meta + độ tươi mới
+  ui --> user: Render dòng thời gian và trạng thái chất lượng dữ liệu
+end
+@enduml
+----
+
+=== 4.2 L2 — Luồng Backend Nội Bộ (Internal Backend Flow)
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Audit timeline query — L2: Internal Backend Flow
+
+participant "Audit Controller" as ctrl
+participant "Scope Policy" as policy
+participant "Identity Client" as identityClient
+participant "Query Service" as querySvc
+database "Audit DB" as db
+participant "Redaction Mapper" as mapper
+
+ctrl -> policy: authorize(request, JWT context)
+policy -> identityClient: [HTTP sync - client] Phân giải quyền hạn / phạm vi / phiên bản
+identityClient --> policy: phạm vi được cấp quyền hoặc từ chối
+alt Bị từ chối
+  policy --> ctrl: Lỗi an toàn forbidden / scope
+else Được cấp quyền
+  policy -> querySvc: bộ lọc chuẩn hóa + hash phạm vi
+  querySvc -> querySvc: Xác thực hash cursor/bộ lọc và chặn khoảng 90 ngày
+  querySvc -> db: SELECT projection dòng thời gian + watermark
+  db --> querySvc: dữ liệu trang + chất lượng
+  querySvc -> mapper: Làm sạch các trường nhạy cảm và ánh xạ nhãn an toàn
+  mapper --> ctrl: phong bì phản hồi chuẩn
+end
+@enduml
+----
+
+== 5. Phát hiện bất thường P2 → tạo phát hiện / vụ việc
+
+=== 5.1 L1 — Luồng Hệ Thống (System Flow)
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Anomaly detection → finding/case — L1: System Flow
+
+queue "Audit/Order/Payment/Shift Events" as events
+participant "Loss Prevention Worker" as worker
+database "Audit PostgreSQL" as db
+participant "Case Service" as cases
+participant "Owner/Manager Console" as console
+
+events ->> worker: [EventBridge/SQS] các dữ kiện đã chuẩn hóa
+worker -> db: Đọc bằng chứng + baseline + chính sách quy tắc
+db --> worker: dữ kiện, baseline, phiên bản chính sách
+worker -> worker: Tổng hợp đặc trưng theo nhân viên / chi nhánh / thời gian
+worker -> worker: Đánh giá các quy tắc có thể giải thích được
+alt Baseline chưa đủ dữ liệu / có khoảng trống
+  worker -> db: Ghi nhận telemetry chất lượng, không tạo phát hiện tin cậy cao
+else Quy tắc bị kích hoạt
+  worker -> db: INSERT phát hiện đơn định + snapshot bằng chứng
+  worker -> cases: [Nội bộ] Mở / cập nhật tham chiếu vụ việc
+  cases -> db: INSERT hành động vụ việc / con trỏ hiện hành
+  cases ->> events: [EventBridge/SQS] AnomalyFindingCreated.v1
+end
+console -> cases: [HTTP/REST] Truy vấn phát hiện / vụ việc được cấp quyền
+cases --> console: mức nghiêm trọng / bằng chứng / giải thích / trạng thái
+@enduml
+----
+
+=== 5.2 L2 — Luồng Backend Nội Bộ (Internal Backend Flow)
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Anomaly detection → finding/case — L2: Internal Backend Flow
+
+participant "Fact Consumer" as consumer
+participant "Feature Aggregator" as aggregator
+participant "Rule Evaluator" as evaluator
+database "Audit DB" as db
+participant "Finding/Case Service" as caseSvc
+queue "Audit Outbox" as outbox
+
+consumer -> aggregator: áp dụng dữ kiện chuẩn hóa theo watermark
+aggregator -> db: Đọc / cập nhật baseline nhân viên / chi nhánh / thời gian
+db --> aggregator: baseline + khởi động / chất lượng dữ liệu
+aggregator -> evaluator: đặc trưng + chính sách quy tắc / phiên bản
+evaluator -> evaluator: Đánh giá quy tắc hủy / giảm giá / két tiền / hành động lặp
+alt Chưa đủ baseline hoặc nguồn dữ liệu bán phần
+  evaluator -> db: Ghi nhận telemetry INSUFFICIENT_BASELINE / PARTIAL
+else Bị kích hoạt
+  evaluator -> caseSvc: createOrReviseFinding(deterministicKey)
+  caseSvc -> db: INSERT snapshot phát hiện/bằng chứng với CAS/dedupe
+  db --> caseSvc: trạng thái phát hiện
+  caseSvc -> db: INSERT hành động vụ việc OPEN / con trỏ hiện hành
+  caseSvc ->> outbox: phát hành AnomalyFindingCreated.v1
+end
+@enduml
+----
+
+== 6. Chuyển trạng thái vụ việc
+
+=== 6.1 L1 — Luồng Hệ Thống (System Flow)
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Finding/case transition — L1: System Flow
+
+actor "Owner/Manager" as user
+participant "Angular Audit Console" as ui
+participant "Audit API/Case Service" as api
+participant "Identity" as identity
+database "Audit PostgreSQL" as db
+queue "EventBridge/SQS" as bus
+
+user -> ui: Xác nhận / điều tra / giải quyết / bác bỏ
+ui -> api: [HTTP/REST] POST /api/v1/loss-prevention/findings/{id}/{action}
+api -> identity: [HTTP/REST] Phân giải quyền vụ việc + phạm vi chi nhánh
+alt Manager cố gắng giải quyết hoặc bác bỏ
+  identity --> api: từ chối (denied)
+  api --> ui: HTTP 403 lỗi an toàn
+else Được cấp quyền
+  identity --> api: phạm vi / phiên bản
+  api -> db: Đọc vụ việc + phạm vi / phiên bản bằng chứng
+  db --> api: vụ việc hiện tại
+  api -> db: Chuyển trạng thái bằng CAS + ghi thêm hành động vụ việc / outbox
+  alt Xung đột phiên bản / bước chuyển không hợp lệ
+    db --> api: xung đột (conflict)
+    api --> ui: HTTP 409 trạng thái hiện tại
+  else Đã commit thành công
+    db --> api: trạng thái mới / ID hành động
+    api ->> bus: [EventBridge/SQS] AuditCaseActionRecorded.v1
+    api --> ui: HTTP 200 vụ việc hiện tại
+  end
+end
+@enduml
+----
+
+=== 6.2 L2 — Luồng Backend Nội Bộ (Internal Backend Flow)
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Finding/case transition — L2: Internal Backend Flow
+
+participant "Case Controller" as ctrl
+participant "Case Policy" as policy
+participant "Identity Client" as identityClient
+participant "Case Service" as caseSvc
+database "Audit DB" as db
+queue "Case Outbox" as outbox
+
+ctrl -> policy: kiểm tra tính hợp lệ hành động / lý do / If-Match
+policy -> identityClient: [HTTP sync - client] Phân giải quyền hạn / phạm vi vụ việc
+identityClient --> policy: quyết định phân quyền
+alt Bị từ chối
+  policy --> ctrl: lỗi forbidden an toàn
+else Được phép
+  policy -> caseSvc: transition(caseId, action, expectedVersion)
+  caseSvc -> db: SELECT vụ việc / bằng chứng với điều kiện tenant / chi nhánh
+  db --> caseSvc: trạng thái / phiên bản hiện hành
+  caseSvc -> caseSvc: Kiểm tra tính hợp lệ bước chuyển và lý do bắt buộc
+  caseSvc -> db: CAS cập nhật con trỏ hiện hành + INSERT case_actions + outbox
+  alt Xung đột CAS
+    db --> caseSvc: 0 dòng được cập nhật
+    caseSvc --> ctrl: 409 conflict
+  else Thành công
+    db --> caseSvc: bước chuyển đã commit
+    caseSvc ->> outbox: phát hành AuditCaseActionRecorded.v1
+    caseSvc --> ctrl: phản hồi vụ việc hiện hành
+  end
+end
+@enduml
+----
+
+== 7. Xác minh digest phát hiện không khớp (Digest Verification Mismatch)
+
+=== 7.1 L1 — Luồng Hệ Thống (System Flow)
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Digest verification — L1: System Flow
+
+actor "Scheduler/Ops" as ops
+participant "Digest Worker" as digest
+database "Audit PostgreSQL" as db
+participant "Alert/Observability" as alert
+participant "Audit Service" as audit
+
+ops -> digest: [Nội bộ] Bắt đầu / giữ lease kiểm tra tính toàn vẹn
+digest -> db: SELECT lô digest + bằng chứng kiểm toán có thứ tự
+db --> digest: các dòng lô / checkpoint
+digest -> digest: Chuẩn hóa các trường allowlist + tính SHA-256
+digest -> db: Ghi nhận kết quả xác minh
+alt Digest trùng khớp (Matches)
+  digest --> ops: VERIFIED lô / checkpoint
+else Digest không khớp (Mismatch)
+  digest -> db: INSERT phát hiện toàn vẹn + đóng băng kết quả xác minh
+  digest -> alert: [HTTP/REST] Cảnh báo phát hiện lệch digest toàn vẹn
+  digest -> audit: [Nội bộ] Ghi nhận AuditIntegrityMismatchDetected.v1
+  digest --> ops: MISMATCH + yêu cầu điều tra hạn chế
+end
+@enduml
+----
+
+=== 7.2 L2 — Luồng Backend Nội Bộ (Internal Backend Flow)
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Digest verification — L2: Internal Backend Flow
+
+participant "Integrity Controller/Lease" as ctrl
+participant "Digest Service" as digestSvc
+participant "Canonicalizer" as canon
+database "Audit DB" as db
+participant "Integrity Finding Writer" as finding
+queue "Audit Outbox" as outbox
+
+ctrl -> digestSvc: xin giữ lease xác minh lô
+digestSvc -> db: SELECT metadata lô + danh sách ID sự kiện có sắp xếp
+db --> digestSvc: thông tin lô
+digestSvc -> canon: tuần tự hóa các trường sự kiện chuẩn tắc / phiên bản
+canon --> digestSvc: chuỗi byte chuẩn tắc
+digestSvc -> digestSvc: Tính toán SHA-256 + previousDigest
+digestSvc -> db: INSERT kết quả xác minh
+alt Khớp
+  db --> digestSvc: VERIFIED
+else Không khớp
+  digestSvc -> finding: createIntegrityFinding(batch)
+  finding -> db: INSERT phát hiện toàn vẹn bất biến
+  finding ->> outbox: phát hành AuditIntegrityMismatchDetected.v1
+end
+@enduml
+----
+
+== 8. Xuất file 7 năm / lưu trữ pháp lý / phát lại
+
+=== 8.1 L1 — Luồng Hệ Thống (System Flow)
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Audit export/legal hold/replay — L1: System Flow
+
+actor "Owner/Ops" as user
+participant "Audit API" as api
+participant "Identity" as identity
+participant "Export/Retention Worker" as worker
+database "Audit PostgreSQL" as db
+database "Encrypted Object Storage" as objectStore
+queue "EventBridge/SQS" as bus
+
+user -> api: [HTTP/REST] POST /api/v1/audit/exports
+api -> identity: [HTTP/REST] Phân giải quyền audit:operate + phạm vi
+alt Bị từ chối hoặc phạm vi không hợp lệ
+  identity --> api: forbidden / scope_not_allowed
+  api --> user: lỗi an toàn
+else Được cấp quyền
+  identity --> api: phạm vi / phiên bản
+  api -> db: INSERT tác vụ xuất dữ liệu có tính lũy kế
+  db --> api: operationId
+  api --> user: HTTP 202 pollUrl
+  worker -> db: Kiểm tra lại phạm vi / lệnh lưu trữ pháp lý / loại dữ liệu
+  alt Có lệnh lưu trữ pháp lý hoặc xung đột chính sách
+    worker -> db: Đánh dấu bị chặn / ghi nhận quyết định hold kiểm toán
+  else Xuất dữ liệu / archive được phép
+    worker -> db: Stream các dòng đã làm sạch có giới hạn
+    worker -> objectStore: [HTTP/REST] Upload file mã hóa / checksum / thời hạn
+    objectStore --> worker: tham chiếu object
+    worker -> db: Hoàn tất tác vụ + tham chiếu kiểm toán
+  end
+end
+
+opt Phát lại / Rebuild hạn chế
+  user -> api: [HTTP/REST] POST /internal/v1/audit/rebuilds
+  api ->> bus: [EventBridge/SQS] phát lại cửa sổ nguồn
+end
+@enduml
+----
+
+=== 8.2 L2 — Luồng Backend Nội Bộ (Internal Backend Flow)
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Audit export/legal hold/replay — L2: Internal Backend Flow
+
+participant "Operations Controller" as ctrl
+participant "Operations Policy" as policy
+participant "Identity Client" as identityClient
+participant "Export/Retention Service" as opSvc
+database "Audit DB" as db
+database "Encrypted Object Storage" as objectStore
+queue "Replay Outbox" as outbox
+
+ctrl -> policy: xác thực tác vụ / phạm vi / ngày / loại dữ liệu
+policy -> identityClient: [HTTP sync - client] Phân giải quyền audit:operate
+identityClient --> policy: phạm vi / phiên bản
+policy -> opSvc: createOrResumeOperation(idempotencyKey)
+opSvc -> db: SELECT tác vụ hiện tại + các lệnh lưu trữ pháp lý
+db --> opSvc: trạng thái tác vụ / hold
+alt Lệnh hold chặn thao tác
+  opSvc -> db: INSERT quyết định retention/export bị chặn
+else Xuất file được phép
+  opSvc -> db: Stream các dòng đã làm sạch với điều kiện phạm vi
+  opSvc -> objectStore: [HTTP sync - SDK] Put object mã hóa
+  objectStore --> opSvc: checksum / tham chiếu object
+  opSvc -> db: Đánh dấu tác vụ hoàn tất / hết hạn / tham chiếu kiểm toán
+end
+
+opt Phát lại (Replay)
+  opSvc ->> outbox: phát hành yêu cầu phát lại kèm cửa sổ nguồn
+end
+@enduml
+----
+
+== Kiểm tra xác thực biểu đồ (Diagram Validation)
+
+* 8 luồng nghiệp vụ quan trọng × 2 cấp độ = 16 khối PlantUML hoàn chỉnh.
+* Mỗi khối sử dụng `!theme toy`, `autonumber`, nhãn giao thức rõ ràng trên các mũi tên giao tiếp giữa các service, các nhánh `alt`/`opt` cho xử lý lỗi và chính sách.
+* Không có sự xuất hiện của API Gateway hay auth-service generic; Identity chỉ xuất hiện tại các điểm mà việc quyết định phân quyền hiện hành là một phần tường minh của luồng xử lý.
+* Không đưa vào các thành phần Repository/DAO; việc truy cập database được biểu diễn trực tiếp từ service nghiệp vụ tương ứng.

@@ -1,0 +1,558 @@
+= Module 8 — Gợi ý món / Upsell: Sequence Diagrams
+:toc:
+:sectnums:
+
+Ngày: 2026-10-13
+
+Các sơ đồ dưới đây là design-level diagrams. Repository hiện chưa có mã nguồn triển khai Recommendation; các service và nhà cung cấp ngoại vi ngoài ranh giới được biểu diễn theo các hợp đồng đã xác nhận.
+
+== Danh sách các thành phần tham gia (Participants)
+
+Cấp độ L1 biểu diễn: POS, Recommendation, Order, Catalog, Inventory, Loyalty, EventBridge/SQS, Reporting/Audit và DeepSeek khi luồng nghiệp vụ liên quan.
+
+Cấp độ L2 tập trung vào các cấu phần nội bộ: Controller, Application Service, Order Context Client, Eligibility Projection, Rule/Model Runtime, Recommendation DB và Outbox/ML Worker; không biểu diễn Repository/DAO riêng lẻ.
+
+== 1. Gợi ý giỏ hàng P0 (P0 cart recommendation) — L1: Luồng hệ thống (System Flow)
+
+[plantuml,recommendation-cart-l1,svg]
+....
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title P0 Cart Recommendation — L1: System Flow
+
+actor "Thu ngân / POS" as pos
+participant "Recommendation Service" as rec
+participant "Order Service" as order
+database "Recommendation PostgreSQL" as db
+
+pos -> rec: [HTTP/REST] POST /api/v1/recommendations
+rec -> order: [HTTP/REST] Phân giải ngữ cảnh giỏ hàng hiện tại
+order --> rec: orderId + cartVersion + các dòng món chuẩn tắc
+rec -> db: Nạp các luật active của tenant + hình chiếu khả dụng
+db --> rec: Phiên bản luật + trạng thái ứng viên
+rec -> rec: Lọc giỏ hàng / chi nhánh / khả dụng + xếp hạng tất định
+rec -> db: Lưu phiên gợi ý / danh sách ứng viên
+db --> rec: suggestionId + phiên bản phiên
+rec --> pos: HTTP 200 danh sách ứng viên + metadata luật/mô hình/độ tươi
+
+alt Không có luật hoặc ứng viên hợp lệ
+  rec --> pos: HTTP 200 items=[]
+end
+@enduml
+....
+
+== 1. Gợi ý giỏ hàng P0 (P0 cart recommendation) — L2: Luồng nội bộ backend (Internal Flow)
+
+[plantuml,recommendation-cart-l2,svg]
+....
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title P0 Cart Recommendation — L2: Internal Backend Flow
+
+participant RecommendationController as ctrl
+participant RecommendationApplicationService as app
+participant OrderContextClient as orderClient
+participant CandidateEligibilityProjection as elig
+participant RuleEngine/ModelRuntime as ranker
+database "Recommendation DB" as db
+
+ctrl -> app: getRecommendations(request)
+app -> app: Thẩm định auth / tenant / chi nhánh / đơn hàng / phiên bản
+app -> orderClient: resolveCart(orderId, cartVersion)
+orderClient --> app: Ngữ cảnh giỏ hàng chuẩn tắc
+app -> elig: loadEligibleCandidates(tenant, branch)
+elig -> db: Đọc hình chiếu món/khả dụng + watermark nguồn
+db --> elig: Trạng thái ứng viên / độ tươi
+elig --> app: Ngữ cảnh bộ lọc
+app -> ranker: rank(cart, active rules/model, candidates)
+ranker -> db: Đọc con trỏ luật / mô hình active
+db --> ranker: Dữ liệu tính điểm có đánh phiên bản
+ranker --> app: Danh sách top-K tất định + quy kết
+app -> db: Chèn phiên gợi ý / ứng viên
+db --> app: suggestionId
+app --> ctrl: RecommendationResponse
+@enduml
+....
+
+== 2. Ghi nhận hiển thị và chấp thuận (Suggestion shown/accepted) — L1: Luồng hệ thống (System Flow)
+
+[plantuml,recommendation-interaction-l1,svg]
+....
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Suggestion Shown/Accepted — L1: System Flow
+
+actor "Thu ngân / POS" as pos
+participant "Recommendation Service" as rec
+participant "Order Service" as order
+database "Recommendation PostgreSQL" as db
+queue "EventBridge/SQS" as bus
+participant "Reporting/Audit" as consumers
+
+pos -> rec: [HTTP/REST] POST /recommendations/{suggestionId}/shown
+rec -> db: Thẩm định phiên/ứng viên + khử trùng lặp tương tác
+db --> rec: Ghi nhận hiển thị đã commit
+rec ->> bus: [EventBridge async] phát sự kiện SuggestionShown.v1
+rec --> pos: HTTP 200 đã ghi nhận hiển thị
+
+pos -> order: [HTTP/REST] Thêm món được gợi ý vào đơn hàng
+order --> pos: HTTP 200 thêm dòng thành công + orderLineId/version
+pos -> rec: [HTTP/REST] POST /recommendations/{suggestionId}/accept
+rec -> db: Thẩm định bằng chứng + khử trùng lặp chấp thuận
+db --> rec: Ghi nhận chấp thuận đã commit
+rec ->> bus: [EventBridge async] phát sự kiện SuggestionAccepted.v1
+rec --> pos: HTTP 200 đã ghi nhận chấp thuận
+bus ->> consumers: [SQS async] Tiêu thụ sự kiện phân tích / kiểm toán
+
+alt Thêm dòng vào đơn thất bại
+  order --> pos: HTTP 409/422 từ chối thêm dòng
+  pos -> rec: Không gửi lệnh chấp thuận (no acceptance)
+end
+@enduml
+....
+
+== 2. Ghi nhận hiển thị và chấp thuận (Suggestion shown/accepted) — L2: Luồng nội bộ backend (Internal Flow)
+
+[plantuml,recommendation-interaction-l2,svg]
+....
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Suggestion Shown/Accepted — L2: Internal Backend Flow
+
+participant RecommendationController as ctrl
+participant RecommendationApplicationService as app
+participant CandidateEligibilityProjection as elig
+database "Recommendation DB" as db
+participant "Outbox/ML Worker" as worker
+
+ctrl -> app: recordShown(command)
+app -> elig: validateSessionCandidate(command)
+elig -> db: Đọc phiên + ứng viên + phạm vi/phiên bản
+db --> elig: Hợp lệ / Trùng lặp / Đã hết hạn
+elig --> app: Kết quả thẩm định
+app -> db: INSERT tương tác SHOWN + outbox
+db --> app: Đã commit hoặc trả kết quả lũy nghiệm
+app --> ctrl: 200 shown
+
+ctrl -> app: recordAccepted(command + bằng chứng thêm dòng)
+app -> elig: validateAcceptanceEvidence(command)
+elig -> db: Thẩm định bằng chứng phiên/món/đơn hàng
+db --> elig: Bằng chứng hợp lệ
+app -> db: INSERT tương tác ACCEPTED + outbox
+db --> app: Đã commit
+app --> ctrl: 200 accepted
+worker -> db: Xuất bản các sự kiện tương tác đang chờ
+@enduml
+....
+
+== 3. Hình chiếu khả dụng bị trễ (Stale availability projection) — L1: Luồng hệ thống (System Flow)
+
+[plantuml,recommendation-stale-l1,svg]
+....
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Stale Availability Projection — L1: System Flow
+
+actor "Thu ngân / POS" as pos
+participant "Recommendation Service" as rec
+participant "Catalog Service" as catalog
+participant "Inventory Service" as inventory
+participant "Order Service" as order
+queue "EventBridge/SQS" as bus
+
+catalog ->> bus: [EventBridge async] Sự kiện khả dụng v10
+inventory ->> bus: [EventBridge async] Sự kiện tồn kho v21
+bus ->> rec: [SQS async] Consumer hình chiếu cập nhật trạng thái
+
+pos -> rec: [HTTP/REST] Lấy gợi ý cho cartVersion=12
+rec -> rec: Kiểm tra watermark nguồn / thời hạn TTL
+alt Hình chiếu còn tươi (Fresh)
+  rec --> pos: HTTP 200 danh sách ứng viên đủ điều kiện
+else Hình chiếu bị trễ / thiếu dữ liệu (Stale)
+  rec --> pos: HTTP 200 lọc rỗng + cờ freshness=STALE
+end
+
+pos -> order: [HTTP/REST] Thêm món được chọn vào đơn
+order -> catalog: [HTTP/REST] Thẩm định trạng thái món / thực đơn
+order -> inventory: [HTTP/REST] Thẩm định / giữ tồn kho hiện tại
+alt Trạng thái thực tế hợp lệ
+  order --> pos: HTTP 200 đã thêm dòng
+else Trạng thái thực tế không khả dụng
+  order --> pos: HTTP 409 candidate_unavailable
+end
+@enduml
+....
+
+== 3. Hình chiếu khả dụng bị trễ (Stale availability projection) — L2: Luồng nội bộ backend (Internal Flow)
+
+[plantuml,recommendation-stale-l2,svg]
+....
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Stale Availability Projection — L2: Internal Backend Flow
+
+participant RecommendationController as ctrl
+participant RecommendationApplicationService as app
+participant CandidateEligibilityProjection as elig
+participant RuleEngine/ModelRuntime as ranker
+database "Recommendation DB" as db
+participant "Outbox/ML Worker" as worker
+
+ctrl -> app: getRecommendations(request)
+app -> elig: checkFreshness(tenant, branch, candidates)
+elig -> db: Đọc watermark nguồn / lastEventAt
+db --> elig: Trạng thái độ tươi
+alt Hình chiếu tươi
+  elig --> app: Tập ứng viên đủ điều kiện
+  app -> ranker: xếp hạng ứng viên
+  ranker --> app: Danh sách gợi ý
+else Hình chiếu quá hạn (Stale)
+  elig --> app: Tập rỗng / lọc an toàn + metadata stale
+  app -> app: Không gọi nhà cung cấp ngoại vi
+end
+app --> ctrl: 200 phản hồi an toàn
+worker -> db: Lưu / phát lại checkpoint sau khi commit sự kiện
+@enduml
+....
+
+== 4. Cá nhân hóa ALS P1 và fallback (P1 ALS request and fallback) — L1: Luồng hệ thống (System Flow)
+
+[plantuml,recommendation-als-l1,svg]
+....
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title P1 ALS Personalization — L1: System Flow
+
+actor "Thu ngân / POS" as pos
+participant "Loyalty Service" as loyalty
+participant "Recommendation Service" as rec
+participant "Order Service" as order
+database "Recommendation PostgreSQL" as db
+
+pos -> loyalty: [HTTP/REST] Phân giải SĐT thành ngữ cảnh khách hàng
+loyalty --> pos: customerKey opaque + tính đủ điều kiện / phiên bản
+pos -> rec: [HTTP/REST] Lấy gợi ý kèm customerKey opaque
+rec -> order: [HTTP/REST] Phân giải ngữ cảnh giỏ hàng hiện tại
+order --> rec: Các dòng món / phiên bản giỏ hàng
+rec -> db: Nạp con trỏ ALS active + ngữ cảnh đặc trưng khách hàng
+db --> rec: Tín hiệu mô hình/khách hàng hoặc báo thiếu
+
+alt Mô hình ALS khỏe mạnh + đủ tín hiệu
+  rec -> rec: Tính điểm ALS → lọc giỏ hàng / chi nhánh / khả dụng
+  rec --> pos: HTTP 200 reason=PERSONALIZED_ALS
+else Thiếu tín hiệu / mô hình không khả dụng / trượt cổng chất lượng
+  rec -> db: Nạp các luật kết hợp đang active
+  db --> rec: Danh sách luật
+  rec --> pos: HTTP 200 reason=COLD_START/ALS_FALLBACK
+end
+@enduml
+....
+
+== 4. Cá nhân hóa ALS P1 và fallback (P1 ALS request and fallback) — L2: Luồng nội bộ backend (Internal Flow)
+
+[plantuml,recommendation-als-l2,svg]
+....
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title P1 ALS Personalization — L2: Internal Backend Flow
+
+participant RecommendationController as ctrl
+participant RecommendationApplicationService as app
+participant OrderContextClient as orderClient
+participant CandidateEligibilityProjection as elig
+participant RuleEngine/ModelRuntime as runtime
+database "Recommendation DB" as db
+
+ctrl -> app: getRecommendations(customerKey)
+app -> app: Thẩm định khóa opaque / tenant / ngữ cảnh đồng thuận
+app -> orderClient: resolveCart(orderId, cartVersion)
+orderClient --> app: Giỏ hàng chuẩn tắc
+app -> runtime: scoreALS(customerKey, cart)
+runtime -> db: Đọc con trỏ mô hình active + đặc trưng khách hàng
+db --> runtime: Mô hình/tín hiệu khỏe mạnh hoặc không khả dụng
+
+alt ALS khả dụng
+  runtime -> elig: filterAndRankALS(candidates)
+  elig -> db: Đọc hình chiếu chi nhánh / catalog / tồn kho
+  db --> elig: Ứng viên đủ điều kiện
+  elig --> runtime: Top-K
+else ALS không khả dụng
+  runtime -> db: Đọc các luật kết hợp active
+  db --> runtime: Danh sách luật
+  runtime -> elig: filterAndRankRules(candidates)
+  elig --> runtime: Top-K dự phòng hoặc danh sách rỗng
+end
+runtime --> app: Danh sách gợi ý + lý do / phiên bản
+app --> ctrl: RecommendationResponse
+@enduml
+....
+
+== 5. Huấn luyện ALS ban đêm và kích hoạt mô hình (Nightly ALS train and activation) — L1: Luồng hệ thống (System Flow)
+
+[plantuml,recommendation-training-l1,svg]
+....
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Nightly ALS Training — L1: System Flow
+
+participant "Bộ lập lịch (Scheduler)" as scheduler
+participant "Recommendation/ML Worker" as worker
+participant "Order Service" as order
+participant "Recommendation Service" as rec
+database "Recommendation PostgreSQL" as db
+collections "Lưu trữ đối tượng (Object Storage)" as store
+queue "EventBridge/SQS" as bus
+
+scheduler -> worker: [HTTP/REST] Xếp hàng lần chạy huấn luyện ban đêm
+worker -> rec: [HTTP/REST] Tạo lần chạy huấn luyện lũy nghiệm
+rec -> db: Khóa lần chạy tenant/dòng mô hình + watermark nguồn
+db --> rec: Lần chạy được chấp nhận
+rec --> worker: HTTP 202 runId
+worker -> order: [HTTP/REST] Đọc/xuất ranh giới ảnh chụp đơn đã thanh toán
+order --> worker: Dữ kiện OrderPaid / watermark nguồn
+worker -> store: [HTTPS] Ghi ảnh chụp huấn luyện bất biến
+store --> worker: URI ảnh chụp / mã băm checksum
+worker -> worker: Huấn luyện ALS phân lập theo từng tenant
+worker -> rec: [HTTP/REST] Gửi các chỉ số ứng viên / manifest artifact
+
+alt Vượt qua các cổng chất lượng / bảo mật / cách ly dữ liệu
+  rec -> db: Cập nhật CAS con trỏ active sang mô hình ứng viên
+  rec ->> bus: [EventBridge async] phát sự kiện RecommendationModelActivated.v1
+  rec --> worker: HTTP 200 ACTIVE
+else Trượt cổng kiểm soát hoặc lỗi huấn luyện
+  rec -> db: Giữ nguyên mô hình active cũ; đánh dấu REJECTED/FAILED
+  rec ->> bus: [EventBridge async] phát sự kiện RecommendationTrainingRunCompleted.v1
+  rec --> worker: HTTP 200 RETAIN_PREVIOUS
+end
+@enduml
+....
+
+== 5. Huấn luyện ALS ban đêm và kích hoạt mô hình (Nightly ALS train and activation) — L2: Luồng nội bộ backend (Internal Flow)
+
+[plantuml,recommendation-training-l2,svg]
+....
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Nightly ALS Training — L2: Internal Backend Flow
+
+participant TrainingOrchestrator as orch
+participant PaidSnapshotBuilder as snap
+participant ALSTrainer as trainer
+participant ModelValidator as validator
+database "Recommendation DB" as db
+collections "Object Storage" as store
+participant ModelRegistry as registry
+
+orch -> db: Xin khóa thuê (lease) lần chạy tenant/dòng mô hình
+db --> orch: Lần chạy + watermark nguồn
+orch -> snap: buildPaidInteractionSnapshot(watermark)
+snap -> db: Đọc các tương tác/đặc trưng đã thanh toán khử trùng lặp
+db --> snap: Các dòng dữ liệu phân lập theo tenant
+snap -> store: Ghi manifest / blob ảnh chụp
+store --> snap: URI / checksum
+snap --> orch: Ảnh chụp sẵn sàng
+orch -> trainer: train(snapshot)
+trainer -> store: Ghi artifact ứng viên
+store --> trainer: URI artifact / checksum
+trainer --> orch: Các chỉ số ứng viên / manifest
+orch -> validator: validate(candidate)
+validator -> validator: Kiểm tra cổng chất lượng/độ bao phủ/rò rỉ/checksum
+
+alt Hợp lệ (Valid)
+  validator --> orch: PASS
+  orch -> registry: Cập nhật CAS kích hoạt ứng viên
+  registry -> db: Cập nhật con trỏ active + audit/outbox
+  db --> registry: ACTIVE
+else Không hợp lệ (Invalid)
+  validator --> orch: FAIL
+  orch -> db: Đánh dấu ứng viên bị từ chối / thất bại
+end
+@enduml
+....
+
+== 6. Xử lý sự cố mô hình, rollback và phát lại (Model failure, rollback and replay) — L1: Luồng hệ thống (System Flow)
+
+[plantuml,recommendation-model-recovery-l1,svg]
+....
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Model Failure/Rollback/Replay — L1: System Flow
+
+actor "Chủ chuỗi / Vận hành" as ops
+participant "Recommendation Service" as rec
+participant "ML Worker" as worker
+database "Recommendation PostgreSQL" as db
+collections "Object Storage" as store
+queue "EventBridge/SQS" as bus
+
+rec -> db: Phát hiện sự cố nạp mô hình / sai lệch checksum / chất lượng
+db --> rec: Mô hình active không khỏe mạnh
+rec -> rec: Chuyển runtime sang chế độ dự phòng bằng luật kết hợp
+rec ->> bus: [EventBridge async] phát chỉ số sức khỏe mô hình / fallback
+
+ops -> rec: [HTTP/REST] Yêu cầu rollback(activeModelVersion)
+rec -> db: Thẩm định mô hình trước đó + CAS con trỏ active
+db --> rec: Mô hình đã được thẩm định trước đó
+rec ->> bus: [EventBridge async] phát sự kiện RecommendationModelRolledBack.v1
+rec --> ops: HTTP 200 rollback hoàn tất
+
+ops -> worker: [HTTP/REST] Phát lại lần chạy huấn luyện từ snapshotId
+worker -> store: [HTTPS] Đọc ảnh chụp bất biến
+store --> worker: Ảnh chụp / checksum
+worker -> rec: [HTTP/REST] Nộp ứng viên mới để thẩm định
+rec --> worker: HTTP 202 tiếp nhận thẩm định ứng viên
+@enduml
+....
+
+== 6. Xử lý sự cố mô hình, rollback và phát lại (Model failure, rollback and replay) — L2: Luồng nội bộ backend (Internal Flow)
+
+[plantuml,recommendation-model-recovery-l2,svg]
+....
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Model Failure/Rollback/Replay — L2: Internal Backend Flow
+
+participant RecommendationController as ctrl
+participant RecommendationApplicationService as app
+participant RuleEngine/ModelRuntime as runtime
+participant ModelRegistry as registry
+database "Recommendation DB" as db
+participant "Outbox/ML Worker" as worker
+
+runtime -> registry: loadActiveModel()
+registry -> db: Đọc con trỏ / checksum
+db --> registry: Manifest artifact
+registry -> registry: Xác minh tính toàn vẹn checksum / nạp mô hình
+alt Nạp thất bại
+  registry --> runtime: Không khỏe mạnh (Unhealthy)
+  runtime -> runtime: Kích hoạt fallback về luật kết hợp
+else Nạp thành công
+  registry --> runtime: Mô hình sẵn sàng
+end
+
+ctrl -> app: rollback(modelVersion)
+app -> registry: rollbackTo(previousValidated)
+registry -> db: Cập nhật CAS con trỏ + audit/outbox
+db --> registry: Rollback đã commit
+app --> ctrl: 200 rollback
+worker -> db: Phát lại lần chạy dựa trên manifest ảnh chụp bất biến
+@enduml
+....
+
+== 7. Khởi động nguội với DeepSeek P2 (P2 DeepSeek cold-start) — L1: Luồng hệ thống (System Flow)
+
+[plantuml,recommendation-cold-start-l1,svg]
+....
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title DeepSeek Cold-Start Enrichment — L1: System Flow
+
+participant "Catalog Service" as catalog
+queue "EventBridge/SQS" as bus
+participant "Recommendation/ML Worker" as worker
+participant "DeepSeek Adapter" as adapter
+participant DeepSeek as llm
+database "Recommendation PostgreSQL" as db
+actor "Chủ chuỗi / Người xét duyệt" as owner
+
+catalog ->> bus: [EventBridge async] phát sự kiện ItemCreated/Updated.v1
+bus ->> worker: [SQS async] Đưa tác vụ cold-start vào hàng đợi
+worker -> db: Tạo tác vụ ứng viên lũy nghiệm
+db --> worker: Tác vụ được chấp nhận
+worker -> adapter: Khử độc metadata + áp dụng ngân sách / phiên bản prompt
+adapter -> llm: [HTTP/REST async] Sinh các nhãn / đặc trưng có cấu trúc
+llm --> adapter: JSON ứng viên / nguồn gốc dữ liệu
+adapter -> adapter: Thẩm định schema / từ vựng / an toàn / độ tin cậy
+adapter -> db: Lưu đặc trưng ứng viên ở trạng thái PENDING_REVIEW
+db --> adapter: ID ứng viên
+adapter --> worker: Tác vụ hoàn tất
+worker ->> bus: [EventBridge async] phát sự kiện ColdStartFeatureCandidateCreated.v1
+owner -> db: [HTTP/REST] Xem xét và phê duyệt ứng viên
+db --> owner: Đặc trưng đã active / bị từ chối
+@enduml
+....
+
+== 7. Khởi động nguội với DeepSeek P2 (P2 DeepSeek cold-start) — L2: Luồng nội bộ backend (Internal Flow)
+
+[plantuml,recommendation-cold-start-l2,svg]
+....
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title DeepSeek Cold-Start Enrichment — L2: Internal Backend Flow
+
+participant ColdStartWorker as worker
+participant PromptSafetyAdapter as adapter
+participant StructuredOutputValidator as validator
+database "Recommendation DB" as db
+collections "Object Storage" as store
+participant "Outbox/ML Worker" as publisher
+
+worker -> db: Xin khóa thuê tác vụ cold-start
+db --> worker: Ứng viên metadata từ Catalog
+worker -> adapter: sanitizeAndBuildPrompt(metadata)
+adapter --> worker: Payload được phép + phiên bản prompt
+worker -> adapter: callProvider(payload)
+adapter --> worker: Dữ liệu phản hồi chưa đáng tin cậy
+worker -> validator: validate(response)
+validator -> validator: Kiểm tra schema / từ vựng / an toàn / độ tin cậy
+alt Hợp lệ (Valid)
+  validator --> worker: Ứng viên được chấp nhận để xét duyệt
+  worker -> db: INSERT đặc trưng ứng viên PENDING_REVIEW
+  db --> worker: ID ứng viên
+else Không hợp lệ / Quá thời gian chờ (Invalid/timeout)
+  validator --> worker: Từ chối / thử lại / đưa vào DLQ
+  worker -> db: Ghi nhận lỗi mà không làm thay đổi Catalog
+end
+publisher -> db: Xuất bản sự kiện ứng viên / outbox
+@enduml
+....
+
+== Ghi chú thiết kế (Design notes)
+
+* Recommendation tuyệt đối không đọc trực tiếp database của Order, Catalog, Inventory hay Loyalty; ngữ cảnh Order được lấy qua API nội bộ có giới hạn thời gian hoặc từ hình chiếu cục bộ khớp phiên bản; các nguồn còn lại đi qua các sự kiện / hình chiếu có đánh phiên bản.
+* Thao tác thêm dòng của Order là thẩm quyền tối cao. Dữ liệu Recommendation bị cũ hoặc sự cố từ hệ thống phân tích / nhà cung cấp ngoại vi không được phép làm gián đoạn luồng checkout.
+* `SuggestionAccepted` chỉ được ghi nhận sau khi có bằng chứng thêm dòng thành công; sự kiện `OrderPaid.v1` vẫn là nguồn dữ liệu chuẩn mực duy nhất cho doanh thu và huấn luyện mô hình.
+* Các phiên bản mô hình/luật ALS cùng watermark hình chiếu được trả về và ghi nhận đầy đủ nhằm phục vụ việc phát lại, rollback và kiểm toán.
+* DeepSeek và dịch vụ thời tiết hoàn toàn không nằm trên luồng xử lý thời gian thực P0/P1.

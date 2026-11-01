@@ -1,0 +1,575 @@
+= Module 7 — Ca làm việc: Sequence Diagrams
+:toc:
+:sectnums:
+
+Ngày: 2026-10-13
+
+Các sơ đồ dưới đây là design-level diagrams. Shift service chưa có implementation source trong repository; các service ngoài boundary được biểu diễn theo contracts đã xác nhận.
+
+== Participants
+
+L1 dùng các participant ở system boundary: POS Client, Shift Service, Order/Checkout Saga, Payment Service, Shift PostgreSQL, EventBridge/SQS và Reporting/Audit.
+
+L2 dùng các participant có ý nghĩa kiến trúc trong Shift Service: Controller, Application Service, Admission/Fence Coordinator, Cash Summary/Reconciliation Engine, Shift DB và Outbox/Close Worker.
+
+== 1. Open race — L1: System Flow
+
+[plantuml,shift-open-race-l1,svg]
+....
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Shift Open Race — L1: System Flow
+
+actor "POS Client" as pos
+participant "Shift Service" as shift
+database "Shift PostgreSQL" as db
+queue "EventBridge/SQS" as bus
+participant "Reporting/Audit" as consumers
+
+par Cashier A
+  pos -> shift: [HTTP/REST] POST /api/v1/branches/{branchId}/shifts
+  shift -> db: Lock branch slot + check active shift
+  db --> shift: Slot available
+  shift -> db: Insert ACTIVE shift + ShiftOpened outbox
+  db --> shift: Commit shift A
+  shift --> pos: HTTP 201 Shift A ACTIVE
+else Cashier B concurrently
+  pos -> shift: [HTTP/REST] POST /api/v1/branches/{branchId}/shifts
+  shift -> db: Wait for branch slot/unique constraint
+  db --> shift: Active shift A exists
+  shift --> pos: HTTP 409 shift_already_open
+end
+
+shift ->> bus: [EventBridge async] publish ShiftOpened.v1
+bus ->> consumers: [SQS async] consume event idempotently
+@enduml
+....
+
+== 1. Open race — L2: Internal Flow
+
+[plantuml,shift-open-race-l2,svg]
+....
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Shift Open Race — L2: Internal Backend Flow
+
+participant Controller as ctrl
+participant ShiftApplicationService as app
+participant AdmissionFenceCoordinator as fence
+database "Shift DB" as db
+queue "Outbox/Close Worker" as worker
+
+par Request A
+  ctrl -> app: openShift(request A)
+  app -> app: Validate tenant/branch/role/idempotency
+  app -> fence: acquireOpenSlot()
+  fence -> db: SELECT branch/active slot FOR UPDATE
+  db --> fence: Slot available
+  fence -> db: INSERT shift + outbox
+  db --> fence: Commit ACTIVE shift A
+  fence --> app: Shift A
+  app --> ctrl: 201 Shift A
+else Request B
+  ctrl -> app: openShift(request B)
+  app -> fence: acquireOpenSlot()
+  fence -> db: SELECT branch/active slot FOR UPDATE
+  db --> fence: Shift A exists
+  fence --> app: shift_already_open
+  app --> ctrl: 409 Conflict
+end
+
+worker -> db: Publish pending ShiftOpened outbox
+@enduml
+....
+
+== 2. Admission before/after fence — L1: System Flow
+
+[plantuml,shift-admission-fence-l1,svg]
+....
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Admission Before/After Close Fence — L1: System Flow
+
+actor "POS Client" as pos
+participant "Order Service / Checkout Saga" as order
+participant "Shift Service" as shift
+participant "Payment Service" as payment
+database "Shift PostgreSQL" as db
+
+pos -> order: [HTTP/REST] Start checkout with shiftId
+order -> shift: [HTTP/REST] POST internal transaction-admissions
+shift -> db: Lock ACTIVE shift, increment admission_seq
+db --> shift: admissionId=A, seq=N
+shift --> order: HTTP 201 Admission A
+order --> pos: Checkout accepted for processing
+
+par Close races with payment
+  pos -> shift: [HTTP/REST] POST close
+  shift -> db: Lock shift; phase OPEN -> CLOSING
+  db --> shift: closeFenceSeq=N
+  shift --> pos: HTTP 202 closeStatus=PROCESSING
+else Existing admission completes
+  order -> payment: [HTTP/REST] initiate cash payment with admissionId=A
+  payment -> shift: [HTTP/REST] POST cash fact/completion for A
+  shift -> db: Accept fact seq N; mark admission terminal
+  db --> shift: Fact deduplicated/committed
+  shift --> payment: HTTP 202/200 accepted
+end
+
+order -> shift: [HTTP/REST] New admission after fence
+shift -> db: Observe phase CLOSING
+db --> shift: Reject admission
+shift --> order: HTTP 409 transaction_after_close_fence
+@enduml
+....
+
+== 2. Admission before/after fence — L2: Internal Flow
+
+[plantuml,shift-admission-fence-l2,svg]
+....
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Admission Before/After Close Fence — L2: Internal Backend Flow
+
+participant Controller as ctrl
+participant ShiftApplicationService as app
+participant AdmissionFenceCoordinator as fence
+participant CashSummaryReconciliationEngine as cash
+database "Shift DB" as db
+participant "Outbox/Close Worker" as worker
+
+par Admission wins row lock
+  ctrl -> app: admitTransaction(request)
+  app -> fence: admit(request)
+  fence -> db: Lock shift + validate phase OPEN
+  db --> fence: seq N, admission A
+  fence -> db: Insert admission A
+  fence --> app: admission A
+  app --> ctrl: 201 admission A
+else Close obtains row lock
+  ctrl -> app: closeShift(request)
+  app -> fence: establishFence(shift)
+  fence -> db: Lock shift + phase OPEN -> CLOSING
+  db --> fence: closeFenceSeq=N
+  fence --> app: close operation PROCESSING
+  app --> ctrl: 202 PROCESSING
+end
+
+worker -> db: Poll pre-fence admissions
+worker -> cash: finalizeWhenTerminal(shift, fence)
+cash -> db: Read deduped facts + admission watermark
+db --> cash: Complete or unresolved summary
+@enduml
+....
+
+== 3. P0 close — L1: System Flow
+
+[plantuml,shift-p0-close-l1,svg]
+....
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title P0 Close Shift — L1: System Flow
+
+actor "Cashier / Manager" as user
+participant "Shift Service" as shift
+participant "Payment Service" as payment
+database "Shift PostgreSQL" as db
+queue "EventBridge/SQS" as bus
+participant "Reporting/Audit" as consumers
+
+user -> shift: [HTTP/REST] POST /api/v1/shifts/{shiftId}/close
+shift -> db: Lock ACTIVE shift; OPEN -> CLOSING
+db --> shift: Fence committed
+shift --> user: HTTP 202 closeStatus=PROCESSING
+
+loop Until all pre-fence admissions terminal
+  shift -> db: Read pending admissions <= closeFenceSeq
+  db --> shift: Admission state/fact watermark
+end
+
+alt Drain complete
+  shift -> db: CLOSING/FROZEN -> CLOSED + audit + ShiftClosed outbox
+  db --> shift: Commit terminal close
+  shift --> user: HTTP 200 CLOSED
+  shift ->> bus: [EventBridge async] publish ShiftClosed.v1
+  bus ->> consumers: [SQS async] consume close fact
+else Drain timeout or unresolved fact
+  shift -> db: CLOSING -> PENDING_REVIEW + reconciliation case
+  db --> shift: Commit safe review state
+  shift --> user: HTTP 200 PENDING_REVIEW
+end
+
+payment -> shift: [HTTP/REST] Late fact with admission after fence
+shift -> db: Create reconciliation case; no closed-state mutation
+@enduml
+....
+
+== 3. P0 close — L2: Internal Flow
+
+[plantuml,shift-p0-close-l2,svg]
+....
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title P0 Close Shift — L2: Internal Backend Flow
+
+participant Controller as ctrl
+participant ShiftApplicationService as app
+participant AdmissionFenceCoordinator as fence
+participant CashSummaryReconciliationEngine as cash
+database "Shift DB" as db
+participant "Outbox/Close Worker" as worker
+
+ctrl -> app: closeShift(command)
+app -> fence: establishFence(shiftId)
+fence -> db: Lock row; set CLOSING + fence seq/time
+db --> fence: Fence version
+fence --> app: close operation
+app --> ctrl: 202 PROCESSING
+
+worker -> db: Load pre-fence pending admissions
+worker -> cash: drainAndSummarize(shift, fence)
+cash -> db: Read admissions + cash facts
+db --> cash: Terminal or unresolved
+
+alt All terminal
+  cash --> worker: Complete summary
+  worker -> db: Set FROZEN/CLOSED + outbox + audit
+  db --> worker: Commit
+else Timeout
+  cash --> worker: Unresolved pre-fence admission
+  worker -> db: Set PENDING_REVIEW + reconciliation case
+  db --> worker: Commit safe state
+end
+@enduml
+....
+
+== 4. P1 count and review — L1: System Flow
+
+[plantuml,shift-p1-review-l1,svg]
+....
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title P1 Count and Review — L1: System Flow
+
+actor Cashier as cashier
+actor "Manager/Owner" as manager
+participant "Shift Service" as shift
+participant "Payment Service" as payment
+database "Shift PostgreSQL" as db
+queue "EventBridge/SQS" as bus
+participant "Reporting/Audit" as consumers
+
+cashier -> shift: [HTTP/REST] Close with countedCashMinor
+shift -> db: Establish fence + drain admissions
+payment -> shift: [HTTP/REST] Cash facts with admissionId
+shift -> db: Deduplicate facts and calculate expected cash
+db --> shift: expected, discrepancy, threshold snapshot
+
+alt Within threshold
+  shift -> db: Insert immutable count; ACTIVE -> CLOSED
+  shift ->> bus: [EventBridge async] ShiftCountSubmitted + ShiftClosed
+  shift --> cashier: HTTP 200 CLOSED
+else Over threshold
+  shift -> db: Insert immutable count; ACTIVE -> PENDING_REVIEW
+  shift ->> bus: [EventBridge async] ShiftReviewRequired.v1
+  shift --> cashier: HTTP 200 PENDING_REVIEW
+  manager -> shift: [HTTP/REST] Approve latest count
+  shift -> db: Lock shift + If-Match review version
+  db --> shift: Version valid
+  shift -> db: PENDING_REVIEW -> CLOSED + audit/outbox
+  shift --> manager: HTTP 200 CLOSED
+end
+
+bus ->> consumers: [SQS async] Consume count/review/close facts
+@enduml
+....
+
+== 4. P1 count and review — L2: Internal Flow
+
+[plantuml,shift-p1-review-l2,svg]
+....
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title P1 Count and Review — L2: Internal Backend Flow
+
+participant Controller as ctrl
+participant ShiftApplicationService as app
+participant AdmissionFenceCoordinator as fence
+participant CashSummaryReconciliationEngine as cash
+database "Shift DB" as db
+participant "Outbox/Close Worker" as worker
+
+ctrl -> app: closeWithCount(command)
+app -> fence: establishFenceAndDrain()
+fence -> db: Set CLOSING; read admission watermark
+db --> fence: Fence/fact completeness
+fence -> cash: calculateExpectedCash(snapshot)
+cash -> db: Read opening float + cash facts + policy
+db --> cash: expected/discrepancy/threshold
+
+alt Within threshold
+  cash --> app: closeable
+  app -> db: Insert immutable count + CLOSED + outbox
+  db --> app: Commit
+else Over threshold
+  cash --> app: review required
+  app -> db: Insert immutable count + PENDING_REVIEW + outbox
+  db --> app: Commit review state
+  ctrl -> app: approveCount(If-Match)
+  app -> db: Lock latest count + verify review version
+  db --> app: Version valid
+  app -> db: CLOSED + approval audit + outbox
+end
+
+worker -> db: Publish pending events
+@enduml
+....
+
+== 5. Recount — L1: System Flow
+
+[plantuml,shift-recount-l1,svg]
+....
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Recount — L1: System Flow
+
+actor Cashier as cashier
+actor "Manager/Owner" as manager
+participant "Shift Service" as shift
+database "Shift PostgreSQL" as db
+queue "EventBridge/SQS" as bus
+
+manager -> shift: [HTTP/REST] Request recount for latest attempt
+shift -> db: Lock PENDING_REVIEW; mark attempt RECOUNT_REQUIRED
+db --> shift: New review version
+shift ->> bus: [EventBridge async] ShiftRecountRequested.v1
+shift --> manager: HTTP 200 recount required
+
+cashier -> shift: [HTTP/REST] Submit new immutable count attempt
+shift -> db: Calculate discrepancy with same fence facts
+db --> shift: Attempt 2 stored
+alt Within threshold
+  shift -> db: Keep PENDING_REVIEW until manager approval
+else Still over threshold
+  shift -> db: Keep PENDING_REVIEW + note required
+end
+
+manager -> shift: [HTTP/REST] Approve latest attempt with If-Match
+shift -> db: PENDING_REVIEW -> CLOSED
+shift --> manager: HTTP 200 CLOSED
+@enduml
+....
+
+== 5. Recount — L2: Internal Flow
+
+[plantuml,shift-recount-l2,svg]
+....
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Recount — L2: Internal Backend Flow
+
+participant Controller as ctrl
+participant ShiftApplicationService as app
+participant AdmissionFenceCoordinator as fence
+participant CashSummaryReconciliationEngine as cash
+database "Shift DB" as db
+participant "Outbox/Close Worker" as worker
+
+ctrl -> app: requestRecount(countAttemptId)
+app -> db: Lock shift + latest attempt; mark RECOUNT_REQUIRED
+db --> app: review version incremented
+app --> ctrl: 200 recount required
+
+ctrl -> app: submitRecount(countCommand)
+app -> fence: verify shift remains fenced/frozen
+fence -> db: Validate no reopen + load fence snapshot
+db --> fence: Snapshot available
+app -> cash: calculateAttempt(snapshot, countedCash)
+cash -> db: Insert immutable attempt 2
+db --> cash: Attempt 2
+app --> ctrl: 201 count attempt
+
+ctrl -> app: approveLatest(If-Match)
+app -> db: Lock latest attempt + close shift
+db --> app: CLOSED
+app ->> worker: enqueue outbox publication
+@enduml
+....
+
+== 6. Cancel abandoned shift — L1: System Flow
+
+[plantuml,shift-cancel-l1,svg]
+....
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+
+title Cancel Abandoned Shift — L1: System Flow
+
+actor "Manager/Owner" as manager
+participant "Shift Service" as shift
+participant "Payment Service" as payment
+database "Shift PostgreSQL" as db
+queue "EventBridge/SQS" as bus
+
+manager -> shift: [HTTP/REST] POST /api/v1/shifts/{shiftId}/cancel
+shift -> db: Lock ACTIVE shift; check cash admissions
+db --> shift: No admitted cash transaction
+
+shift -> shift: Validate reason + openingFloatReturnedMinor = openingFloatMinor
+alt Full opening float returned
+  shift -> db: ACTIVE -> CANCELLED + return audit + outbox
+  db --> shift: Commit cancellation
+  shift ->> bus: [EventBridge async] ShiftCancelled.v1
+  shift --> manager: HTTP 200 CANCELLED
+else Cash transaction exists or return incomplete
+  shift --> manager: HTTP 409 opening_float_not_returned / shift_not_cancellable
+end
+
+payment -> shift: [HTTP/REST] Late cash fact
+shift -> db: Recheck source/admission; reject cancellation path or create case
+@enduml
+....
+
+== 6. Cancel abandoned shift — L2: Internal Flow
+
+[plantuml,shift-cancel-l2,svg]
+....
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Cancel Abandoned Shift — L2: Internal Backend Flow
+
+participant Controller as ctrl
+participant ShiftApplicationService as app
+participant AdmissionFenceCoordinator as fence
+participant CashSummaryReconciliationEngine as cash
+database "Shift DB" as db
+participant "Outbox/Close Worker" as worker
+
+ctrl -> app: cancelShift(command)
+app -> fence: verifyCancellable(shift)
+fence -> db: Lock ACTIVE shift + query admitted cash
+db --> fence: No cash admission
+app -> cash: validateOpeningFloatReturn(command)
+cash --> app: Full return confirmed
+app -> db: Set CANCELLED + audit + outbox
+db --> app: Commit
+app --> ctrl: 200 CANCELLED
+
+worker -> db: Publish ShiftCancelled outbox
+@enduml
+....
+
+== 7. Late/duplicate cash fact — L1: System Flow
+
+[plantuml,shift-late-fact-l1,svg]
+....
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Late/Duplicate Cash Fact — L1: System Flow
+
+participant "Payment Service" as payment
+participant "Shift Service" as shift
+database "Shift PostgreSQL" as db
+queue "EventBridge/SQS" as bus
+participant "Reporting/Audit" as consumers
+
+payment -> shift: [HTTP/REST] POST cash fact
+shift -> db: Validate tenant/branch/shift/admission/source key
+
+alt Known source duplicate
+  db --> shift: Existing fact/source key
+  shift --> payment: HTTP 200 idempotent no-op
+else Fact admitted after fence or unknown/mismatch
+  shift -> db: Insert reconciliation case + audit; do not mutate closed shift
+  db --> shift: Case created
+  shift ->> bus: [EventBridge async] ShiftReconciliationCaseOpened.v1
+  shift --> payment: HTTP 409 late_cash_fact_reconciliation_required
+end
+
+bus ->> consumers: [SQS async] Consume reconciliation fact
+@enduml
+....
+
+== 7. Late/duplicate cash fact — L2: Internal Flow
+
+[plantuml,shift-late-fact-l2,svg]
+....
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Late/Duplicate Cash Fact — L2: Internal Backend Flow
+
+participant Controller as ctrl
+participant ShiftApplicationService as app
+participant AdmissionFenceCoordinator as fence
+participant CashSummaryReconciliationEngine as cash
+database "Shift DB" as db
+participant "Outbox/Close Worker" as worker
+
+ctrl -> app: ingestCashFact(fact)
+app -> fence: validateAdmissionAndFence(fact)
+fence -> db: Check shift phase, fence seq and source key
+db --> fence: Existing/late/mismatch result
+
+alt Duplicate source key
+  fence --> app: Idempotent existing fact
+  app --> ctrl: 200 no-op
+else Late or mismatched
+  app -> cash: createReconciliationCase(fact, reason)
+  cash -> db: Insert case + audit reference + outbox
+  db --> cash: Case ID
+  cash --> app: Reconciliation required
+  app --> ctrl: 409 reconciliation_required
+end
+
+worker -> db: Publish case event / retry if needed
+@enduml
+....
+
+== Design notes
+
+* `CLOSING` và `FROZEN` là internal admission phases; public lifecycle vẫn là `ACTIVE`, `PENDING_REVIEW`, `CLOSED`, `CANCELLED`.
+* Close không giữ database transaction mở trong lúc drain. Fence commit trước, close worker xử lý bằng version và idempotency.
+* Một cash fact được tính vào expected cash chỉ khi có tenant/branch/shift scope, admission hợp lệ trước fence, source key chưa từng xử lý và trạng thái payment/refund hợp lệ.
+* Không có flow tự động reopen shift hoặc sửa count/fact đã submit.

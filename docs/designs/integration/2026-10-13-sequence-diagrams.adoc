@@ -1,0 +1,680 @@
+= Module 12 — Integration & Demo Orchestration Sequence Diagrams
+
+Started at: 2026/10/13 00:00:00  
+Finished at: 2026/10/13 00:00:00  
+Total time: 0 minutes  
+---
+
+**Status:** Design-level diagrams; participant set confirmed by user.  
+**Source note:** Repository chưa có application source; diagrams trace approved parent contracts và Module 12 architecture, không phải runtime trace.
+
+== 1. Capture invoice recipient consent
+
+=== 1.1 L1 — System flow
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Capture Invoice Recipient Consent — L1: System Flow
+
+actor "Cashier/POS" as pos
+participant "Identity" as id
+participant "Integration Runtime" as int
+database "Integration PostgreSQL" as db
+
+pos -> id: [HTTP/REST] Resolve permission + branch scope
+id --> pos: Authorized scope
+pos -> int: [HTTP/REST] POST /api/v1/invoice-recipient-intents
+int -> id: [HTTP/REST] Verify order/branch scope
+id --> int: Scope decision
+alt Invalid contact or consent
+  int --> pos: HTTP 422 invalid_contact_or_consent
+else Valid preference
+  int -> db: [SQL] INSERT consent snapshot + idempotency record
+  db --> int: invoiceRecipientRef + version
+  int --> pos: HTTP 201 opaque invoiceRecipientRef
+end
+
+@enduml
+----
+
+=== 1.2 L2 — Internal backend flow
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Capture Invoice Recipient Consent — L2: Internal Backend Flow
+
+participant "InvoiceRecipientController" as ctrl
+participant "ScopeClient" as scope
+participant "RecipientPreferenceService" as svc
+database "Integration DB" as db
+queue "Outbox" as outbox
+
+ctrl -> ctrl: Validate JWT, idempotency key and body
+ctrl -> scope: [HTTP/REST] authorize branch/order context
+scope --> ctrl: Resolved scope
+ctrl -> svc: prepareRecipient(request, scope)
+activate svc
+svc -> svc: Normalize channel/contact and consent version
+alt Invalid input or scope
+  svc --> ctrl: Validation/authorization error
+else Valid input
+  svc -> db: [SQL] SELECT idempotency + active snapshot
+  db --> svc: Existing / none
+  svc -> db: [SQL] INSERT immutable recipient snapshot
+  db --> svc: Opaque recipient ref
+  svc -> outbox: [SQL] Queue redacted audit reference
+  svc --> ctrl: RecipientResponse
+end
+deactivate svc
+ctrl --> ctrl: Map safe response
+
+@enduml
+----
+
+== 2. OrderPaid to technical invoice
+
+=== 2.1 L1 — System flow
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title OrderPaid to Invoice — L1: System Flow
+
+participant "Order Service" as order
+queue "EventBridge/SQS + DLQ" as bus
+participant "Integration Runtime" as int
+database "Integration PostgreSQL" as db
+participant "Invoice Sandbox Provider" as provider
+
+order ->> bus: [EventBridge/SQS async] publish OrderPaid.v1
+bus ->> int: [EventBridge/SQS async] deliver OrderPaid.v1
+int -> db: [SQL] Deduplicate inbox + create invoice operation
+db --> int: REQUESTED / existing operation
+alt Duplicate or already issued
+  int -> db: [SQL] Read current operation
+  db --> int: Existing status
+else New operation
+  int ->> bus: [EventBridge/SQS async] InvoiceOperationRequested.v1
+  int -> provider: [HTTP/REST] Issue technical invoice + idempotency key
+  alt Provider accepted
+    provider --> int: 200 provider ref
+    int -> db: [SQL] Commit ISSUED + provider attempt + outbox
+    int ->> bus: [EventBridge/SQS async] InvoiceIssued.v1
+  else Timeout/retryable failure
+    provider --> int: Timeout/429/5xx
+    int -> db: [SQL] Commit FAILED_RETRYABLE + next attempt
+  else Terminal failure
+    provider --> int: 4xx/unsupported payload
+    int -> db: [SQL] Commit FAILED_TERMINAL + safe code
+    int ->> bus: [EventBridge/SQS async] InvoiceFailed.v1
+  end
+end
+
+@enduml
+----
+
+=== 2.2 L2 — Internal backend flow
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title OrderPaid to Invoice — L2: Internal Backend Flow
+
+participant "OrderPaidConsumer" as consumer
+participant "Inbox/Dedupe" as inbox
+participant "InvoiceOrchestrator" as svc
+database "Integration DB" as db
+participant "InvoiceProviderClient" as client
+queue "Outbox/DLQ" as outbox
+
+consumer -> inbox: validate envelope + source version
+inbox -> db: [SQL] INSERT inbox event / unique source key
+db --> inbox: APPLIED / duplicate
+alt Duplicate
+  inbox --> consumer: no-op; ACK
+else First delivery
+  inbox -> svc: createOrLoadInvoiceOperation()
+  activate svc
+  svc -> db: [SQL] INSERT/SELECT invoice operation + items
+  db --> svc: REQUESTED operation
+  svc -> outbox: [SQL] Queue InvoiceOperationRequested.v1
+  svc --> inbox: Local transaction committed
+  deactivate svc
+  consumer --> consumer: ACK SQS after commit
+end
+
+client -> svc: issueDueOperations()
+activate svc
+svc -> db: [SQL] Claim operation lease + provider attempt
+db --> svc: Lease + idempotency key
+svc -> client: [HTTP/REST] issue(command, idempotencyKey)
+client --> svc: Normalized provider result
+svc -> db: [SQL] CAS state + attempt + outbox
+db --> svc: Committed ISSUED/FAILED
+deactivate svc
+
+@enduml
+----
+
+== 3. Invoice issued to email/Zalo delivery
+
+=== 3.1 L1 — System flow
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Invoice Delivery — L1: System Flow
+
+participant "Integration Runtime" as int
+queue "EventBridge/SQS + DLQ" as bus
+database "Integration PostgreSQL" as db
+participant "Email Provider" as email
+participant "Zalo Provider" as zalo
+
+bus ->> int: [EventBridge/SQS async] InvoiceIssued.v1
+int -> db: [SQL] Load consent snapshot + create delivery operations
+db --> int: Selected channel(s) / NO_RECIPIENT
+alt No consent/contact
+  int -> db: [SQL] Mark delivery NOT_REQUESTED / NO_RECIPIENT
+else Email selected
+  int -> email: [HTTP/REST] Send invoice + idempotency key
+  alt Accepted
+    email --> int: 202 provider message ref
+    int -> db: [SQL] Commit SENT + outbox status
+  else Retryable failure
+    email --> int: 429/5xx/timeout
+    int -> db: [SQL] Commit FAILED_RETRYABLE + backoff
+  end
+else Zalo selected
+  int -> zalo: [HTTP/REST] Send invoice + idempotency key
+  alt Accepted
+    zalo --> int: 202 provider message ref
+    int -> db: [SQL] Commit SENT + outbox status
+  else Retryable/terminal failure
+    zalo --> int: Provider result
+    int -> db: [SQL] Commit normalized status
+  end
+end
+int ->> bus: [EventBridge/SQS async] InvoiceDeliveryStatusChanged.v1
+
+@enduml
+----
+
+=== 3.2 L2 — Internal backend flow
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Invoice Delivery — L2: Internal Backend Flow
+
+participant "DeliveryWorker" as worker
+participant "DeliveryPolicy" as policy
+database "Integration DB" as db
+participant "ChannelProviderClient" as client
+queue "Outbox/DLQ" as outbox
+
+worker -> db: [SQL] Claim PENDING delivery lease
+db --> worker: Delivery operation + consent snapshot ref
+worker -> policy: evaluateConsentChannelRateLimit()
+policy --> worker: Allowed / NO_RECIPIENT / BLOCKED
+alt Not allowed
+  worker -> db: [SQL] Mark NOT_REQUESTED/FAILED_TERMINAL
+else Allowed
+  worker -> db: [SQL] INSERT provider attempt + SENDING state
+  db --> worker: Channel idempotency key
+  worker -> client: [HTTP/REST] send(invoice artifact, idempotency key)
+  client --> worker: Normalized provider result
+  worker -> db: [SQL] CAS delivery state + attempt
+  db --> worker: SENT/FAILED/EXPIRED
+  worker -> outbox: [SQL] Queue status event + audit reference
+end
+
+@enduml
+----
+
+== 4. Demo success end-to-end
+
+=== 4.1 L1 — System flow
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Demo Success — L1: System Flow
+
+actor "Demo Operator" as op
+participant "Demo Control Plane" as demo
+participant "POS/Angular" as pos
+participant "Shift Service" as shift
+participant "Order Service" as order
+participant "Recommendation" as rec
+participant "Loyalty" as loyalty
+participant "Payment/VNPAY" as pay
+participant "Step Functions Saga" as saga
+participant "Inventory" as inv
+participant "Reporting" as rep
+participant "AI Assistant" as ai
+queue "EventBridge/SQS" as bus
+participant "AWS X-Ray" as xray
+
+op -> demo: [HTTP/REST] POST /internal/v1/demo/runs
+demo -> shift: [HTTP/REST] preflight/open shift
+demo -> pos: [HTTP/REST] execute POS scenario
+pos -> order: [HTTP/REST] create gà rán order
+order -> rec: [HTTP/REST] request cart suggestion
+rec --> pos: Suggest Coca
+pos -> rec: [HTTP/REST] record shown/accepted
+pos -> order: [HTTP/REST] add Coca with attribution
+pos -> loyalty: [HTTP/REST] customer phone context
+pos -> order: [HTTP/REST] checkout
+order -> saga: [HTTP/REST] start checkout Saga
+saga -> pay: [HTTP/REST] create VNPAY QR
+pay --> pos: QR pending
+pay -> pay: [HTTP/REST] verified sandbox IPN
+pay ->> bus: [EventBridge/SQS async] PaymentPaid.v1
+saga -> inv: [HTTP/REST] commit reservation
+saga -> order: [HTTP/REST] finalize PAID
+order ->> bus: [EventBridge/SQS async] OrderPaid.v1
+bus ->> loyalty: [EventBridge/SQS async] accrue points
+bus ->> inv: [EventBridge/SQS async] paid/stock projection
+bus ->> rep: [EventBridge/SQS async] paid revenue + attribution
+demo -> ai: [HTTP/REST] ask Coca uplift question
+ai -> rep: [HTTP/REST] approved contribution/AOV tool
+ai -> rec: [HTTP/REST] approved attribution tool
+rep --> ai: Facts + freshness/provenance
+rec --> ai: Attribution facts
+ai --> demo: Safe answer + metric definition
+demo -> xray: [AWS X-Ray/OpenTelemetry] get trace summary
+xray --> demo: Trace references
+demo --> op: PASS checkpoints + trace + AI answer
+
+@enduml
+----
+
+=== 4.2 L2 — Demo Control Plane internal flow
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Demo Success — L2: Demo Control Plane Internal Flow
+
+participant "DemoRunController" as ctrl
+participant "PreflightEvaluator" as pre
+participant "ScenarioOrchestrator" as orch
+participant "ParentApiAdapters" as adapters
+participant "CheckpointEvaluator" as check
+database "Demo Control DB" as db
+participant "TraceAdapter" as trace
+
+ctrl -> db: [SQL] Create run + scenario/seed version
+ctrl -> pre: preflight(run)
+pre -> adapters: [HTTP/REST] check parent health/capabilities
+adapters --> pre: Health matrix
+pre -> db: [SQL] Record PREFLIGHT/READY checkpoint
+pre --> ctrl: READY / PREFLIGHT_FAILED
+alt READY
+  ctrl -> orch: execute(run)
+  activate orch
+  loop Ordered scenario steps
+    orch -> adapters: [HTTP/REST] execute step through real contract
+    adapters --> orch: Safe result + correlation
+    orch -> check: evaluate expected checkpoint
+    check -> db: [SQL] Persist expected/observed result
+    check -> trace: [AWS X-Ray/OpenTelemetry] resolve trace reference
+    trace --> check: Redacted trace reference
+    check --> orch: PASS/FAIL/QUALITY
+  end
+  orch -> db: [SQL] Commit run summary
+  deactivate orch
+end
+ctrl --> ctrl: Return run status/trace references
+
+@enduml
+----
+
+== 5. Demo Payment unavailable compensation
+
+=== 5.1 L1 — System flow
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Demo Payment Unavailable — L1: System Flow
+
+participant "Demo Control Plane" as demo
+participant "Payment Fault Boundary" as fault
+participant "Order Service" as order
+participant "Step Functions Saga" as saga
+participant "Payment Service" as pay
+participant "Inventory" as inv
+queue "EventBridge/SQS" as bus
+participant "AWS X-Ray" as xray
+
+demo -> fault: [HTTP/REST] acquire PAYMENT_UNAVAILABLE lease
+fault --> demo: faultLeaseId + expiry
+demo -> order: [HTTP/REST] checkout with demoRunId/faultLeaseId
+order -> saga: [HTTP/REST] start checkout
+saga -> inv: [HTTP/REST] reserve ingredients
+inv --> saga: Reservation held
+saga -> pay: [HTTP/REST] initiate payment
+pay -> fault: [HTTP/REST] evaluate run-scoped lease
+fault --> pay: Unavailable / timeout
+pay --> saga: Payment unavailable
+saga -> inv: [HTTP/REST] release reservation
+inv --> saga: Released once
+saga -> order: [HTTP/REST] mark CHECKOUT_FAILED + compensation
+order ->> bus: [EventBridge/SQS async] OrderCheckoutFailed.v1
+demo -> xray: [AWS X-Ray/OpenTelemetry] get failure trace
+xray --> demo: Redacted trace + compensation spans
+demo --> demo: Assert no OrderPaid / no points / no stock commit
+demo --> demo: PASS failure scenario
+
+@enduml
+----
+
+=== 5.2 L2 — Fault lease and checkpoint flow
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Demo Payment Unavailable — L2: Fault/Checkpoint Flow
+
+participant "DemoRunController" as ctrl
+participant "FaultLeaseManager" as lease
+participant "PaymentFaultAdapter" as fault
+participant "CheckpointEvaluator" as check
+database "Demo Control DB" as db
+participant "TraceAdapter" as trace
+
+ctrl -> lease: acquire(run, PAYMENT_UNAVAILABLE)
+lease -> db: [SQL] Validate DEMO/TEST + insert expiring lease
+db --> lease: faultLeaseId
+lease --> ctrl: Lease active
+ctrl -> fault: [HTTP/REST] Attach lease to run context
+fault --> ctrl: Context accepted
+ctrl -> check: waitForCompensation(run)
+check -> check: Poll authoritative Order/Inventory checkpoints
+check -> db: [SQL] Persist observed failure/release/no-paid assertions
+check -> trace: [AWS X-Ray/OpenTelemetry] resolve saga trace
+trace --> check: Trace references
+check --> ctrl: PASS / TIMEOUT / FAILED
+ctrl -> lease: revoke/expire lease
+lease -> db: [SQL] Mark lease REVOKED/EXPIRED
+
+@enduml
+----
+
+== 6. AI uplift query
+
+=== 6.1 L1 — System flow
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title AI Coca Uplift Query — L1: System Flow
+
+actor "Owner/Manager" as user
+participant "Demo/Owner Console" as console
+participant "Identity" as id
+participant "AI Assistant" as ai
+participant "Reporting" as rep
+participant "Recommendation" as rec
+
+user -> console: Ask “Tuần này gợi ý Coca giúp tăng bao nhiêu doanh thu?”
+console -> ai: [HTTP/REST] POST conversation/turn + requested scope
+ai -> id: [HTTP/REST] resolve tenant/branch permission
+id --> ai: Authorized scope/version
+ai -> rep: [HTTP/REST] approved contribution/AOV function
+rep --> ai: Paid revenue/metric/freshness facts
+ai -> rec: [HTTP/REST] approved shown/accepted attribution function
+rec --> ai: Attribution facts + quality
+alt Complete and fresh
+  ai --> console: Safe answer + definition/provenance
+else Partial/stale/missing attribution
+  ai --> console: Safe limitation + data quality state
+end
+console --> user: Render answer with scope/period/freshness
+
+@enduml
+----
+
+=== 6.2 L2 — Demo/Integration query adapter flow
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title AI Coca Uplift Query — L2: Query Adapter Flow
+
+participant "DemoRunController" as ctrl
+participant "AIClient" as client
+participant "ScopeContext" as scope
+participant "CheckpointEvaluator" as check
+database "Demo Control DB" as db
+participant "TraceAdapter" as trace
+
+ctrl -> scope: Resolve run owner/scope context
+scope --> ctrl: Trusted scope + run correlation
+ctrl -> client: [HTTP/REST] Ask approved AI function path
+client --> ctrl: Safe answer + provenance
+ctrl -> check: validate metric/quality/provenance
+check -> db: [SQL] Persist AI checkpoint + answer reference
+check -> trace: [AWS X-Ray/OpenTelemetry] link answer trace
+trace --> check: Trace reference
+check --> ctrl: PASS / DATA_LATE / INCOMPLETE
+
+@enduml
+----
+
+== 7. Duplicate/replay/provider crash recovery
+
+=== 7.1 L1 — System flow
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Integration Replay Recovery — L1: System Flow
+
+queue "EventBridge/SQS + DLQ" as bus
+participant "Integration Runtime" as int
+database "Integration PostgreSQL" as db
+participant "Invoice Sandbox Provider" as provider
+
+bus ->> int: [EventBridge/SQS async] Redeliver same OrderPaid.v1
+int -> db: [SQL] Unique inbox/source key
+db --> int: IGNORED_DUPLICATE
+int --> bus: ACK without side effect
+int -> db: [SQL] Claim stuck ISSUING provider attempt
+db --> int: Same idempotency key
+int -> provider: [HTTP/REST] Query/retry same key
+alt Provider accepted earlier
+  provider --> int: ISSUED + same safe ref
+  int -> db: [SQL] Reconcile ISSUED once
+else Provider unknown
+  provider --> int: UNKNOWN
+  int -> db: [SQL] Keep retry/reconciliation state
+  int ->> bus: [EventBridge/SQS async] IntegrationDataQualityChanged.v1
+else Provider definitive failure
+  provider --> int: FAILED
+  int -> db: [SQL] Commit normalized terminal/retryable state
+end
+
+@enduml
+----
+
+=== 7.2 L2 — Internal recovery flow
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Integration Replay Recovery — L2: Internal Recovery Flow
+
+participant "EventConsumer" as consumer
+participant "InboxDedupe" as inbox
+participant "ReconciliationWorker" as worker
+database "Integration DB" as db
+participant "ProviderClient" as client
+queue "DLQ/Outbox" as queue
+
+consumer -> inbox: validate/replay event
+inbox -> db: [SQL] SELECT unique source key
+db --> inbox: Duplicate / first
+alt Duplicate
+  inbox --> consumer: ACK no-op
+else First event
+  inbox -> db: [SQL] Apply invoice operation projection
+  db --> inbox: Commit
+  inbox --> consumer: ACK
+end
+worker -> db: [SQL] Claim expired provider attempt
+db --> worker: Operation + same idempotency key
+worker -> client: [HTTP/REST] query/retry provider
+client --> worker: ISSUED/UNKNOWN/FAILED
+worker -> db: [SQL] CAS status + reconciliation record
+worker -> queue: [SQL] Queue quality/status event or DLQ
+
+@enduml
+----
+
+== 8. Demo reset and fault-lease expiry
+
+=== 8.1 L1 — System flow
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Demo Reset and Lease Expiry — L1: System Flow
+
+actor "Demo Operator" as op
+participant "Demo Control Plane" as demo
+database "Demo Control DB" as db
+participant "Parent Cleanup Adapters" as cleanup
+participant "Audit Service" as audit
+participant "AWS X-Ray" as xray
+
+op -> demo: [HTTP/REST] POST /internal/v1/demo/runs/{id}/reset
+demo -> db: [SQL] Acquire reset lease + load resource manifest
+db --> demo: Manifest / conflict
+alt Concurrent run/reset
+  demo --> op: HTTP 409 demo_run_conflict
+else Reset allowed
+  demo -> cleanup: [HTTP/REST] Cleanup resources reverse dependency order
+  cleanup --> demo: Safe per-service cleanup results
+  demo -> db: [SQL] Record reset operation + mark RESET
+  demo -> audit: [HTTP/REST] Redacted reset/fault audit reference
+  demo -> xray: [AWS X-Ray/OpenTelemetry] close/link run trace
+  xray --> demo: Trace reference
+  demo --> op: HTTP 200 RESET + summary
+end
+demo -> db: [SQL] Expiry worker marks stale fault leases EXPIRED
+
+@enduml
+----
+
+=== 8.2 L2 — Internal reset flow
+
+[plantuml]
+----
+@startuml
+!theme toy
+autonumber
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+title Demo Reset and Lease Expiry — L2: Internal Reset Flow
+
+participant "DemoRunController" as ctrl
+participant "ResetService" as reset
+participant "ResourceManifestStore" as manifest
+participant "ParentCleanupAdapter" as adapter
+database "Demo Control DB" as db
+participant "AuditTraceAdapter" as obs
+
+ctrl -> reset: reset(runId, idempotencyKey)
+reset -> db: [SQL] Acquire run/reset lease
+db --> reset: Lease granted / conflict
+alt Lease conflict
+  reset --> ctrl: demo_run_conflict
+else Lease granted
+  reset -> manifest: loadCleanupManifest(run)
+  manifest -> db: [SQL] Read ordered opaque resources
+  db --> manifest: Cleanup list
+  loop Reverse dependency resources
+    manifest -> adapter: [HTTP/REST] cleanup namespaced resource
+    adapter --> manifest: Safe result
+  end
+  manifest -> db: [SQL] Record cleanup result + RESET state
+  reset -> obs: [HTTP/REST] audit reset + trace reference
+  obs --> reset: Recorded
+  reset --> ctrl: Reset summary
+end
+
+@enduml
+----
+
+== Diagram notes
+
+* All event arrows use EventBridge/SQS with at-least-once delivery; consumers deduplicate before side effects.
+* All provider calls use adapter boundaries and stable idempotency keys; provider response is normalized before persistence.
+* `OrderPaid.v1` remains the only canonical paid-order fact; `PaymentPaid.v1` is not an invoice trigger.
+* Demo Control Plane never reads or writes parent databases directly and is deployed only in non-production.
+* X-Ray/OpenTelemetry references are redacted and may be degraded without changing business state; the checkpoint records trace quality.

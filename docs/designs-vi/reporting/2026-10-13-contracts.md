@@ -206,6 +206,8 @@ Mọi endpoint đều yêu cầu quyền `report:read` và trả về phong bì 
 | GET | `/api/v1/reports/recommendations/effectiveness` | `RecommendationEffectivenessResponse` | Phân nhóm hiển thị/chấp nhận/AOV gợi ý |
 | GET | `/api/v1/reports/freshness` | `FreshnessResponse` | Sức khỏe và độ tươi mới của projection/nguồn |
 
+---
+
 ### 4.2 Phong Bì Phản Hồi Chung
 
 ```json
@@ -235,15 +237,37 @@ Mọi endpoint đều yêu cầu quyền `report:read` và trả về phong bì 
     }
   },
   "meta": {
-    "requestId": "req_01J...",
-    "correlationId": "cor_01J...",
+    "requestId": "req_0192b2d0-7f1d-7abc-8d2c-123456789001",
+    "correlationId": "cor_0192b2d0-7f1d-7abc-8d2c-123456789002",
+    "timestamp": "2026-10-13T08:00:00Z",
     "nextCursor": null
   }
 }
 ```
 
-### 4.3 `DashboardOverviewResponse`
+---
 
+### 4.3 Tổng quan các chỉ số KPI Dashboard (Dashboard Overview)
+
+`GET /api/v1/reports/dashboard/overview`
+
+Truy vấn các widget KPI tổng thể, tăng trưởng so với kỳ trước và trạng thái dữ liệu.
+
+#### Tiêu đề Yêu cầu (Headers)
+```http
+Authorization: Bearer <Cognito JWT Token>
+Accept: application/json
+X-Correlation-ID: 0192b2d0-7f1d-7abc-8d2c-123456789001
+```
+
+#### Tham số Truy vấn (Query Parameters)
+| Tham số | Kiểu | Bắt buộc | Mô tả |
+|---|---|:---:|---|
+| `branchIds` | UUID[] | Không | Danh sách chi nhánh (tối đa 20) |
+| `from`, `to` | date (YYYY-MM-DD) | Không | Mặc định 7 ngày gần nhất |
+| `comparison` | enum | Không | `PREVIOUS_EQUAL_PERIOD`, `SAME_WEEKDAY_LAST_WEEK` |
+
+#### Phản hồi Thành Công `200 OK`
 ```json
 {
   "data": {
@@ -261,131 +285,284 @@ Mọi endpoint đều yêu cầu quyền `report:read` và trả về phong bì 
       "netSalesDeltaRatio": "-0.0677",
       "comparisonPeriod": {"from": "2026-09-18", "to": "2026-09-30"}
     },
-    "dataQuality": {}
+    "dataQuality": {
+      "status": "FRESH",
+      "freshnessLagSeconds": 15,
+      "completenessStatus": "COMPLETE",
+      "watermark": "reporting:tenant:v901",
+      "watermarkVersion": 901,
+      "lastUpdatedAt": "2026-10-13T08:00:00Z",
+      "projectionVersion": 12
+    }
+  },
+  "meta": {
+    "requestId": "req_0192b2d0-7f1d-7abc-8d2c-123456789001",
+    "correlationId": "cor_0192b2d0-7f1d-7abc-8d2c-123456789002",
+    "timestamp": "2026-10-13T08:00:01Z"
   }
 }
 ```
 
 Tổng quan KPI tuyệt đối không được kết hợp các widget có watermark/phiên bản tính toán không tương thích mà không công khai trạng thái bán phần/kém tươi mới nhất.
 
-### 4.4 Doanh số Theo Ngày / Chi Nhánh / Khung Giờ
+---
 
-`DailySalesRow`:
+### 4.4 Báo cáo doanh số theo ngày (Daily Sales Report)
 
+`GET /api/v1/reports/sales/daily`
+
+#### Tiêu đề Yêu cầu (Headers)
+```http
+Authorization: Bearer <Cognito JWT Token>
+Accept: application/json
+X-Correlation-ID: 0192b2d0-7f1d-7abc-8d2c-123456789001
+```
+
+#### Phản hồi Thành Công `200 OK`
 ```json
 {
-  "businessDate": "2026-10-12",
-  "branchId": "0192...",
-  "branchLabel": "Quận 1",
-  "paidOrderCount": 42,
-  "grossSalesMinor": 4800000,
-  "discountMinor": 300000,
-  "netSalesMinor": 4500000,
-  "vatMinor": 409091,
-  "aovMinor": 107143,
-  "currency": "VND",
-  "calculationVersion": "sales-metric-v1"
+  "data": {
+    "scope": {"type": "BRANCH", "branchIds": ["0192b2d0-7f1d-7abc-8d2c-123456789002"]},
+    "period": {"from": "2026-10-12", "to": "2026-10-12", "timezone": "Asia/Ho_Chi_Minh"},
+    "rows": [
+      {
+        "businessDate": "2026-10-12",
+        "branchId": "0192b2d0-7f1d-7abc-8d2c-123456789002",
+        "branchLabel": "Quận 1",
+        "paidOrderCount": 42,
+        "grossSalesMinor": 4800000,
+        "discountMinor": 300000,
+        "netSalesMinor": 4500000,
+        "vatMinor": 409091,
+        "aovMinor": 107143,
+        "currency": "VND",
+        "calculationVersion": "sales-metric-v1"
+      }
+    ],
+    "dataQuality": {"status": "FRESH", "completenessStatus": "COMPLETE"}
+  },
+  "meta": {
+    "requestId": "req_0192b2d0-7f1d-7abc-8d2c-123456789001",
+    "correlationId": "cor_0192b2d0-7f1d-7abc-8d2c-123456789002",
+    "timestamp": "2026-10-13T08:00:02Z"
+  }
 }
 ```
 
-`BranchSalesRow` sử dụng các trường chỉ số tương tự kèm theo `rank`, `deltaMinor`, `deltaRatio` và nhãn chi nhánh an toàn. Chi nhánh không thuộc quyền sở hữu sẽ bị loại bỏ, không trả về dưới dạng dòng ẩn/không được phân quyền.
+---
 
-`HourlySalesRow`:
+### 4.4.1 Báo cáo so sánh theo chi nhánh (Sales by Branch Report)
 
+`GET /api/v1/reports/sales/by-branch`
+
+Sử dụng các trường chỉ số tương tự kèm theo `rank`, `deltaMinor`, `deltaRatio` và nhãn chi nhánh an toàn. Chi nhánh không thuộc quyền sở hữu sẽ bị loại bỏ, không trả về dưới dạng dòng ẩn/không được phân quyền.
+
+---
+
+### 4.4.2 Báo cáo doanh số theo khung giờ (Hourly Sales Report)
+
+`GET /api/v1/reports/sales/hourly`
+
+#### Phản hồi Thành Công `200 OK`
 ```json
 {
-  "branchId": "0192...",
-  "businessDate": "2026-10-12",
-  "hourBucket": 18,
-  "timezone": "Asia/Ho_Chi_Minh",
-  "paidOrderCount": 8,
-  "netSalesMinor": 920000,
-  "currency": "VND"
+  "data": {
+    "scope": {"type": "BRANCH", "branchIds": ["0192b2d0-7f1d-7abc-8d2c-123456789002"]},
+    "period": {"from": "2026-10-12", "to": "2026-10-12", "timezone": "Asia/Ho_Chi_Minh"},
+    "rows": [
+      {
+        "branchId": "0192b2d0-7f1d-7abc-8d2c-123456789002",
+        "businessDate": "2026-10-12",
+        "hourBucket": 18,
+        "timezone": "Asia/Ho_Chi_Minh",
+        "paidOrderCount": 8,
+        "netSalesMinor": 920000,
+        "currency": "VND"
+      }
+    ],
+    "dataQuality": {"status": "FRESH", "completenessStatus": "COMPLETE"}
+  },
+  "meta": {
+    "requestId": "req_0192b2d0-7f1d-7abc-8d2c-123456789001",
+    "correlationId": "cor_0192b2d0-7f1d-7abc-8d2c-123456789002",
+    "timestamp": "2026-10-13T08:00:03Z"
+  }
 }
 ```
 
 Khung giờ (hour bucket) là giờ cục bộ cho truy vấn một chi nhánh và giờ chuẩn tenant cho chính sách đa chi nhánh. Không bao giờ trả về timestamp giao dịch chính xác.
 
-### 4.5 Doanh số Theo Nhân Viên
+---
 
+### 4.5 Doanh số Theo Nhân Viên (Sales by Employee)
+
+`GET /api/v1/reports/sales/by-employee`
+
+#### Phản hồi Thành Công `200 OK`
 ```json
 {
-  "employee": {
-    "id": "0192...",
-    "displayLabel": "Thu ngân A",
-    "statusAtSale": "ACTIVE"
+  "data": {
+    "scope": {"type": "BRANCH", "branchIds": ["0192b2d0-7f1d-7abc-8d2c-123456789002"]},
+    "rows": [
+      {
+        "employee": {
+          "id": "0192b2d0-7f1d-7abc-8d2c-123456789020",
+          "displayLabel": "Thu ngân A",
+          "statusAtSale": "ACTIVE"
+        },
+        "paidOrderCount": 42,
+        "netSalesMinor": 4500000,
+        "aovMinor": 107143,
+        "currency": "VND",
+        "attributionVersion": "checkout-employee-v1",
+        "qualityCode": null
+      }
+    ],
+    "dataQuality": {"status": "FRESH", "completenessStatus": "COMPLETE"}
   },
-  "paidOrderCount": 42,
-  "netSalesMinor": 4500000,
-  "aovMinor": 107143,
-  "currency": "VND",
-  "attributionVersion": "checkout-employee-v1",
-  "qualityCode": null
+  "meta": {
+    "requestId": "req_0192b2d0-7f1d-7abc-8d2c-123456789001",
+    "correlationId": "cor_0192b2d0-7f1d-7abc-8d2c-123456789002",
+    "timestamp": "2026-10-13T08:00:04Z"
+  }
 }
 ```
 
 Trường hợp thiếu/không khớp dữ liệu ghi nhận nhân viên sẽ dùng `employee.id=UNASSIGNED`, nhãn an toàn `Chưa xác định`, và `qualityCode=missing_checkout_attribution`; bản ghi này vẫn được giữ lại trong tổng doanh số của tenant/chi nhánh.
 
+---
+
 ### 4.6 Món Bán Chạy (Top Items)
 
+`GET /api/v1/reports/top-items`
+
+#### Phản hồi Thành Công `200 OK`
 ```json
 {
-  "itemId": "0192...",
-  "itemLabel": "Gà rán",
-  "itemStatus": "ACTIVE",
-  "rank": 1,
-  "quantitySold": 120,
-  "revenueMinor": 3600000,
-  "currency": "VND"
+  "data": {
+    "rows": [
+      {
+        "itemId": "0192b2d0-7f1d-7abc-8d2c-123456789040",
+        "itemLabel": "Trà sữa Ô long nướng",
+        "itemStatus": "ACTIVE",
+        "rank": 1,
+        "quantitySold": 120,
+        "revenueMinor": 5400000,
+        "currency": "VND"
+      }
+    ],
+    "dataQuality": {"status": "FRESH", "completenessStatus": "COMPLETE"}
+  },
+  "meta": {
+    "requestId": "req_0192b2d0-7f1d-7abc-8d2c-123456789001",
+    "correlationId": "cor_0192b2d0-7f1d-7abc-8d2c-123456789002",
+    "timestamp": "2026-10-13T08:00:05Z"
+  }
 }
 ```
 
 `revenueMinor` là doanh thu dòng thuần sau khi đã phân bổ chiết khấu và chưa bao gồm VAT/phí/tip. Danh sách sắp xếp cho phép: `REVENUE` hoặc `QUANTITY`; hòa điểm được xử lý ổn định bằng ID món.
 
+---
+
 ### 4.7 Hiệu Quả Khuyến Mãi (Promotion Effectiveness)
 
+`GET /api/v1/reports/promotions/effectiveness`
+
+#### Phản hồi Thành Công `200 OK`
 ```json
 {
-  "promotionVersionId": "0192...",
-  "promotionLabel": "Happy Hour 10% v3",
-  "ruleVersion": 3,
-  "conflictGroup": "happy-hour",
-  "appliedOrderCount": 52,
-  "grossSalesMinor": 5200000,
-  "discountMinor": 520000,
-  "netSalesMinor": 4680000,
-  "averageNetOrderMinor": 90000,
-  "allocationStatus": "ALLOCATED",
-  "currency": "VND"
+  "data": {
+    "rows": [
+      {
+        "promotionVersionId": "0192b2d0-7f1d-7abc-8d2c-123456789050",
+        "promotionLabel": "Happy Hour 10% v3",
+        "ruleVersion": 3,
+        "conflictGroup": "happy-hour",
+        "appliedOrderCount": 52,
+        "grossSalesMinor": 5200000,
+        "discountMinor": 520000,
+        "netSalesMinor": 4680000,
+        "averageNetOrderMinor": 90000,
+        "allocationStatus": "ALLOCATED",
+        "currency": "VND"
+      }
+    ],
+    "dataQuality": {"status": "FRESH", "completenessStatus": "COMPLETE"}
+  },
+  "meta": {
+    "requestId": "req_0192b2d0-7f1d-7abc-8d2c-123456789001",
+    "correlationId": "cor_0192b2d0-7f1d-7abc-8d2c-123456789002",
+    "timestamp": "2026-10-13T08:00:06Z"
+  }
 }
 ```
 
 Các giá trị `allocationStatus` có thể có: `ALLOCATED`, `UNALLOCATED_PROMOTION`, `PARTIAL`. Phiên bản khuyến mãi là bất biến và không gộp chung với phiên bản khác.
 
+---
+
 ### 4.8 Hiệu Quả Gợi Ý (Recommendation Effectiveness)
 
+`GET /api/v1/reports/recommendations/effectiveness`
+
+#### Phản hồi Thành Công `200 OK`
 ```json
 {
-  "shownCount": 1000,
-  "acceptedCount": 180,
-  "acceptanceRate": "0.1800",
-  "acceptedOrderCount": 160,
-  "controlOrderCount": 500,
-  "acceptedAovMinor": 118000,
-  "controlAovMinor": 103000,
-  "aovUpliftMinor": 15000,
-  "aovUpliftRatio": "0.1456",
-  "currency": "VND",
-  "attributionVersion": "suggestion-cohort-v1",
-  "interpretation": "OBSERVED_COHORT_DIFFERENCE"
+  "data": {
+    "shownCount": 1000,
+    "acceptedCount": 180,
+    "acceptanceRate": "0.1800",
+    "acceptedOrderCount": 160,
+    "controlOrderCount": 500,
+    "acceptedAovMinor": 118000,
+    "controlAovMinor": 103000,
+    "aovUpliftMinor": 15000,
+    "aovUpliftRatio": "0.1456",
+    "currency": "VND",
+    "attributionVersion": "suggestion-cohort-v1",
+    "interpretation": "OBSERVED_COHORT_DIFFERENCE",
+    "dataQuality": {"status": "FRESH", "completenessStatus": "COMPLETE"}
+  },
+  "meta": {
+    "requestId": "req_0192b2d0-7f1d-7abc-8d2c-123456789001",
+    "correlationId": "cor_0192b2d0-7f1d-7abc-8d2c-123456789002",
+    "timestamp": "2026-10-13T08:00:07Z"
+  }
 }
 ```
 
 Một đơn hàng chấp nhận nhiều gợi ý chỉ được tính 1 lần trong nhóm đơn hàng chấp nhận (accepted AOV cohort). Số lượng chấp nhận vẫn giữ nguyên ở cấp độ tương tác. Nếu thiếu mẫu số nhóm đối chứng (control denominator) sẽ trả về `NO_DATA`; nếu thiếu correlation ghi nhận đơn hàng sẽ trả về `PARTIAL`/chờ projection và không tính toán âm thầm.
 
+---
+
 ### 4.9 Phản Hồi Độ Tươi Mới (Freshness Response)
 
-`GET /api/v1/reports/freshness` trả về một `DataQualityEnvelope` cho mỗi phạm vi/nguồn/projection được yêu cầu. Phản hồi bao gồm danh sách `missingSources` an toàn, độ trễ, watermark và phiên bản projection hiện hành. Tuyệt đối không trả về payload hàng đợi thô hay nội dung event.
+`GET /api/v1/reports/freshness`
+
+Trả về một `DataQualityEnvelope` cho mỗi phạm vi/nguồn/projection được yêu cầu. Phản hồi bao gồm danh sách `missingSources` an toàn, độ trễ, watermark và phiên bản projection hiện hành. Tuyệt đối không trả về payload hàng đợi thô hay nội dung event.
+
+#### Phản hồi Thành Công `200 OK`
+```json
+{
+  "data": {
+    "status": "FRESH",
+    "freshnessLagSeconds": 12,
+    "completenessStatus": "COMPLETE",
+    "watermark": "reporting:tenant:v901",
+    "watermarkVersion": 901,
+    "lastUpdatedAt": "2026-10-13T08:00:00Z",
+    "projectionVersion": 12,
+    "missingSources": [],
+    "calculationVersion": "sales-metric-v1"
+  },
+  "meta": {
+    "requestId": "req_0192b2d0-7f1d-7abc-8d2c-123456789001",
+    "correlationId": "cor_0192b2d0-7f1d-7abc-8d2c-123456789002",
+    "timestamp": "2026-10-13T08:00:08Z"
+  }
+}
+```
 
 ## 5. Hợp Đồng Vận Hành Nội Bộ (Internal Operational Contracts)
 
@@ -829,6 +1006,192 @@ Các chỉ mục bắt buộc:
 8. Nạp dữ liệu mẫu (seed) các tham chiếu phiên bản từ điển chỉ số mang tính đơn định; không thực hiện backfill sự kiện nghiệp vụ từ các nguồn không xác định.
 
 Các migration chỉ được tiến về phía trước (forward-only) trong môi trường dùng chung. Các thay đổi mang tính phá hủy (destructive) phải áp dụng chiến lược expand → migrate → contract. Mọi cột bắt buộc phải có `COMMENT ON COLUMN`.
+
+### 8.3 Các Kịch Bản Migration Flyway (Flyway Migration Scripts)
+
+#### `V1__init_reporting_read_models.sql`
+```sql
+-- Flyway Migration V1: Bảng inbox, watermark và các bảng tổng hợp doanh thu cốt lõi P0
+CREATE TABLE reporting_inbox (
+    source VARCHAR(64) NOT NULL,
+    event_id VARCHAR(128) NOT NULL,
+    event_type VARCHAR(64) NOT NULL,
+    tenant_id VARCHAR(64) NOT NULL,
+    branch_id VARCHAR(64),
+    payload JSONB NOT NULL,
+    processed_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT pk_reporting_inbox PRIMARY KEY (source, event_id)
+);
+COMMENT ON TABLE reporting_inbox IS 'Bảng inbox bảo đảm tính idempotent cho các event tiêu thụ vào reporting read model';
+
+CREATE TABLE reporting_watermarks (
+    tenant_id VARCHAR(64) NOT NULL,
+    scope VARCHAR(64) NOT NULL,
+    projection_name VARCHAR(64) NOT NULL,
+    last_event_id VARCHAR(128) NOT NULL,
+    last_event_time TIMESTAMPTZ NOT NULL,
+    last_updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    status VARCHAR(20) NOT NULL DEFAULT 'FRESH',
+    CONSTRAINT pk_reporting_watermarks PRIMARY KEY (tenant_id, scope, projection_name)
+);
+CREATE INDEX idx_watermark_freshness ON reporting_watermarks (tenant_id, scope, projection_name, last_updated_at);
+COMMENT ON TABLE reporting_watermarks IS 'Theo dõi tiến độ xử lý và độ tươi mới (freshness) của từng projection';
+
+CREATE TABLE sales_daily (
+    tenant_id VARCHAR(64) NOT NULL,
+    branch_id VARCHAR(64) NOT NULL,
+    report_date DATE NOT NULL,
+    currency VARCHAR(3) NOT NULL DEFAULT 'VND',
+    gross_sales BIGINT NOT NULL DEFAULT 0,
+    net_sales BIGINT NOT NULL DEFAULT 0,
+    discount_amount BIGINT NOT NULL DEFAULT 0,
+    tax_amount BIGINT NOT NULL DEFAULT 0,
+    order_count INT NOT NULL DEFAULT 0,
+    customer_count INT NOT NULL DEFAULT 0,
+    average_order_value BIGINT NOT NULL DEFAULT 0,
+    cash_sales BIGINT NOT NULL DEFAULT 0,
+    qr_sales BIGINT NOT NULL DEFAULT 0,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT pk_sales_daily PRIMARY KEY (tenant_id, branch_id, report_date, currency)
+);
+CREATE INDEX idx_sales_daily_period ON sales_daily (tenant_id, report_date DESC, branch_id);
+COMMENT ON TABLE sales_daily IS 'Read model doanh số lũy kế theo ngày';
+
+CREATE TABLE sales_top_items (
+    tenant_id VARCHAR(64) NOT NULL,
+    branch_id VARCHAR(64) NOT NULL,
+    report_date DATE NOT NULL,
+    item_id VARCHAR(64) NOT NULL,
+    item_name VARCHAR(255) NOT NULL,
+    category_id VARCHAR(64) NOT NULL,
+    quantity_sold INT NOT NULL DEFAULT 0,
+    net_revenue BIGINT NOT NULL DEFAULT 0,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT pk_sales_top_items PRIMARY KEY (tenant_id, branch_id, report_date, item_id)
+);
+CREATE INDEX idx_top_items_revenue ON sales_top_items (tenant_id, branch_id, report_date DESC, net_revenue DESC);
+COMMENT ON TABLE sales_top_items IS 'Read model xếp hạng món bán chạy';
+```
+
+#### `V2__init_hourly_and_employee_reports.sql`
+```sql
+-- Flyway Migration V2: Bảng phân tích theo khung giờ và năng suất nhân viên P1
+CREATE TABLE sales_by_hour (
+    tenant_id VARCHAR(64) NOT NULL,
+    branch_id VARCHAR(64) NOT NULL,
+    report_date DATE NOT NULL,
+    hour_of_day SMALLINT NOT NULL CHECK (hour_of_day >= 0 AND hour_of_day <= 23),
+    currency VARCHAR(3) NOT NULL DEFAULT 'VND',
+    net_sales BIGINT NOT NULL DEFAULT 0,
+    order_count INT NOT NULL DEFAULT 0,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT pk_sales_by_hour PRIMARY KEY (tenant_id, branch_id, report_date, hour_of_day, currency)
+);
+COMMENT ON TABLE sales_by_hour IS 'Read model doanh thu và số đơn theo khung giờ trong ngày';
+
+CREATE TABLE employee_sales_summary (
+    tenant_id VARCHAR(64) NOT NULL,
+    branch_id VARCHAR(64) NOT NULL,
+    period_start DATE NOT NULL,
+    period_end DATE NOT NULL,
+    employee_id VARCHAR(64) NOT NULL,
+    employee_name VARCHAR(255) NOT NULL,
+    total_orders INT NOT NULL DEFAULT 0,
+    total_net_sales BIGINT NOT NULL DEFAULT 0,
+    total_tips BIGINT NOT NULL DEFAULT 0,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT pk_employee_sales_summary PRIMARY KEY (tenant_id, branch_id, period_start, period_end, employee_id)
+);
+CREATE INDEX idx_employee_period ON employee_sales_summary (tenant_id, branch_id, period_start DESC, employee_id);
+COMMENT ON TABLE employee_sales_summary IS 'Read model doanh số và số lượt phục vụ/checkout của nhân viên';
+```
+
+#### `V3__init_promotion_and_recommendation_reports.sql`
+```sql
+-- Flyway Migration V3: Bảng hiệu quả khuyến mãi và gợi ý món P1
+CREATE TABLE promotion_performance_summary (
+    tenant_id VARCHAR(64) NOT NULL,
+    branch_id VARCHAR(64) NOT NULL,
+    period_start DATE NOT NULL,
+    period_end DATE NOT NULL,
+    promotion_version VARCHAR(64) NOT NULL,
+    promotion_id VARCHAR(64) NOT NULL,
+    promotion_name VARCHAR(255) NOT NULL,
+    total_discount_amount BIGINT NOT NULL DEFAULT 0,
+    total_redemptions INT NOT NULL DEFAULT 0,
+    total_order_revenue BIGINT NOT NULL DEFAULT 0,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT pk_promotion_perf_summary PRIMARY KEY (tenant_id, branch_id, period_start, period_end, promotion_version)
+);
+CREATE INDEX idx_promotion_period ON promotion_performance_summary (tenant_id, branch_id, period_start DESC, promotion_version);
+COMMENT ON TABLE promotion_performance_summary IS 'Read model hiệu quả áp dụng voucher và khuyến mãi';
+
+CREATE TABLE recommendation_performance_summary (
+    tenant_id VARCHAR(64) NOT NULL,
+    branch_id VARCHAR(64) NOT NULL,
+    period_start DATE NOT NULL,
+    period_end DATE NOT NULL,
+    dimension VARCHAR(64) NOT NULL,
+    impressions INT NOT NULL DEFAULT 0,
+    acceptances INT NOT NULL DEFAULT 0,
+    acceptance_rate NUMERIC(5,2) NOT NULL DEFAULT 0.00,
+    attributed_revenue BIGINT NOT NULL DEFAULT 0,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT pk_recommendation_perf PRIMARY KEY (tenant_id, branch_id, period_start, period_end, dimension)
+);
+CREATE INDEX idx_recommendation_period ON recommendation_performance_summary (tenant_id, branch_id, period_start DESC, dimension);
+COMMENT ON TABLE recommendation_performance_summary IS 'Read model tỷ lệ chấp nhận và doanh thu đóng góp từ module AI recommendation';
+```
+
+#### `V4__init_rebuild_and_leases.sql`
+```sql
+-- Flyway Migration V4: Bảng điều phối Rebuild và Lease worker
+CREATE TABLE reporting_rebuild_jobs (
+    job_id VARCHAR(64) NOT NULL PRIMARY KEY,
+    tenant_id VARCHAR(64) NOT NULL,
+    scope VARCHAR(64) NOT NULL,
+    projections TEXT[] NOT NULL,
+    date_from DATE NOT NULL,
+    date_to DATE NOT NULL,
+    status VARCHAR(30) NOT NULL DEFAULT 'QUEUED',
+    progress_percentage SMALLINT NOT NULL DEFAULT 0,
+    trigger_reason VARCHAR(255) NOT NULL,
+    started_at TIMESTAMPTZ,
+    completed_at TIMESTAMPTZ,
+    created_by VARCHAR(64) NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE reporting_worker_leases (
+    lease_name VARCHAR(64) NOT NULL PRIMARY KEY,
+    worker_id VARCHAR(128) NOT NULL,
+    lease_expires_at TIMESTAMPTZ NOT NULL,
+    status VARCHAR(30) NOT NULL DEFAULT 'ACQUIRED',
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX idx_rebuild_lease ON reporting_worker_leases (status, lease_expires_at);
+```
+
+#### `V5__init_reporting_audit_logs.sql`
+```sql
+-- Flyway Migration V5: Vết kiểm toán truy cập báo cáo
+CREATE TABLE reporting_access_audit_logs (
+    audit_id VARCHAR(64) NOT NULL PRIMARY KEY,
+    tenant_id VARCHAR(64) NOT NULL,
+    branch_id VARCHAR(64),
+    user_id VARCHAR(64) NOT NULL,
+    user_role VARCHAR(64) NOT NULL,
+    endpoint VARCHAR(128) NOT NULL,
+    query_parameters JSONB,
+    export_format VARCHAR(20),
+    ip_address VARCHAR(45) NOT NULL,
+    user_agent TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX idx_report_audit_scope_time ON reporting_access_audit_logs (tenant_id, created_at DESC);
+COMMENT ON TABLE reporting_access_audit_logs IS 'Lưu vết kiểm toán truy xuất báo cáo, chống rò rỉ dữ liệu tài chính kinh doanh';
+```
+
 
 ## 9. Hợp Đồng Bộ Nhớ Đệm và Tính Nhất Quán (Cache & Consistency)
 

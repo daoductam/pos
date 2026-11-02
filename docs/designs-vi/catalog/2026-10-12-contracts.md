@@ -1,8 +1,3 @@
-Started at: 2026/10/12 15:52:00 +07
-Finished at: 2026/10/12 15:52:00 +07
-Total time: 0 minutes
----
-
 # Hợp đồng Dữ liệu & API: Catalog Service (Dịch vụ Danh mục Món ăn)
 
 ## Nguồn tài liệu và Quyền hạn Hợp đồng
@@ -15,33 +10,41 @@ Total time: 0 minutes
 
 Tài liệu này là hợp đồng quy chuẩn (normative contract) cho Catalog Service. Việc triển khai thực tế bắt buộc phải sinh và xác thực tài liệu OpenAPI 3.1 cùng các artifact AsyncAPI/JSON Schema từ các định nghĩa này trước bản phát hành mã nguồn đầu tiên.
 
-## Các Nguyên tắc Hợp đồng
+---
 
-- Các API đồng bộ công khai sử dụng REST + OpenAPI 3.1 dưới tiền tố `/api/v1/catalog`.
-- Các API giao tiếp giữa các service (service-to-service) sử dụng REST + OpenAPI 3.1 dưới tiền tố `/internal/v1/catalog` và bắt buộc phải có workload identity/mTLS. Chúng tuyệt đối không được đưa vào bảng định tuyến của Angular.
-- Các sự kiện sử dụng cấu trúc bao bọc (envelope) của nền tảng và JSON Schema/AsyncAPI. Cơ chế chuyển phát là ít nhất một lần (at-least-once); các consumer khử trùng lặp theo `eventId`.
-- Các ID của Catalog là chuỗi UUID v7. Timestamp là chuỗi ISO-8601 UTC. Tiền tệ là số nguyên không âm `int64` tính theo đơn vị minor VND, trong đó `amountMinor` là số tiền nguyên VND.
-- Mọi yêu cầu công khai đều được phân quyền thông qua quyết định hiện tại từ Identity. Các claim role/branch trong JWT và các giá trị tenant do client gửi lên chỉ đóng vai trò gợi ý (hints), không bao giờ là nguồn thẩm quyền phân quyền.
+## Các Nguyên tắc Hợp đồng (Contract Principles)
+
+- Toàn bộ API đồng bộ công khai sử dụng chuẩn **RESTful + OpenAPI 3.1** dưới tiền tố `/api/v1/catalog`.
+- Các API giao tiếp giữa các service (service-to-service) sử dụng REST + OpenAPI 3.1 dưới tiền tố `/internal/v1/catalog`, bắt buộc phải có chứng chỉ Workload Identity / mTLS và tuyệt đối không đưa vào bảng định tuyến của Angular.
+- Các sự kiện bất đồng bộ tuân thủ cấu trúc bao bọc (envelope) chuẩn của nền tảng và JSON Schema/AsyncAPI. Cơ chế chuyển phát là ít nhất một lần (at-least-once); các consumer khử trùng lặp theo `eventId`.
+- Các định danh (ID) do Catalog quản lý đều là chuỗi UUID v7. Mốc thời gian là chuỗi ISO-8601 UTC trong API và kiểu `TIMESTAMPTZ` trong PostgreSQL.
+- Tiền tệ là số nguyên không âm `int64` tính theo đơn vị minor VND (`amountMinor`), trong đó 1 đơn vị minor tương đương 1 VND nguyên. Tuyệt đối không dùng số thực dấu phẩy động (float).
+- Mọi yêu cầu công khai đều được phân quyền thông qua quyết định thẩm quyền từ Identity Access. JWT role/branch claims và các giá trị tenant do client gửi lên chỉ đóng vai trò gợi ý (hints), không bao giờ là nguồn thẩm quyền phân quyền.
 - Ngữ cảnh tenant được trích xuất từ ngữ cảnh Identity đã xác thực. Catalog không đưa vào header `X-Active-Tenant-Id` và không bao giờ chấp nhận quyền sở hữu tenant từ request body hoặc query parameter. Header `X-Active-Branch-Id` chỉ được chấp nhận như một bộ chọn chi nhánh đã được máy chủ xác thực.
-- Trạng thái thực đơn và giá cơ sở ở P0 có phạm vi trên toàn tenant. Một header chi nhánh vẫn bắt buộc đối với các vai trò có phạm vi chi nhánh để tư cách thành viên và quyền truy cập chi nhánh được kiểm tra ngay cả khi đồ thị thực đơn P0 trả về là toàn cầu.
-- Không có thao tác xóa cứng (hard delete) trong P0. Các chuyển đổi trạng thái/lưu trữ (archive) bảo toàn các ID cần thiết cho các tham chiếu lịch sử của Order và Inventory.
+- Trạng thái thực đơn và giá cơ sở ở P0 có phạm vi trên toàn tenant. Header chi nhánh vẫn bắt buộc đối với các vai trò có phạm vi chi nhánh (`MANAGER`, `CASHIER`, `KITCHEN`) để tư cách thành viên và quyền truy cập chi nhánh được kiểm tra ngay cả khi đồ thị thực đơn P0 trả về là toàn chuỗi.
+- Tuyệt đối không có thao tác xóa cứng (hard delete) trong P0. Các chuyển đổi trạng thái/lưu trữ (`ARCHIVED`) là xóa mềm (soft delete) nhằm bảo toàn các ID cần thiết cho các tham chiếu lịch sử của Order và Inventory.
+- Mọi thao tác ghi có khả năng thử lại bắt buộc phải có `Idempotency-Key`. Mọi thao tác cập nhật tài nguyên có phiên bản bắt buộc phải truyền `If-Match`.
 
-## Hợp đồng HTTP Chung
+---
+
+## Hợp đồng HTTP Chung (Common HTTP Contract)
 
 ### Các Header HTTP
 
-| Header | Bắt buộc | Ý nghĩa |
-|---|---:|---|
-| `Authorization` | Các API công khai được bảo vệ | `Bearer <Cognito access token>`. Cognito xác thực danh tính người dùng; Identity phân giải tư cách thành viên và quyền hạn hiện tại. |
-| `X-Correlation-Id` | Khuyến nghị | Giá trị tương quan của bên gọi; được service tự sinh nếu vắng mặt. Được trả về trong metadata thành công/lỗi. |
-| `X-Active-Branch-Id` | Vai trò/lượt đọc theo chi nhánh | Chi nhánh do client chọn; được xác thực đối chiếu với tư cách thành viên đang hoạt động hiện tại. Không bao giờ được tin cậy đơn lẻ. Tùy chọn đối với các thao tác toàn tenant của Owner và các biến đổi của Manager. |
-| `Idempotency-Key` | Thao tác POST/biến đổi trạng thái thử lại được | Khóa do client sinh có phạm vi actor + tenant + operation. Cùng một khóa bắt buộc phải mang cùng một hash yêu cầu. |
-| `If-Match` | Cập nhật có phiên bản | ETag của tài nguyên từ lần đọc gần nhất, ví dụ `"catalog-item-v7"`. Bắt buộc cho các cập nhật và thay đổi quan hệ. |
-| `Content-Type` | Yêu cầu có body | `application/json; charset=utf-8`. |
+| Header | Bắt buộc | Ý nghĩa và Quy ước sử dụng |
+|---|:---:|---|
+| `Authorization` | Bắt buộc cho Public API | `Bearer <Cognito access token>`. Cognito xác thực danh tính người dùng; Identity phân giải tư cách thành viên và quyền hạn hiện tại. |
+| `X-Correlation-Id` | Khuyến nghị (Tự sinh nếu thiếu) | Mã truy vết yêu cầu; được trả về trong metadata thành công/lỗi, outbox event và audit log. |
+| `X-Active-Branch-Id` | Khi gọi với vai trò chi nhánh | Chi nhánh do client chọn; được xác thực đối chiếu với tư cách thành viên đang hoạt động hiện tại. Tùy chọn đối với các thao tác toàn tenant của Owner. |
+| `Idempotency-Key` | Bắt buộc cho các lệnh ghi có thể retry | Khóa do client sinh có phạm vi actor + tenant + operation. Cùng một khóa bắt buộc phải mang cùng một hash yêu cầu. |
+| `If-Match` | Bắt buộc khi cập nhật tài nguyên | Mã ETag của tài nguyên từ lần đọc gần nhất (ví dụ: `"item-v7"` hoặc `"category-v3"`). Bắt buộc cho các cập nhật và thay đổi liên kết. |
+| `Content-Type` | Bắt buộc với request có body | `application/json; charset=utf-8`. |
 
-Các yêu cầu nội bộ ngoài ra còn mang thông tin xác thực workload identity/mTLS. Các client công khai không thể gọi `/internal/v1`.
+---
 
-### Cấu trúc Bao bọc Thành công (Success Envelope)
+### Cấu trúc Bao bì Chuẩn hóa (Standard Envelope)
+
+#### Phản hồi Thành công Đối tượng Đơn lẻ (Single Entity Response)
 
 ```json
 {
@@ -53,7 +56,9 @@ Các yêu cầu nội bộ ngoài ra còn mang thông tin xác thực workload i
 }
 ```
 
-Các phản hồi danh sách (collection) bổ sung thêm phân trang offset:
+#### Phản hồi Danh sách Phân trang (Paginated Collection Response)
+
+Catalog Service sử dụng phân trang trang (Offset Pagination) cho các danh sách quản trị và POS:
 
 ```json
 {
@@ -71,7 +76,7 @@ Các phản hồi danh sách (collection) bổ sung thêm phân trang offset:
 }
 ```
 
-### Cấu trúc Bao bọc Lỗi (Error Envelope)
+#### Phản hồi Lỗi (Error Envelope)
 
 ```json
 {
@@ -91,362 +96,978 @@ Các phản hồi danh sách (collection) bổ sung thêm phân trang offset:
 }
 ```
 
-Các mã lỗi chuẩn và mã lỗi đặc thù của Catalog:
+#### Bảng Quy tắc Mã Lỗi của Catalog Service
 
-| HTTP | Mã lỗi | Ý nghĩa |
+| HTTP Status | Mã lỗi (Code) | Ngữ cảnh sử dụng trong Catalog |
 |---:|---|---|
 | 401 | `unauthorized` | Thiếu, không hợp lệ hoặc hết hạn Cognito JWT. |
-| 403 | `forbidden` | Vai trò, tư cách thành viên, phạm vi tenant hoặc chi nhánh hiện tại không cho phép thao tác. |
+| 403 | `forbidden` | Vai trò, tư cách thành viên, phạm vi tenant hoặc chi nhánh hiện tại không cho phép thao tác (ví dụ: Cashier cố tình sửa thực đơn). |
 | 404 | `not_found` | Tài nguyên không tồn tại trong phạm vi được ủy quyền của bên gọi. Tuyệt đối không làm lộ sự tồn tại của tài nguyên thuộc tenant khác. |
 | 409 | `conflict` | Xung đột trạng thái chung. |
-| 409 | `catalog_version_conflict` | Header `If-Match` đã lỗi thời. |
-| 409 | `sku_conflict` | SKU đã được đặt trước bởi một món khác trong cùng tenant, bao gồm cả món đã lưu trữ. |
+| 409 | `catalog_version_conflict` | Header `If-Match` đã lỗi thời so với phiên bản hiện tại trên database. |
+| 409 | `sku_conflict` | Mã SKU đã được đặt trước bởi một món khác trong cùng tenant (bao gồm cả món đã lưu trữ). |
 | 409 | `category_has_items` | Danh mục không thể lưu trữ khi nó vẫn còn chứa các món chưa lưu trữ. |
 | 409 | `last_active_variant` | Thao tác sẽ khiến một món đang hoạt động không còn biến thể/biến thể mặc định nào đang hoạt động. |
-| 409 | `invalid_required_modifier_rule` | Thao tác sẽ khiến quy tắc nhóm modifier bắt buộc trở nên bất khả thi. |
-| 409 | `duplicate_request` | Cùng một idempotency key được tái sử dụng nhưng với một hash yêu cầu khác. |
+| 409 | `invalid_required_modifier_rule` | Thao tác sẽ khiến quy tắc nhóm modifier bắt buộc trở nên bất khả thi (ví dụ: số tùy chọn active < minSelections). |
+| 409 | `duplicate_request` | Cùng một `Idempotency-Key` được tái sử dụng nhưng với một request hash khác. |
 | 409 | `archived_resource` | Một tài nguyên đã lưu trữ ở trạng thái kết thúc (terminal) không thể bị biến đổi. |
 | 422 | `validation_error` | Xác thực payload, trường dữ liệu hoặc quy tắc nghiệp vụ thất bại. |
 | 422 | `invalid_modifier_selection` | Tùy chọn được chọn thuộc tenant khác, không hoạt động, bị trùng lặp hoặc vi phạm min/max. |
 | 422 | `invalid_variant_selection` | Biến thể bị thiếu, không hoạt động, thuộc tenant khác hoặc mơ hồ theo quy tắc phân giải kiểu cũ. |
 | 422 | `foreign_resource` | Tài nguyên được tham chiếu không thuộc về tenant hiện tại. |
 | 429 | `rate_limited` | Vượt quá giới hạn tốc độ tại Gateway hoặc service. |
-| 503 | `authorization_unavailable` | Không thể phân giải an toàn quyết định phân quyền từ Identity; từ chối truy cập (fail closed). |
+| 503 | `authorization_unavailable` | Không thể phân giải an toàn quyết định phân quyền từ Identity; hệ thống áp dụng nguyên tắc đóng cửa an toàn (fail-closed). |
 | 503 | `service_unavailable` | Catalog hoặc một dependency nội bộ bắt buộc tạm thời không khả dụng. |
 
-Thông báo lỗi luôn an toàn đối với client. Tuyệt đối không trả về hoặc ghi log các chi tiết câu lệnh SQL, JWT, bí mật, mã PIN thô hoặc toàn bộ payload yêu cầu.
+---
 
 ## Hợp đồng Phân quyền và Phạm vi (Scope)
 
-Catalog gửi một yêu cầu quyết định tới Identity cho subject hiện tại, ngữ cảnh tenant được chọn, ngữ cảnh chi nhánh tùy chọn và một trong các quyền hạn sau:
+Catalog gửi yêu cầu quyết định tới Identity Access với subject hiện tại, ngữ cảnh tenant được chọn, ngữ cảnh chi nhánh và một trong các quyền hạn sau:
 
-| Quyền hạn | Vai trò | Phạm vi (Scope) | Mục đích sử dụng trong Catalog |
+| Quyền hạn | Vai trò sở hữu | Phạm vi (Scope) | Mục đích sử dụng trong Catalog |
 |---|---|---|---|
-| `catalog:read` | Owner, Manager, Cashier, Kitchen | Tenant cộng với tư cách thành viên chi nhánh đã xác thực cho các vai trò chi nhánh | Các lượt đọc trên POS và quản trị. |
-| `catalog:manage` | Owner, Manager | Toàn tenant; Manager cần có bất kỳ tư cách thành viên Manager nào đang hoạt động trong tenant được chọn | Các biến đổi danh mục, món ăn, biến thể và modifier. |
-| `catalog:resolve` | Workload identity của Order | Yêu cầu tenant/chi nhánh đã xác thực, không có vai trò người dùng cuối | Phân giải Đơn hàng nội bộ. |
+| `catalog:read` | `OWNER`, `MANAGER`, `CASHIER`, `KITCHEN` | Tenant cộng với tư cách thành viên chi nhánh hợp lệ | Đọc menu bán hàng trên POS và đọc dữ liệu quản trị. |
+| `catalog:manage` | `OWNER`, `MANAGER` | Toàn tenant; Manager cần có tư cách thành viên active tại bất kỳ chi nhánh nào trong tenant | Tạo mới, cập nhật, đổi trạng thái danh mục, món ăn, biến thể và modifier. |
+| `catalog:resolve` | Workload identity của Order | Tenant/chi nhánh đã xác thực, không có vai trò người dùng cuối | Phân giải và định giá giỏ hàng Đơn hàng nội bộ. |
 
-Các quy tắc:
+*Các quy tắc bảo mật:*
+1. `OWNER` có thể đọc/ghi trong tenant mà không cần header chi nhánh.
+2. `MANAGER` có thể đọc/ghi thực đơn dùng chung của tenant khi Identity xác nhận có tư cách thành viên Manager đang hoạt động tại bất kỳ chi nhánh nào thuộc tenant đó. Thao tác biến đổi được ghi audit là có tác động toàn tenant.
+3. `CASHIER` và `KITCHEN` bắt buộc phải có tư cách thành viên chi nhánh đang hoạt động và **chỉ có quyền đọc (read-only)**. Cố tình gửi lệnh ghi sẽ nhận mã `403 Forbidden`.
+4. Mọi quyết định từ Identity bị lỗi hoặc timeout đều dẫn đến từ chối truy cập (Fail-Closed).
 
-1. Chủ sở hữu (Owner) có thể đọc/ghi trong tenant được chọn mà không cần header chi nhánh.
-2. Quản lý (Manager) có thể đọc/ghi thực đơn dùng chung của tenant khi Identity xác nhận có tư cách thành viên Manager đang hoạt động tại bất kỳ chi nhánh nào đang hoạt động thuộc tenant đó. Header chi nhánh gửi lên được xác thực nhưng không làm thu hẹp biến đổi của Catalog; biến đổi được ghi audit là có tác động toàn tenant.
-3. Thu ngân (Cashier) và Bếp/Bar (Kitchen) bắt buộc phải có tư cách thành viên chi nhánh đang hoạt động và chỉ có quyền đọc (read-only).
-4. Bộ phân giải nội bộ/lịch sử chỉ có thể phân giải các tham chiếu đã lưu trữ khi bên gọi là một workload của Order được ủy quyền. Nó tuyệt đối không được làm cho các tài nguyên đã lưu trữ trở thành có thể bán được trên POS.
-5. Quyết định từ Identity bị thất bại hoặc không khả dụng sẽ dẫn đến từ chối truy cập (fail closed). Quyền hạn lưu trong cache không được phép tồn tại lâu hơn thời gian sống (TTL) quyết định cho phép theo hợp đồng Identity.
+---
 
-## Bề mặt API Công khai (Public API Surface)
+## Bề mặt API Công khai (Public API Surface Summary)
 
-Các endpoint dưới đây thuộc phạm vi P0 trừ khi được đánh dấu là P1. Mọi endpoint biến đổi đều sử dụng envelope chung và yêu cầu header `Idempotency-Key` khi được liệt kê là có thể thử lại. Mọi biến đổi có phiên bản đều yêu cầu header `If-Match` ngoại trừ thao tác tạo mới.
+| Phương thức | Đường dẫn (Path) | Quyền hạn (Scope) | Idempotent | If-Match | Mã HTTP Thành công |
+|---|---|---|:---:|:---:|---|
+| **GET** | `/api/v1/catalog/categories` | `catalog:read` | Không | Không | `200 OK` |
+| **POST** | `/api/v1/catalog/categories` | `catalog:manage` | Bắt buộc | Không | `201 Created` |
+| **GET** | `/api/v1/catalog/categories/{categoryId}` | `catalog:read` | Không | Không | `200 OK` |
+| **PATCH** | `/api/v1/catalog/categories/{categoryId}` | `catalog:manage` | Bắt buộc | Bắt buộc | `200 OK` |
+| **POST** | `/api/v1/catalog/categories/{categoryId}/archive` | `catalog:manage` | Bắt buộc | Bắt buộc | `200 OK` |
+| **GET** | `/api/v1/catalog/items` | `catalog:read` | Không | Không | `200 OK` |
+| **POST** | `/api/v1/catalog/items` | `catalog:manage` | Bắt buộc | Không | `201 Created` |
+| **GET** | `/api/v1/catalog/items/{itemId}` | `catalog:read` | Không | Không | `200 OK` |
+| **PATCH** | `/api/v1/catalog/items/{itemId}` | `catalog:manage` | Bắt buộc | Bắt buộc | `200 OK` |
+| **POST** | `/api/v1/catalog/items/{itemId}/state` | `catalog:manage` | Bắt buộc | Bắt buộc | `200 OK` |
+| **POST** | `/api/v1/catalog/items/{itemId}/variants` | `catalog:manage` | Bắt buộc | Không | `201 Created` |
+| **PATCH** | `/api/v1/catalog/variants/{variantId}` | `catalog:manage` | Bắt buộc | Bắt buộc | `200 OK` |
+| **POST** | `/api/v1/catalog/variants/{variantId}/state` | `catalog:manage` | Bắt buộc | Bắt buộc | `200 OK` |
+| **POST** | `/api/v1/catalog/variants/{variantId}/default` | `catalog:manage` | Bắt buộc | Bắt buộc | `200 OK` |
+| **GET** | `/api/v1/catalog/modifier-groups` | `catalog:read` | Không | Không | `200 OK` |
+| **POST** | `/api/v1/catalog/modifier-groups` | `catalog:manage` | Bắt buộc | Không | `201 Created` |
+| **GET** | `/api/v1/catalog/modifier-groups/{groupId}` | `catalog:read` | Không | Không | `200 OK` |
+| **PATCH** | `/api/v1/catalog/modifier-groups/{groupId}` | `catalog:manage` | Bắt buộc | Bắt buộc | `200 OK` |
+| **POST** | `/api/v1/catalog/modifier-groups/{groupId}/state` | `catalog:manage` | Bắt buộc | Bắt buộc | `200 OK` |
+| **POST** | `/api/v1/catalog/modifier-groups/{groupId}/options` | `catalog:manage` | Bắt buộc | Không | `201 Created` |
+| **PATCH** | `/api/v1/catalog/modifier-options/{optionId}` | `catalog:manage` | Bắt buộc | Bắt buộc | `200 OK` |
+| **POST** | `/api/v1/catalog/modifier-options/{optionId}/state` | `catalog:manage` | Bắt buộc | Bắt buộc | `200 OK` |
+| **PUT** | `/api/v1/catalog/items/{itemId}/modifier-groups/{groupId}` | `catalog:manage` | Bắt buộc | Bắt buộc | `200 OK` |
+| **DELETE** | `/api/v1/catalog/items/{itemId}/modifier-groups/{groupId}` | `catalog:manage` | Bắt buộc | Bắt buộc | `204 No Content` |
+| **GET** | `/api/v1/catalog/combos` (P1) | `catalog:read` | Không | Không | `200 OK` |
+| **POST** | `/api/v1/catalog/combos` (P1) | `catalog:manage` | Bắt buộc | Không | `201 Created` |
+| **GET** | `/api/v1/catalog/combos/{comboId}` (P1) | `catalog:read` | Không | Không | `200 OK` |
+| **PATCH** | `/api/v1/catalog/combos/{comboId}` (P1) | `catalog:manage` | Bắt buộc | Bắt buộc | `200 OK` |
+| **POST** | `/api/v1/catalog/combos/{comboId}/state` (P1) | `catalog:manage` | Bắt buộc | Bắt buộc | `200 OK` |
+| **PUT** | `/api/v1/catalog/branches/{branchId}/variants/{variantId}/price` (P1) | `catalog:manage` | Bắt buộc | Không | `200 OK` |
+| **DELETE** | `/api/v1/catalog/branches/{branchId}/variants/{variantId}/price` (P1) | `catalog:manage` | Bắt buộc | Không | `204 No Content` |
+| **GET** | `/api/v1/catalog/tags` (P1) | `catalog:read` | Không | Không | `200 OK` |
+| **POST** | `/api/v1/catalog/tags` (P1) | `catalog:manage` | Bắt buộc | Không | `201 Created` |
+| **PUT** | `/api/v1/catalog/items/{itemId}/tags` (P1) | `catalog:manage` | Bắt buộc | Bắt buộc | `200 OK` |
 
-### Danh mục (Categories)
+---
 
-| Phương thức | Đường dẫn | Quyền | Yêu cầu | Phản hồi | Mã trạng thái |
-|---|---|---|---|---|---|
-| GET | `/api/v1/catalog/categories` | `catalog:read` | `page`, `limit`, `status`, `q`, `sort` | `CategoryPage` | 200, 401, 403 |
-| POST | `/api/v1/catalog/categories` | `catalog:manage` + idempotency | `CreateCategoryRequest` | `CategoryResponse` | 201, 403, 409, 422 |
-| GET | `/api/v1/catalog/categories/{categoryId}` | `catalog:read` | — | `CategoryResponse` | 200, 403, 404 |
-| PATCH | `/api/v1/catalog/categories/{categoryId}` | `catalog:manage` | `UpdateCategoryRequest` + `If-Match` | `CategoryResponse` | 200, 403, 404, 409, 422 |
-| POST | `/api/v1/catalog/categories/{categoryId}/archive` | `catalog:manage` + idempotency | `{}` + `If-Match` | `CategoryResponse` | 200, 403, 404, 409 |
+## Chi tiết Hợp đồng Từng API Công khai (Public API Details)
 
-Cấu trúc danh mục là dạng phẳng trong P0. Phương thức `DELETE` không được hỗ trợ.
+### 1. Quản lý Danh mục (Categories)
 
-### Món ăn và Biến thể (Items and Variants)
+Cấu trúc danh mục trong P0 là dạng phẳng (không phân nhánh lồng nhau). Không hỗ trợ phương thức `DELETE` vật lý; chỉ hỗ trợ thao tác lưu trữ mềm (`archive`).
 
-| Phương thức | Đường dẫn | Quyền | Yêu cầu | Phản hồi | Mã trạng thái |
-|---|---|---|---|---|---|
-| GET | `/api/v1/catalog/items` | `catalog:read` | bộ lọc + phân trang trang | `CatalogItemPage` | 200, 401, 403 |
-| POST | `/api/v1/catalog/items` | `catalog:manage` + idempotency | `CreateCatalogItemRequest` | `CatalogItemResponse` | 201, 403, 409, 422 |
-| GET | `/api/v1/catalog/items/{itemId}` | `catalog:read` | `view=sellable\|admin` | `CatalogItemResponse` | 200, 403, 404 |
-| PATCH | `/api/v1/catalog/items/{itemId}` | `catalog:manage` | `UpdateCatalogItemRequest` + `If-Match` | `CatalogItemResponse` | 200, 403, 404, 409, 422 |
-| POST | `/api/v1/catalog/items/{itemId}/state` | `catalog:manage` + idempotency | `ChangeStateRequest` + `If-Match` | `CatalogItemResponse` | 200, 403, 404, 409, 422 |
-| POST | `/api/v1/catalog/items/{itemId}/variants` | `catalog:manage` + idempotency | `CreateVariantRequest` | `VariantResponse` | 201, 403, 404, 409, 422 |
-| PATCH | `/api/v1/catalog/variants/{variantId}` | `catalog:manage` | `UpdateVariantRequest` + `If-Match` | `VariantResponse` | 200, 403, 404, 409, 422 |
-| POST | `/api/v1/catalog/variants/{variantId}/state` | `catalog:manage` + idempotency | `ChangeStateRequest` + `If-Match` | `VariantResponse` | 200, 403, 404, 409, 422 |
-| POST | `/api/v1/catalog/variants/{variantId}/default` | `catalog:manage` + idempotency | `{}` + `If-Match` | `CatalogItemResponse` | 200, 403, 404, 409 |
+#### `GET /api/v1/catalog/categories`
+Lấy danh sách các danh mục trong tenant.
 
-Endpoint `GET /items` hỗ trợ các tham số:
-
-```text
-?view=sellable|admin
-&categoryId=<uuid>
-&status=ACTIVE|INACTIVE|ARCHIVED
-&q=<search text>
-&page=1&limit=20
-&sort=displayOrder|name|updatedAt
-&direction=asc|desc
-```
-
-Giá trị mặc định là `view=sellable`, `page=1`, `limit=20`, và `sort=displayOrder,asc`. Giá trị tối đa của `limit` là 100. `view=admin` chỉ dành riêng cho Owner/Manager. `view=sellable` sẽ loại bỏ các danh mục, món, biến thể không hoạt động/đã lưu trữ và các lựa chọn modifier không hợp lệ.
-
-Endpoint cũ của hệ thống cha `POST /api/v1/catalog/items/{itemId}/availability` chỉ được giữ lại như một bí danh tương thích (compatibility alias) trong quá trình di chuyển (migration). Nó bắt buộc phải thực thi chỉ cho Owner/Manager; quyền ghi của Thu ngân (Cashier) bị loại bỏ. Các client mới phải sử dụng endpoint `state` của item.
-
-### Nhóm Modifier và Tùy chọn (Modifier Groups and Options)
-
-| Phương thức | Đường dẫn | Quyền | Yêu cầu | Phản hồi | Mã trạng thái |
-|---|---|---|---|---|---|
-| GET | `/api/v1/catalog/modifier-groups` | `catalog:read` | bộ lọc + phân trang trang | `ModifierGroupPage` | 200, 401, 403 |
-| POST | `/api/v1/catalog/modifier-groups` | `catalog:manage` + idempotency | `CreateModifierGroupRequest` | `ModifierGroupResponse` | 201, 403, 409, 422 |
-| GET | `/api/v1/catalog/modifier-groups/{groupId}` | `catalog:read` | `view=sellable\|admin` | `ModifierGroupResponse` | 200, 403, 404 |
-| PATCH | `/api/v1/catalog/modifier-groups/{groupId}` | `catalog:manage` | `UpdateModifierGroupRequest` + `If-Match` | `ModifierGroupResponse` | 200, 403, 404, 409, 422 |
-| POST | `/api/v1/catalog/modifier-groups/{groupId}/state` | `catalog:manage` + idempotency | `ChangeStateRequest` + `If-Match` | `ModifierGroupResponse` | 200, 403, 404, 409 |
-| POST | `/api/v1/catalog/modifier-groups/{groupId}/options` | `catalog:manage` + idempotency | `CreateModifierOptionRequest` | `ModifierOptionResponse` | 201, 403, 404, 409, 422 |
-| PATCH | `/api/v1/catalog/modifier-options/{optionId}` | `catalog:manage` | `UpdateModifierOptionRequest` + `If-Match` | `ModifierOptionResponse` | 200, 403, 404, 409, 422 |
-| POST | `/api/v1/catalog/modifier-options/{optionId}/state` | `catalog:manage` + idempotency | `ChangeStateRequest` + `If-Match` | `ModifierOptionResponse` | 200, 403, 404, 409 |
-| PUT | `/api/v1/catalog/items/{itemId}/modifier-groups/{groupId}` | `catalog:manage` + idempotency | `AttachModifierGroupRequest` + `If-Match` | `ItemModifierGroupResponse` | 200, 403, 404, 409, 422 |
-| DELETE | `/api/v1/catalog/items/{itemId}/modifier-groups/{groupId}` | `catalog:manage` + idempotency | `If-Match` | 204 | 403, 404, 409 |
-
-Phương thức `PUT` có tính bất biến (idempotent) và dùng để gắn một nhóm tái sử dụng vào một món. Nó thay thế giá trị ghi đè của cặp item-group đó; nó không làm biến đổi cấu hình mặc định của nhóm. Phương thức `DELETE` là thao tác gỡ liên kết (detach), không phải là xóa cứng nhóm tái sử dụng.
-
-### Các Endpoint P1 (P1 Endpoints)
-
-Các endpoint này đã được định hình hợp đồng nhưng được kiểm soát bằng tính năng (feature-gated) và nằm ngoài phạm vi nghiệm thu P0.
-
-| Phương thức | Đường dẫn | Mục đích |
-|---|---|---|
-| GET/POST | `/api/v1/catalog/combos` | Liệt kê/tạo combo giá cố định. |
-| GET/PATCH | `/api/v1/catalog/combos/{comboId}` | Đọc/cập nhật cấu thành combo và mô tả. |
-| POST | `/api/v1/catalog/combos/{comboId}/state` | Kích hoạt, hủy kích hoạt hoặc lưu trữ combo. |
-| PUT/DELETE | `/api/v1/catalog/branches/{branchId}/variants/{variantId}/price` | Thiết lập/xóa ghi đè giá biến thể hiện tại theo chi nhánh. |
-| GET/POST | `/api/v1/catalog/tags` | Liệt kê/tạo tag chuẩn hóa thuộc sở hữu của tenant. |
-| PUT | `/api/v1/catalog/items/{itemId}/tags` | Thay thế toàn bộ tập hợp tag của món. |
-
-Các route chi nhánh ở P1 yêu cầu header `X-Active-Branch-Id` khớp với đường dẫn URL và phải có quyết định phân quyền hợp lệ của Owner/Manager. Các thành phần combo trong P1 không được chứa một combo khác.
-
-## Lược đồ Yêu cầu Công khai (Public Request Schemas)
-
-### `CreateCategoryRequest` và `UpdateCategoryRequest`
+- **Thẩm quyền:** Quyền `catalog:read`.
+- **Tiêu đề Yêu cầu (Request Headers):**
+  - `Authorization: Bearer <token>` (Bắt buộc)
+  - `X-Active-Branch-Id: <uuid>` (Bắt buộc với Cashier/Kitchen)
+  - `X-Correlation-Id: <uuid>` (Tùy chọn)
+- **Tham số Truy vấn (Query Parameters):**
+  - `page` (integer, Mặc định: `1`): Số thứ tự trang.
+  - `limit` (integer, Mặc định: `20`, Tối đa: `100`): Kích thước trang.
+  - `status` (string, Tùy chọn): Lọc theo trạng thái (`ACTIVE`, `INACTIVE`, `ARCHIVED`). Mặc định trên POS là chỉ lấy `ACTIVE`.
+  - `q` (string, Tùy chọn): Tìm kiếm gần đúng theo tên danh mục.
+  - `sort` (string, Mặc định: `displayOrder:asc`): Sắp xếp (`displayOrder:asc`, `name:asc`, `createdAt:desc`).
+- **Phản hồi Thành công (`200 OK`):**
 
 ```json
 {
-  "name": "Cà phê",
+  "data": [
+    {
+      "id": "0192b2d0-7f1c-7abc-8d2c-123456789012",
+      "tenantId": "0192b2d0-7f1d-7abc-8d2c-123456789012",
+      "name": "Cà phê",
+      "displayOrder": 10,
+      "status": "ACTIVE",
+      "itemCount": 12,
+      "version": 3,
+      "createdAt": "2026-10-12T08:00:00Z",
+      "updatedAt": "2026-10-12T08:10:00Z"
+    }
+  ],
+  "meta": {
+    "pagination": {
+      "page": 1,
+      "limit": 20,
+      "total": 1,
+      "totalPages": 1
+    },
+    "requestId": "req_01J...",
+    "correlationId": "cor_01J..."
+  }
+}
+```
+
+- **Mã lỗi khả dĩ:** `401 Unauthorized`, `403 Forbidden`, `422 Unprocessable Entity`.
+
+---
+
+#### `POST /api/v1/catalog/categories`
+Tạo mới một danh mục trong tenant.
+
+- **Thẩm quyền:** Quyền `catalog:manage` (`OWNER`, `MANAGER`).
+- **Tiêu đề Yêu cầu (Request Headers):**
+  - `Authorization: Bearer <token>` (Bắt buộc)
+  - `Idempotency-Key: <unique-key>` (Bắt buộc)
+  - `X-Correlation-Id: <uuid>` (Khuyến nghị)
+  - `Content-Type: application/json; charset=utf-8` (Bắt buộc)
+- **Dữ liệu Gửi lên (Request Body):**
+
+```json
+{
+  "name": "Trà sữa & Trà trái cây",
+  "displayOrder": 20
+}
+```
+
+*Quy cách kiểm tra (Validation):*
+- `name`: Chuỗi từ 1 đến 120 ký tự Unicode (sau khi trim); duy nhất trong phạm vi tenant (không phân biệt chữ hoa chữ thường).
+- `displayOrder`: Số nguyên `>= 0` (mặc định 0).
+
+- **Phản hồi Thành công (`201 Created`):**
+
+```json
+{
+  "data": {
+    "id": "0192b2d0-7f50-7abc-8d2c-123456789012",
+    "tenantId": "0192b2d0-7f1d-7abc-8d2c-123456789012",
+    "name": "Trà sữa & Trà trái cây",
+    "displayOrder": 20,
+    "status": "ACTIVE",
+    "itemCount": 0,
+    "version": 1,
+    "createdAt": "2026-10-12T08:30:00Z",
+    "updatedAt": "2026-10-12T08:30:00Z"
+  },
+  "meta": {
+    "requestId": "req_01J...",
+    "correlationId": "cor_01J..."
+  }
+}
+```
+
+- **Mã lỗi khả dĩ:**
+  - `403 Forbidden` (`forbidden`): Cashier/Kitchen cố tình tạo danh mục.
+  - `409 Conflict` (`conflict`): Tên danh mục đã tồn tại trong tenant.
+  - `409 Conflict` (`duplicate_request`): Trùng `Idempotency-Key` nhưng body khác.
+  - `422 Unprocessable Entity` (`validation_error`): Tên rỗng hoặc displayOrder âm.
+
+---
+
+#### `GET /api/v1/catalog/categories/{categoryId}`
+Xem chi tiết một danh mục.
+
+- **Thẩm quyền:** Quyền `catalog:read`.
+- **Tiêu đề Yêu cầu (Request Headers):**
+  - `Authorization: Bearer <token>` (Bắt buộc)
+  - `X-Correlation-Id: <uuid>` (Tùy chọn)
+- **Tham số Đường dẫn (Path Parameters):**
+  - `categoryId` (UUID, Bắt buộc)
+- **Phản hồi Thành công (`200 OK`):** Trả về đối tượng `CategoryResponse`.
+- **Mã lỗi khả dĩ:** `401 Unauthorized`, `403 Forbidden`, `404 Not Found`.
+
+---
+
+#### `PATCH /api/v1/catalog/categories/{categoryId}`
+Cập nhật tên hoặc thứ tự hiển thị của danh mục.
+
+- **Thẩm quyền:** Quyền `catalog:manage`.
+- **Tiêu đề Yêu cầu (Request Headers):**
+  - `Authorization: Bearer <token>` (Bắt buộc)
+  - `If-Match: "category-v1"` (Bắt buộc - ETag phiên bản hiện tại)
+  - `Idempotency-Key: <unique-key>` (Bắt buộc)
+  - `X-Correlation-Id: <uuid>` (Khuyến nghị)
+  - `Content-Type: application/json; charset=utf-8` (Bắt buộc)
+- **Tham số Đường dẫn (Path Parameters):**
+  - `categoryId` (UUID, Bắt buộc)
+- **Dữ liệu Gửi lên (Request Body):**
+
+```json
+{
+  "name": "Trà sữa Đặc biệt",
+  "displayOrder": 25
+}
+```
+
+- **Phản hồi Thành công (`200 OK`):** Trả về `CategoryResponse` với `version` tăng lên.
+- **Mã lỗi khả dĩ:**
+  - `403 Forbidden`, `404 Not Found`.
+  - `409 Conflict` (`catalog_version_conflict`): Không khớp ETag `If-Match`.
+  - `409 Conflict` (`archived_resource`): Danh mục đã lưu trữ không được sửa.
+  - `422 Unprocessable Entity` (`validation_error`): Tên rỗng hoặc trùng tên khác.
+
+---
+
+#### `POST /api/v1/catalog/categories/{categoryId}/archive`
+Lưu trữ danh mục (`status: ARCHIVED`). Bất biến nghiệp vụ: Danh mục chỉ được phép lưu trữ khi nó không còn chứa bất kỳ món ăn nào chưa lưu trữ (`category_has_items`).
+
+- **Thẩm quyền:** Quyền `catalog:manage`.
+- **Tiêu đề Yêu cầu (Request Headers):**
+  - `Authorization: Bearer <token>` (Bắt buộc)
+  - `If-Match: "category-v2"` (Bắt buộc)
+  - `Idempotency-Key: <unique-key>` (Bắt buộc)
+  - `X-Correlation-Id: <uuid>` (Khuyến nghị)
+- **Tham số Đường dẫn (Path Parameters):**
+  - `categoryId` (UUID, Bắt buộc)
+- **Dữ liệu Gửi lên (Request Body):** Trống `{}`.
+- **Phản hồi Thành công (`200 OK`):** `CategoryResponse` với `status: "ARCHIVED"`.
+- **Mã lỗi khả dĩ:**
+  - `403 Forbidden`, `404 Not Found`.
+  - `409 Conflict` (`category_has_items`): Vẫn còn món thuộc danh mục chưa archive.
+  - `409 Conflict` (`catalog_version_conflict`).
+
+---
+
+### 2. Quản lý Món ăn và Biến thể (Items & Variants)
+
+Một món ăn (`CatalogItem`) đại diện cho một sản phẩm trong thực đơn. Mọi món ăn bắt buộc phải có ít nhất một biến thể (`CatalogVariant`, ví dụ: SIZE_M, SIZE_L, STANDARD) và chính xác một biến thể mặc định (`isDefault: true`). Thao tác tạo món và các biến thể ban đầu được thực hiện trong cùng một giao dịch cơ sở dữ liệu.
+
+#### `GET /api/v1/catalog/items`
+Lấy danh sách món ăn trong thực đơn. Hỗ trợ hai chế độ xem: `view=sellable` (dành cho POS) và `view=admin` (dành cho Dashboard quản trị).
+
+- **Thẩm quyền:** Quyền `catalog:read`.
+- **Tiêu đề Yêu cầu (Request Headers):**
+  - `Authorization: Bearer <token>` (Bắt buộc)
+  - `If-None-Match: "catalog-tenant-<tenantId>-v<catalogVersion>"` (Tùy chọn - kiểm tra cache 304)
+  - `X-Active-Branch-Id: <uuid>` (Bắt buộc với Cashier/Kitchen)
+  - `X-Correlation-Id: <uuid>` (Tùy chọn)
+- **Tham số Truy vấn (Query Parameters):**
+  - `view` (string, Mặc định: `sellable`): `sellable` chỉ trả về các món/biến thể đang `ACTIVE` và có thể bán được; `admin` trả về đầy đủ các trạng thái và chỉ dành cho Owner/Manager.
+  - `categoryId` (UUID, Tùy chọn): Lọc theo danh mục.
+  - `status` (string, Tùy chọn): `ACTIVE`, `INACTIVE`, `ARCHIVED` (chỉ có tác dụng với `view=admin`).
+  - `q` (string, Tùy chọn): Tìm kiếm theo tên hoặc SKU.
+  - `page` (integer, Mặc định: `1`): Số trang.
+  - `limit` (integer, Mặc định: `20`, Tối đa: `100`): Kích thước trang.
+  - `sort` (string, Mặc định: `displayOrder:asc`): Sắp xếp (`displayOrder`, `name`, `updatedAt`).
+- **Phản hồi Thành công (`200 OK`):**
+
+```json
+{
+  "data": [
+    {
+      "id": "0192b2d0-7f1e-7abc-8d2c-123456789012",
+      "tenantId": "0192b2d0-7f1d-7abc-8d2c-123456789012",
+      "sku": "CF-SUA",
+      "name": "Cà phê sữa",
+      "description": "Cà phê rang xay nguyên chất pha phin cùng sữa đặc",
+      "category": {
+        "id": "0192b2d0-7f1c-7abc-8d2c-123456789012",
+        "name": "Cà phê"
+      },
+      "status": "ACTIVE",
+      "variants": [
+        {
+          "id": "0192b2d0-7f20-7abc-8d2c-123456789012",
+          "name": "STANDARD",
+          "price": { "amountMinor": 29000, "currency": "VND" },
+          "isDefault": true,
+          "status": "ACTIVE",
+          "displayOrder": 0,
+          "version": 2
+        }
+      ],
+      "modifierGroups": [],
+      "catalogVersion": 18,
+      "version": 4,
+      "createdAt": "2026-10-12T08:00:00Z",
+      "updatedAt": "2026-10-12T08:10:00Z"
+    }
+  ],
+  "meta": {
+    "pagination": {
+      "page": 1,
+      "limit": 20,
+      "total": 1,
+      "totalPages": 1
+    },
+    "requestId": "req_01J...",
+    "correlationId": "cor_01J..."
+  }
+}
+```
+
+*Lưu ý về Cache Header:* Đi kèm tiêu đề phản hồi `ETag: "catalog-tenant-<tenantId>-v18"` và `Cache-Control: private, max-age=30`. Nếu client gửi `If-None-Match` khớp ETag và phân quyền hợp lệ, server trả về `304 Not Modified`.
+
+- **Mã lỗi khả dĩ:** `401 Unauthorized`, `403 Forbidden`, `422 Unprocessable Entity`.
+
+---
+
+#### `POST /api/v1/catalog/items`
+Tạo mới một món ăn cùng các biến thể ban đầu trong một giao dịch.
+
+- **Thẩm quyền:** Quyền `catalog:manage`.
+- **Tiêu đề Yêu cầu (Request Headers):**
+  - `Authorization: Bearer <token>` (Bắt buộc)
+  - `Idempotency-Key: <unique-key>` (Bắt buộc)
+  - `X-Correlation-Id: <uuid>` (Khuyến nghị)
+  - `Content-Type: application/json; charset=utf-8` (Bắt buộc)
+- **Dữ liệu Gửi lên (Request Body):**
+
+```json
+{
+  "sku": "TS-TRAN-CHAU",
+  "name": "Trà sữa Trân châu Đường đen",
+  "categoryId": "0192b2d0-7f50-7abc-8d2c-123456789012",
+  "description": "Trà sữa truyền thống kết hợp trân châu nấu đường mật",
+  "displayOrder": 10,
+  "status": "ACTIVE",
+  "variants": [
+    {
+      "name": "SIZE_M",
+      "price": { "amountMinor": 35000, "currency": "VND" },
+      "isDefault": true,
+      "displayOrder": 0
+    },
+    {
+      "name": "SIZE_L",
+      "price": { "amountMinor": 42000, "currency": "VND" },
+      "isDefault": false,
+      "displayOrder": 1
+    }
+  ]
+}
+```
+
+*Quy cách kiểm tra (Validation):*
+- `sku`: 1–64 ký tự chữ và số, tự động chuẩn hóa chữ hoa (`trim + uppercase`), duy nhất trong tenant (kể cả món đã lưu trữ).
+- `name`: 1–200 ký tự Unicode, bắt buộc.
+- `categoryId`: UUID của một danh mục đang `ACTIVE` trong cùng tenant.
+- `description`: Tối đa 2.000 ký tự (tùy chọn hoặc `null`).
+- `status`: `ACTIVE` hoặc `INACTIVE` (mặc định `INACTIVE`). Nếu là `ACTIVE`, bắt buộc phải có ít nhất 1 biến thể `ACTIVE` và chính xác 1 biến thể mặc định `isDefault: true`.
+- `variants`: Mảng chứa từ 1 đến 20 biến thể. Bắt buộc có chính xác một phần tử mang `isDefault: true`. Mọi giá trị `amountMinor` phải là số nguyên `>= 0`, đơn vị tiền tệ bắt buộc là `"VND"`.
+
+- **Phản hồi Thành công (`201 Created`):** Trả về `CatalogItemResponse` đầy đủ thông tin món và mảng biến thể vừa tạo, kèm `catalogVersion` mới của tenant.
+- **Mã lỗi khả dĩ:**
+  - `403 Forbidden` (`forbidden`).
+  - `409 Conflict` (`sku_conflict`): Mã SKU đã bị trùng trong tenant.
+  - `422 Unprocessable Entity` (`validation_error`): Không có biến thể mặc định, tiền tệ sai, hoặc danh mục không tồn tại/không thuộc tenant.
+
+---
+
+#### `GET /api/v1/catalog/items/{itemId}`
+Xem chi tiết một món ăn, bao gồm các biến thể và danh sách nhóm modifier được liên kết.
+
+- **Thẩm quyền:** Quyền `catalog:read`.
+- **Tiêu đề Yêu cầu (Request Headers):**
+  - `Authorization: Bearer <token>` (Bắt buộc)
+  - `X-Active-Branch-Id: <uuid>` (Bắt buộc với Cashier/Kitchen)
+  - `X-Correlation-Id: <uuid>` (Tùy chọn)
+- **Tham số Đường dẫn (Path Parameters):**
+  - `itemId` (UUID, Bắt buộc)
+- **Tham số Truy vấn (Query Parameters):**
+  - `view` (string, Mặc định: `sellable`): `sellable` hoặc `admin`.
+- **Phản hồi Thành công (`200 OK`):**
+
+```json
+{
+  "data": {
+    "id": "0192b2d0-7f1e-7abc-8d2c-123456789012",
+    "tenantId": "0192b2d0-7f1d-7abc-8d2c-123456789012",
+    "sku": "TS-TRAN-CHAU",
+    "name": "Trà sữa Trân châu Đường đen",
+    "description": "Trà sữa truyền thống kết hợp trân châu nấu đường mật",
+    "category": {
+      "id": "0192b2d0-7f50-7abc-8d2c-123456789012",
+      "name": "Trà sữa & Trà trái cây"
+    },
+    "status": "ACTIVE",
+    "variants": [
+      {
+        "id": "0192b2d0-7f60-7abc-8d2c-123456789012",
+        "name": "SIZE_M",
+        "price": { "amountMinor": 35000, "currency": "VND" },
+        "isDefault": true,
+        "status": "ACTIVE",
+        "displayOrder": 0,
+        "version": 1
+      },
+      {
+        "id": "0192b2d0-7f61-7abc-8d2c-123456789012",
+        "name": "SIZE_L",
+        "price": { "amountMinor": 42000, "currency": "VND" },
+        "isDefault": false,
+        "status": "ACTIVE",
+        "displayOrder": 1,
+        "version": 1
+      }
+    ],
+    "modifierGroups": [
+      {
+        "id": "0192b2d0-7f70-7abc-8d2c-123456789012",
+        "name": "Mức đường",
+        "minSelections": 1,
+        "maxSelections": 1,
+        "displayOrder": 10,
+        "status": "ACTIVE",
+        "options": [
+          {
+            "id": "0192b2d0-7f71-7abc-8d2c-123456789012",
+            "name": "100% Đường",
+            "priceDelta": { "amountMinor": 0, "currency": "VND" },
+            "status": "ACTIVE",
+            "displayOrder": 0,
+            "version": 1
+          },
+          {
+            "id": "0192b2d0-7f72-7abc-8d2c-123456789012",
+            "name": "50% Đường",
+            "priceDelta": { "amountMinor": 0, "currency": "VND" },
+            "status": "ACTIVE",
+            "displayOrder": 1,
+            "version": 1
+          }
+        ],
+        "version": 2
+      }
+    ],
+    "catalogVersion": 19,
+    "version": 1,
+    "createdAt": "2026-10-12T09:00:00Z",
+    "updatedAt": "2026-10-12T09:00:00Z"
+  },
+  "meta": {
+    "requestId": "req_01J...",
+    "correlationId": "cor_01J..."
+  }
+}
+```
+
+- **Mã lỗi khả dĩ:** `401 Unauthorized`, `403 Forbidden`, `404 Not Found`.
+
+---
+
+#### `PATCH /api/v1/catalog/items/{itemId}`
+Cập nhật thông tin cơ bản của món ăn (`name`, `description`, `categoryId`, `displayOrder`). Các trường không truyền sẽ giữ nguyên.
+
+- **Thẩm quyền:** Quyền `catalog:manage`.
+- **Tiêu đề Yêu cầu (Request Headers):**
+  - `Authorization: Bearer <token>` (Bắt buộc)
+  - `If-Match: "item-v1"` (Bắt buộc)
+  - `Idempotency-Key: <unique-key>` (Bắt buộc)
+  - `X-Correlation-Id: <uuid>` (Khuyến nghị)
+  - `Content-Type: application/json; charset=utf-8` (Bắt buộc)
+- **Tham số Đường dẫn (Path Parameters):**
+  - `itemId` (UUID, Bắt buộc)
+- **Dữ liệu Gửi lên (Request Body):**
+
+```json
+{
+  "name": "Trà sữa Trân châu Đường đen (Công thức mới)",
+  "displayOrder": 15
+}
+```
+
+- **Phản hồi Thành công (`200 OK`):** Trả về `CatalogItemResponse` với `version` món tăng thêm 1 và `catalogVersion` tăng thêm 1.
+- **Mã lỗi khả dĩ:**
+  - `403 Forbidden`, `404 Not Found`.
+  - `409 Conflict` (`catalog_version_conflict`).
+  - `422 Unprocessable Entity` (`validation_error`).
+
+---
+
+#### `POST /api/v1/catalog/items/{itemId}/state`
+Chuyển đổi trạng thái hoạt động của món ăn (`ACTIVE <-> INACTIVE` hoặc chuyển sang `ARCHIVED`).
+
+- **Thẩm quyền:** Quyền `catalog:manage`.
+- **Tiêu đề Yêu cầu (Request Headers):**
+  - `Authorization: Bearer <token>` (Bắt buộc)
+  - `If-Match: "item-v2"` (Bắt buộc)
+  - `Idempotency-Key: <unique-key>` (Bắt buộc)
+  - `X-Correlation-Id: <uuid>` (Khuyến nghị)
+  - `Content-Type: application/json; charset=utf-8` (Bắt buộc)
+- **Tham số Đường dẫn (Path Parameters):**
+  - `itemId` (UUID, Bắt buộc)
+- **Dữ liệu Gửi lên (Request Body):**
+
+```json
+{
+  "status": "INACTIVE",
+  "reason": "Tạm dừng phục vụ để thay đổi nhà cung cấp sữa"
+}
+```
+
+*Quy tắc chuyển trạng thái:*
+- Kích hoạt lại `ACTIVE`: Yêu cầu món phải có ít nhất 1 biến thể `ACTIVE` và 1 biến thể mặc định `ACTIVE`.
+- Chuyển sang `ARCHIVED`: Đây là trạng thái kết thúc (terminal); không thể kích hoạt lại hoặc sửa đổi sau khi archive. Mã SKU của món vẫn được bảo lưu để đảm bảo tính toàn vẹn dữ liệu.
+
+- **Phản hồi Thành công (`200 OK`):** Trả về `CatalogItemResponse` với trạng thái mới.
+- **Mã lỗi khả dĩ:**
+  - `403 Forbidden`, `404 Not Found`.
+  - `409 Conflict` (`last_active_variant`): Món không có biến thể active nào nên không thể mở `ACTIVE`.
+  - `409 Conflict` (`archived_resource`): Không thể đổi trạng thái món đã lưu trữ.
+
+---
+
+#### `POST /api/v1/catalog/items/{itemId}/variants`
+Bổ sung thêm một biến thể mới cho món ăn hiện có.
+
+- **Thẩm quyền:** Quyền `catalog:manage`.
+- **Tiêu đề Yêu cầu (Request Headers):**
+  - `Authorization: Bearer <token>` (Bắt buộc)
+  - `Idempotency-Key: <unique-key>` (Bắt buộc)
+  - `X-Correlation-Id: <uuid>` (Khuyến nghị)
+  - `Content-Type: application/json; charset=utf-8` (Bắt buộc)
+- **Tham số Đường dẫn (Path Parameters):**
+  - `itemId` (UUID, Bắt buộc)
+- **Dữ liệu Gửi lên (Request Body):**
+
+```json
+{
+  "name": "SIZE_XL",
+  "price": { "amountMinor": 49000, "currency": "VND" },
+  "isDefault": false,
+  "displayOrder": 2
+}
+```
+
+- **Phản hồi Thành công (`201 Created`):**
+
+```json
+{
+  "data": {
+    "id": "0192b2d0-7f62-7abc-8d2c-123456789012",
+    "name": "SIZE_XL",
+    "price": { "amountMinor": 49000, "currency": "VND" },
+    "isDefault": false,
+    "status": "ACTIVE",
+    "displayOrder": 2,
+    "version": 1
+  },
+  "meta": {
+    "requestId": "req_01J...",
+    "correlationId": "cor_01J..."
+  }
+}
+```
+
+- **Mã lỗi khả dĩ:** `403 Forbidden`, `404 Not Found`, `422 Unprocessable Entity`.
+
+---
+
+#### `PATCH /api/v1/catalog/variants/{variantId}`
+Cập nhật tên, giá bán hoặc thứ tự của một biến thể cụ thể.
+
+- **Thẩm quyền:** Quyền `catalog:manage`.
+- **Tiêu đề Yêu cầu (Request Headers):**
+  - `Authorization: Bearer <token>` (Bắt buộc)
+  - `If-Match: "variant-v1"` (Bắt buộc)
+  - `Idempotency-Key: <unique-key>` (Bắt buộc)
+  - `X-Correlation-Id: <uuid>` (Khuyến nghị)
+  - `Content-Type: application/json; charset=utf-8` (Bắt buộc)
+- **Tham số Đường dẫn (Path Parameters):**
+  - `variantId` (UUID, Bắt buộc)
+- **Dữ liệu Gửi lên (Request Body):**
+
+```json
+{
+  "name": "SIZE_XL_KHONG_LO",
+  "price": { "amountMinor": 52000, "currency": "VND" }
+}
+```
+
+- **Phản hồi Thành công (`200 OK`):** Trả về `VariantResponse` với giá mới và version tăng lên.
+- **Mã lỗi khả dĩ:** `403 Forbidden`, `404 Not Found`, `409 Conflict` (`catalog_version_conflict`), `422 Unprocessable Entity`.
+
+---
+
+#### `POST /api/v1/catalog/variants/{variantId}/state`
+Đổi trạng thái biến thể (`ACTIVE`, `INACTIVE`, `ARCHIVED`). Bất biến: Không được phép vô hiệu hóa hoặc lưu trữ biến thể nếu việc đó làm cho món ăn đang `ACTIVE` mất đi biến thể active cuối cùng hoặc mất biến thể mặc định.
+
+- **Thẩm quyền:** Quyền `catalog:manage`.
+- **Tiêu đề Yêu cầu (Request Headers):**
+  - `Authorization: Bearer <token>` (Bắt buộc)
+  - `If-Match: "variant-v2"` (Bắt buộc)
+  - `Idempotency-Key: <unique-key>` (Bắt buộc)
+  - `X-Correlation-Id: <uuid>` (Khuyến nghị)
+  - `Content-Type: application/json; charset=utf-8` (Bắt buộc)
+- **Tham số Đường dẫn (Path Parameters):**
+  - `variantId` (UUID, Bắt buộc)
+- **Dữ liệu Gửi lên (Request Body):**
+
+```json
+{
+  "status": "INACTIVE",
+  "reason": "Tạm ngưng size XL do thiếu cốc đựng"
+}
+```
+
+- **Phản hồi Thành công (`200 OK`):** Trả về `VariantResponse` với trạng thái mới.
+- **Mã lỗi khả dĩ:**
+  - `403 Forbidden`, `404 Not Found`.
+  - `409 Conflict` (`last_active_variant`): Biến thể này là biến thể active duy nhất của món đang bán.
+
+---
+
+#### `POST /api/v1/catalog/variants/{variantId}/default`
+Chuyển đổi một biến thể thành biến thể mặc định của món ăn. Hệ thống tự động gỡ cờ mặc định của biến thể cũ trong cùng một giao dịch.
+
+- **Thẩm quyền:** Quyền `catalog:manage`.
+- **Tiêu đề Yêu cầu (Request Headers):**
+  - `Authorization: Bearer <token>` (Bắt buộc)
+  - `If-Match: "item-v3"` (Bắt buộc - ETag của món ăn)
+  - `Idempotency-Key: <unique-key>` (Bắt buộc)
+  - `X-Correlation-Id: <uuid>` (Khuyến nghị)
+- **Tham số Đường dẫn (Path Parameters):**
+  - `variantId` (UUID, Bắt buộc)
+- **Dữ liệu Gửi lên (Request Body):** Trống `{}`.
+- **Phản hồi Thành công (`200 OK`):** Trả về `CatalogItemResponse` cập nhật.
+- **Mã lỗi khả dĩ:**
+  - `403 Forbidden`, `404 Not Found`.
+  - `409 Conflict` (`conflict`): Biến thể không ở trạng thái `ACTIVE`.
+
+---
+
+### 3. Quản lý Nhóm Modifier và Tùy chọn (Modifier Groups & Options)
+
+Nhóm Modifier được thiết kế theo mô hình tái sử dụng (Reusable Groups). Một nhóm modifier (ví dụ: Topping, Mức đường, Mức đá) có thể được định nghĩa một lần và liên kết vào nhiều món ăn khác nhau với các quy tắc chọn tối thiểu/tối đa (`minSelections`, `maxSelections`) được phép ghi đè riêng cho từng món.
+
+#### `GET /api/v1/catalog/modifier-groups`
+Lấy danh sách các nhóm modifier trong tenant.
+
+- **Thẩm quyền:** Quyền `catalog:read`.
+- **Tiêu đề Yêu cầu (Request Headers):**
+  - `Authorization: Bearer <token>` (Bắt buộc)
+  - `X-Correlation-Id: <uuid>` (Tùy chọn)
+- **Tham số Truy vấn (Query Parameters):**
+  - `page` (integer, Mặc định: `1`)
+  - `limit` (integer, Mặc định: `20`, Tối đa: `100`)
+  - `status` (string, Tùy chọn: `ACTIVE`, `INACTIVE`, `ARCHIVED`)
+  - `q` (string, Tùy chọn): Tìm kiếm theo tên nhóm.
+- **Phản hồi Thành công (`200 OK`):**
+
+```json
+{
+  "data": [
+    {
+      "id": "0192b2d0-7f21-7abc-8d2c-123456789012",
+      "name": "Topping",
+      "minSelections": 0,
+      "maxSelections": 3,
+      "displayOrder": 20,
+      "status": "ACTIVE",
+      "options": [
+        {
+          "id": "0192b2d0-7f22-7abc-8d2c-123456789012",
+          "name": "Trân châu đen",
+          "priceDelta": { "amountMinor": 5000, "currency": "VND" },
+          "status": "ACTIVE",
+          "displayOrder": 0,
+          "version": 1
+        }
+      ],
+      "version": 3
+    }
+  ],
+  "meta": {
+    "pagination": {
+      "page": 1,
+      "limit": 20,
+      "total": 1,
+      "totalPages": 1
+    },
+    "requestId": "req_01J...",
+    "correlationId": "cor_01J..."
+  }
+}
+```
+
+---
+
+#### `POST /api/v1/catalog/modifier-groups`
+Tạo mới một nhóm modifier kèm các tùy chọn ban đầu.
+
+- **Thẩm quyền:** Quyền `catalog:manage`.
+- **Tiêu đề Yêu cầu (Request Headers):**
+  - `Authorization: Bearer <token>` (Bắt buộc)
+  - `Idempotency-Key: <unique-key>` (Bắt buộc)
+  - `X-Correlation-Id: <uuid>` (Khuyến nghị)
+  - `Content-Type: application/json; charset=utf-8` (Bắt buộc)
+- **Dữ liệu Gửi lên (Request Body):**
+
+```json
+{
+  "name": "Topping Cao Cấp",
+  "minSelections": 0,
+  "maxSelections": 4,
+  "displayOrder": 30,
+  "options": [
+    {
+      "name": "Trân châu hoàng kim",
+      "priceDelta": { "amountMinor": 8000, "currency": "VND" },
+      "displayOrder": 0
+    },
+    {
+      "name": "Pudding trứng",
+      "priceDelta": { "amountMinor": 10000, "currency": "VND" },
+      "displayOrder": 1
+    }
+  ]
+}
+```
+
+*Quy cách kiểm tra:*
+- `name`: 1–120 ký tự Unicode, duy nhất trong tenant giữa các nhóm active.
+- `minSelections` / `maxSelections`: `0 <= minSelections <= maxSelections <= số tùy chọn`.
+- `priceDelta.amountMinor`: Số nguyên `>= 0` (trong P0 phụ thu không được âm).
+
+- **Phản hồi Thành công (`201 Created`):** Trả về `ModifierGroupResponse` đầy đủ.
+- **Mã lỗi khả dĩ:** `403 Forbidden`, `409 Conflict`, `422 Unprocessable Entity`.
+
+---
+
+#### `GET /api/v1/catalog/modifier-groups/{groupId}`
+Xem chi tiết một nhóm modifier.
+
+- **Thẩm quyền:** Quyền `catalog:read`.
+- **Tham số Đường dẫn (Path Parameters):** `groupId` (UUID, Bắt buộc).
+- **Phản hồi Thành công (`200 OK`):** Trả về `ModifierGroupResponse`.
+
+---
+
+#### `PATCH /api/v1/catalog/modifier-groups/{groupId}`
+Cập nhật thông tin nhóm modifier (tên, minSelections, maxSelections mặc định, displayOrder).
+
+- **Thẩm quyền:** Quyền `catalog:manage`.
+- **Tiêu đề Yêu cầu (Request Headers):**
+  - `Authorization: Bearer <token>` (Bắt buộc)
+  - `If-Match: "group-v3"` (Bắt buộc)
+  - `Idempotency-Key: <unique-key>` (Bắt buộc)
+  - `X-Correlation-Id: <uuid>` (Khuyến nghị)
+  - `Content-Type: application/json; charset=utf-8` (Bắt buộc)
+- **Tham số Đường dẫn (Path Parameters):** `groupId` (UUID, Bắt buộc).
+- **Dữ liệu Gửi lên (Request Body):**
+
+```json
+{
+  "name": "Topping Cao Cấp Đặc biệt",
+  "maxSelections": 5
+}
+```
+
+- **Phản hồi Thành công (`200 OK`):** `ModifierGroupResponse` với version tăng thêm 1.
+- **Mã lỗi khả dĩ:** `403 Forbidden`, `404 Not Found`, `409 Conflict`, `422 Unprocessable Entity`.
+
+---
+
+#### `POST /api/v1/catalog/modifier-groups/{groupId}/state`
+Đổi trạng thái nhóm modifier (`ACTIVE`, `INACTIVE`, `ARCHIVED`).
+
+- **Thẩm quyền:** Quyền `catalog:manage`.
+- **Tiêu đề Yêu cầu (Request Headers):** `If-Match`, `Idempotency-Key`, `X-Correlation-Id`, `Content-Type`.
+- **Dữ liệu Gửi lên (Request Body):** `{ "status": "INACTIVE", "reason": "Hết nguyên liệu" }`.
+- **Phản hồi Thành công (`200 OK`):** `ModifierGroupResponse`.
+
+---
+
+#### `POST /api/v1/catalog/modifier-groups/{groupId}/options`
+Thêm tùy chọn mới vào nhóm modifier.
+
+- **Thẩm quyền:** Quyền `catalog:manage`.
+- **Tiêu đề Yêu cầu (Request Headers):** `Authorization`, `Idempotency-Key`, `X-Correlation-Id`, `Content-Type`.
+- **Tham số Đường dẫn (Path Parameters):** `groupId` (UUID, Bắt buộc).
+- **Dữ liệu Gửi lên (Request Body):**
+
+```json
+{
+  "name": "Thạch dừa",
+  "priceDelta": { "amountMinor": 6000, "currency": "VND" },
+  "displayOrder": 2
+}
+```
+
+- **Phản hồi Thành công (`201 Created`):** `ModifierOptionResponse`.
+- **Mã lỗi khả dĩ:** `403 Forbidden`, `404 Not Found`, `409 Conflict`, `422 Unprocessable Entity`.
+
+---
+
+#### `PATCH /api/v1/catalog/modifier-options/{optionId}`
+Cập nhật tên, phụ thu hoặc thứ tự hiển thị của tùy chọn modifier.
+
+- **Thẩm quyền:** Quyền `catalog:manage`.
+- **Tiêu đề Yêu cầu (Request Headers):** `Authorization`, `If-Match: "option-v1"`, `Idempotency-Key`, `X-Correlation-Id`, `Content-Type`.
+- **Tham số Đường dẫn (Path Parameters):** `optionId` (UUID, Bắt buộc).
+- **Dữ liệu Gửi lên (Request Body):**
+
+```json
+{
+  "name": "Thạch dừa non",
+  "priceDelta": { "amountMinor": 7000, "currency": "VND" }
+}
+```
+
+- **Phản hồi Thành công (`200 OK`):** `ModifierOptionResponse`.
+
+---
+
+#### `POST /api/v1/catalog/modifier-options/{optionId}/state`
+Đổi trạng thái tùy chọn modifier (`ACTIVE`, `INACTIVE`, `ARCHIVED`).
+
+- **Thẩm quyền:** Quyền `catalog:manage`.
+- **Tiêu đề Yêu cầu (Request Headers):** `If-Match`, `Idempotency-Key`, `X-Correlation-Id`, `Content-Type`.
+- **Dữ liệu Gửi lên (Request Body):** `{ "status": "INACTIVE", "reason": "Tạm hết" }`.
+- **Phản hồi Thành công (`200 OK`):** `ModifierOptionResponse`.
+
+---
+
+#### `PUT /api/v1/catalog/items/{itemId}/modifier-groups/{groupId}`
+Gắn một nhóm modifier tái sử dụng vào một món ăn, kèm theo giá trị ghi đè số lượng lựa chọn tối thiểu/tối đa dành riêng cho món đó.
+
+- **Thẩm quyền:** Quyền `catalog:manage`.
+- **Tiêu đề Yêu cầu (Request Headers):**
+  - `Authorization: Bearer <token>` (Bắt buộc)
+  - `If-Match: "item-v4"` (Bắt buộc - ETag của món ăn)
+  - `Idempotency-Key: <unique-key>` (Bắt buộc)
+  - `X-Correlation-Id: <uuid>` (Khuyến nghị)
+  - `Content-Type: application/json; charset=utf-8` (Bắt buộc)
+- **Tham số Đường dẫn (Path Parameters):**
+  - `itemId` (UUID, Bắt buộc)
+  - `groupId` (UUID, Bắt buộc)
+- **Dữ liệu Gửi lên (Request Body):**
+
+```json
+{
+  "overrideMin": 1,
+  "overrideMax": 2,
   "displayOrder": 10
 }
 ```
 
-| Trường | Kiểu dữ liệu | Tạo mới | Cập nhật | Ràng buộc |
-|---|---|---:|---:|---|
-| `name` | string | bắt buộc | tùy chọn | 1–120 ký tự Unicode sau khi cắt khoảng trắng (trim); duy nhất trong tenant không phân biệt hoa thường. |
-| `displayOrder` | int32 | tùy chọn | tùy chọn | Số không âm; nếu trùng thứ tự sẽ phân giải theo ID để đảm bảo tính tiền định khi đọc. |
+*Quy tắc kiểm tra:*
+- Cả hai trường `overrideMin` và `overrideMax` đều là tùy chọn. Nếu không truyền, hệ thống sẽ sử dụng giá trị mặc định của nhóm.
+- Ràng buộc: `0 <= effectiveMin <= effectiveMax <= số tùy chọn đang ACTIVE của nhóm`.
+- Nếu món ăn đang `ACTIVE` và được gắn nhóm bắt buộc (`min >= 1`), nhóm đó bắt buộc phải có đủ số tùy chọn active; nếu không yêu cầu sẽ thất bại với lỗi `409 invalid_required_modifier_rule`.
 
-### `CreateCatalogItemRequest`
+- **Phản hồi Thành công (`200 OK`):** Trả về `CatalogItemResponse` cập nhật với nhóm modifier vừa được gắn.
+- **Mã lỗi khả dĩ:**
+  - `403 Forbidden`, `404 Not Found`.
+  - `409 Conflict` (`invalid_required_modifier_rule`).
+  - `409 Conflict` (`catalog_version_conflict`).
+  - `422 Unprocessable Entity` (`foreign_resource`): Nhóm modifier thuộc tenant khác.
+
+---
+
+#### `DELETE /api/v1/catalog/items/{itemId}/modifier-groups/{groupId}`
+Gỡ liên kết (detach) nhóm modifier khỏi món ăn. Thao tác này không xóa bản thân nhóm modifier trong cơ sở dữ liệu.
+
+- **Thẩm quyền:** Quyền `catalog:manage`.
+- **Tiêu đề Yêu cầu (Request Headers):**
+  - `Authorization: Bearer <token>` (Bắt buộc)
+  - `If-Match: "item-v5"` (Bắt buộc)
+  - `Idempotency-Key: <unique-key>` (Bắt buộc)
+  - `X-Correlation-Id: <uuid>` (Khuyến nghị)
+- **Tham số Đường dẫn (Path Parameters):**
+  - `itemId` (UUID, Bắt buộc)
+  - `groupId` (UUID, Bắt buộc)
+- **Phản hồi Thành công (`204 No Content`):** Không có body.
+- **Mã lỗi khả dĩ:** `403 Forbidden`, `404 Not Found`, `409 Conflict`.
+
+---
+
+### 4. Các Endpoint Giai đoạn P1 (Feature-Gated)
+
+#### `GET /api/v1/catalog/combos` & `POST /api/v1/catalog/combos`
+Quản lý combo món ăn với mức giá cố định (`fixedPrice`). Combo bao gồm danh sách các thành phần (`components`), mỗi thành phần trỏ tới một `itemId` và `variantId` bắt buộc. Bất biến: Thành phần combo không được phép chứa một combo khác.
 
 ```json
 {
-  "sku": "CF-SUA",
-  "name": "Cà phê sữa",
-  "categoryId": "0192b2d0-7f1c-7abc-8d2c-123456789012",
-  "description": null,
-  "displayOrder": 10,
-  "status": "INACTIVE",
-  "variants": [
+  "name": "Combo Ăn Sáng Tiết Kiệm",
+  "description": "Bánh mì kẹp thịt + Cà phê sữa đá",
+  "fixedPrice": { "amountMinor": 45000, "currency": "VND" },
+  "components": [
     {
-      "name": "STANDARD",
-      "price": { "amountMinor": 29000, "currency": "VND" },
-      "isDefault": true,
-      "displayOrder": 0
+      "catalogItemId": "0192b2d0-7f1e-7abc-8d2c-123456789012",
+      "variantId": "0192b2d0-7f20-7abc-8d2c-123456789012",
+      "modifierOptionIds": []
     }
   ]
 }
 ```
 
-| Trường | Kiểu dữ liệu | Bắt buộc | Ràng buộc |
-|---|---|---:|---|
-| `sku` | string | có | 1–64 ký tự, chuẩn hóa chữ hoa, duy nhất trong tenant và vẫn được giữ đặt chỗ sau khi lưu trữ. |
-| `name` | string | có | 1–200 ký tự Unicode sau khi trim. |
-| `categoryId` | UUID | có | Danh mục đang hoạt động trong cùng tenant. |
-| `description` | string/null | không | Tối đa 2.000 ký tự; đã làm sạch; metadata P1. |
-| `displayOrder` | int32 | không | Số không âm. |
-| `status` | enum | không | Mặc định là `INACTIVE` cho bản nháp chưa hoàn chỉnh; `ACTIVE` yêu cầu thỏa mãn toàn bộ bất biến bán hàng. |
-| `variants` | array | có | Ít nhất một biến thể; có một và chỉ một biến thể mặc định. |
+- **Phản hồi:** `200 OK` (GET) hoặc `201 Created` (POST) kèm `ComboResponse`.
 
-Thao tác tạo món và các biến thể ban đầu nằm trong cùng một giao dịch. Một món mới có thể được tạo ở trạng thái `INACTIVE` trong khi đang được cấu hình, nhưng thao tác tạo với trạng thái `ACTIVE` bắt buộc phải chứa một biến thể mặc định đang hoạt động và ít nhất một biến thể đang hoạt động.
+---
 
-### `UpdateCatalogItemRequest`
+#### `PUT /api/v1/catalog/branches/{branchId}/variants/{variantId}/price`
+Thiết lập ghi đè giá biến thể theo từng chi nhánh cụ thể (Branch Price Override).
 
-Mọi trường dữ liệu đều là tùy chọn; các trường bị bỏ qua sẽ giữ nguyên không đổi. `categoryId` phải thuộc cùng một tenant. Thay đổi `sku` chỉ được phép khi món chưa bị lưu trữ; SKU cũ vẫn được giữ đặt chỗ.
+- **Thẩm quyền:** Quyền `catalog:manage` tại chi nhánh đó.
+- **Dữ liệu Gửi lên (Request Body):**
 
 ```json
 {
-  "name": "Cà phê sữa đá",
-  "categoryId": "0192b2d0-7f1c-7abc-8d2c-123456789012",
-  "displayOrder": 20,
-  "description": "Cà phê rang xay với sữa đặc"
+  "price": { "amountMinor": 32000, "currency": "VND" }
 }
 ```
 
-### Các Lược đồ Biến thể (Variant Schemas)
+- **Phản hồi:** `200 OK` kèm `BranchVariantPriceResponse`.
 
-```json
-{
-  "name": "LARGE",
-  "price": { "amountMinor": 39000, "currency": "VND" },
-  "isDefault": false,
-  "displayOrder": 1
-}
-```
+---
 
-Trường `amountMinor` phải là số nguyên `>= 0`; chỉ chấp nhận đơn vị tiền tệ `VND` trong P0. Một biến thể không thể bị lưu trữ hoặc vô hiệu hóa nếu việc đó khiến một món đang active không còn biến thể/biến thể mặc định nào active, trừ khi trong cùng giao dịch có chỉ định biến thể thay thế hoặc thay đổi trạng thái của món.
+#### `DELETE /api/v1/catalog/branches/{branchId}/variants/{variantId}/price`
+Xóa bản ghi đè giá chi nhánh. Sau khi xóa, giá của biến thể tại chi nhánh sẽ tự động quay về mức giá cơ sở toàn tenant.
 
-### `CreateModifierGroupRequest`
+- **Phản hồi:** `204 No Content`.
 
-```json
-{
-  "name": "Topping",
-  "minSelections": 0,
-  "maxSelections": 3,
-  "displayOrder": 20,
-  "options": [
-    {
-      "name": "Trân châu",
-      "priceDelta": { "amountMinor": 5000, "currency": "VND" },
-      "displayOrder": 0
-    }
-  ]
-}
-```
+---
 
-| Trường | Kiểu dữ liệu | Ràng buộc |
-|---|---|---|
-| `name` | string | 1–120 ký tự; duy nhất trong tenant giữa các nhóm đang active không phân biệt hoa thường. |
-| `minSelections` / `maxSelections` | int32 | `0 <= min <= max <= số tùy chọn đang active`; `min >= 1` nghĩa là bắt buộc. |
-| `options` | array | Ít nhất một tùy chọn cho nhóm được gắn vào món đang active. Tên tùy chọn là duy nhất trong nhóm. |
-| `priceDelta.amountMinor` | int64 | Số không âm trong P0; không hỗ trợ chiết khấu âm hoặc số lượng theo từng tùy chọn. |
+#### `GET /api/v1/catalog/tags` & `POST /api/v1/catalog/tags`
+Quản lý danh mục Tag phân loại chuẩn hóa (phục vụ bộ lọc món và thuật toán gợi ý Recommendation / AI).
 
-`UpdateModifierGroupRequest` có thể thay đổi các giá trị mặc định, tên và thứ tự hiển thị. Nó không được phép làm vô hiệu hóa trong im lặng một món đang active được gắn nhóm này. Thao tác tạo/sửa tùy chọn sử dụng `name`, `priceDelta`, và `displayOrder`; các ID tùy chọn không bao giờ được tái sử dụng.
+- **Dữ liệu tạo Tag (`POST`):** `{ "name": "Best Seller", "slug": "best-seller" }`.
+- **Phản hồi:** `201 Created` kèm `TagResponse`.
 
-### `AttachModifierGroupRequest`
+---
 
-```json
-{
-  "minSelections": 1,
-  "maxSelections": 2,
-  "displayOrder": 30
-}
-```
+#### `PUT /api/v1/catalog/items/{itemId}/tags`
+Thay thế toàn bộ tập hợp Tag được gán cho món ăn một cách nguyên tử.
 
-Cả hai trường ghi đè đều là tùy chọn. Nếu vắng mặt, các giá trị mặc định của nhóm sẽ được áp dụng. Các giá trị hiệu lực phải thỏa mãn `0 <= min <= max <= số tùy chọn đang active`. Một nhóm bắt buộc được gắn vào món phải có đủ số tùy chọn đang hoạt động; ngược lại yêu cầu sẽ thất bại với lỗi `invalid_required_modifier_rule`.
+- **Dữ liệu Gửi lên (Request Body):** `{ "tagIds": ["0192b2d0-7f80-7abc-8d2c-123456789012"] }`.
+- **Phản hồi:** `200 OK`.
 
-### `ChangeStateRequest`
+---
 
-```json
-{
-  "status": "INACTIVE",
-  "reason": "Tạm thời ngừng bán trên thực đơn"
-}
-```
-
-Các chuyển đổi trạng thái `status`:
-
-- Danh mục (Category): `ACTIVE -> INACTIVE -> ACTIVE`, hoặc `ACTIVE/INACTIVE -> ARCHIVED` chỉ khi không còn món nào chưa lưu trữ.
-- Món ăn, biến thể, nhóm modifier và tùy chọn modifier: `ACTIVE <-> INACTIVE`, sau đó chuyển sang `ARCHIVED` là trạng thái kết thúc (terminal).
-- Trạng thái `ARCHIVED` không thể kích hoạt lại hoặc chỉnh sửa.
-
-## Lược đồ Phản hồi Công khai (Public Response Schemas)
-
-Mọi phản hồi tài nguyên đều bao gồm `id`, `tenantId`, `version`, `createdAt`, `updatedAt`, và một HTTP header `ETag`. Phản hồi không làm lộ phiên bản hàng cơ sở dữ liệu nội bộ hoặc tên khóa ngoại nội bộ.
-
-### `CategoryResponse`
-
-```json
-{
-  "id": "0192b2d0-7f1c-7abc-8d2c-123456789012",
-  "tenantId": "0192b2d0-7f1d-7abc-8d2c-123456789012",
-  "name": "Cà phê",
-  "displayOrder": 10,
-  "status": "ACTIVE",
-  "itemCount": 12,
-  "version": 3,
-  "createdAt": "2026-10-12T08:00:00Z",
-  "updatedAt": "2026-10-12T08:10:00Z"
-}
-```
-
-Trường `itemCount` có phạm vi theo tenant đã xác thực và chỉ mang tính chất thông tin; nó không được dùng làm tín hiệu phân quyền.
-
-### `CatalogItemResponse`
-
-```json
-{
-  "id": "0192b2d0-7f1e-7abc-8d2c-123456789012",
-  "tenantId": "0192b2d0-7f1d-7abc-8d2c-123456789012",
-  "sku": "CF-SUA",
-  "name": "Cà phê sữa",
-  "description": null,
-  "category": {
-    "id": "0192b2d0-7f1c-7abc-8d2c-123456789012",
-    "name": "Cà phê"
-  },
-  "status": "ACTIVE",
-  "variants": [],
-  "modifierGroups": [],
-  "catalogVersion": 18,
-  "version": 4,
-  "createdAt": "2026-10-12T08:00:00Z",
-  "updatedAt": "2026-10-12T08:10:00Z"
-}
-```
-
-Đối với `view=sellable`, phản hồi chỉ chứa các kết hợp đang hoạt động có thể bán được. Đối với `view=admin`, nó có thể chứa các phần tử con không hoạt động hoặc đã lưu trữ, được đánh dấu rõ ràng qua trạng thái. `catalogVersion` là phiên bản sửa đổi trên toàn tenant phục vụ ETag/vô hiệu hóa cache của POS.
-
-### Cấu trúc Biến thể và Modifier Lồng nhau
-
-```json
-{
-  "id": "0192b2d0-7f20-7abc-8d2c-123456789012",
-  "name": "STANDARD",
-  "price": { "amountMinor": 29000, "currency": "VND" },
-  "isDefault": true,
-  "status": "ACTIVE",
-  "displayOrder": 0,
-  "version": 2
-}
-```
-
-```json
-{
-  "id": "0192b2d0-7f21-7abc-8d2c-123456789012",
-  "name": "Topping",
-  "minSelections": 0,
-  "maxSelections": 3,
-  "displayOrder": 20,
-  "status": "ACTIVE",
-  "options": [
-    {
-      "id": "0192b2d0-7f22-7abc-8d2c-123456789012",
-      "name": "Trân châu",
-      "priceDelta": { "amountMinor": 5000, "currency": "VND" },
-      "status": "ACTIVE",
-      "displayOrder": 0,
-      "version": 1
-    }
-  ],
-  "version": 3
-}
-```
-
-Phản hồi của món ăn bao gồm `minSelections`, `maxSelections` và `displayOrder` hiệu lực lấy từ liên kết giữa món và nhóm. Phản hồi của nhóm độc lập sẽ hiển thị các giá trị mặc định của nhóm.
-
-## Hợp đồng Đọc POS và Bộ nhớ đệm (Cache Contract)
-
-Endpoint `GET /api/v1/catalog/items?view=sellable` và chi tiết món ăn trả về:
-
-- `ETag: "catalog-tenant-<tenantId>-v<catalogVersion>"` cho đồ thị P0 trên toàn tenant.
-- `Cache-Control: private, max-age=30` cho các lượt đọc trên POS; client phải xác thực lại sau khi có sự kiện biến đổi hoặc khi hết hạn.
-- `304 Not Modified` khi header `If-None-Match` khớp sau khi đã phân quyền thành công. Quá trình phân quyền luôn chạy trước khi trả về `304`.
-
-Khóa cache là `(tenantId, branchId-or-tenant, view, filters, catalogVersion)`. Branch ID vẫn được giữ trong khóa để cô lập phân quyền ngay cả khi giá/thực đơn P0 là toàn cầu.
-
-Catalog chỉ trả về một biến thể khi danh mục, món ăn, biến thể và mọi quy tắc modifier bắt buộc đều đang hoạt động và hợp lệ. Tồn kho vật lý trong Inventory không được gộp vào phản hồi của Catalog. POS có thể hiển thị chỉ báo hết hàng từ Inventory, nhưng Order mới là bên sở hữu quyết định hoàn tất đơn hàng cuối cùng.
-
-## Hợp đồng Bộ Phân giải Đơn hàng Nội bộ (Internal Order Resolver)
+## Hợp đồng API Nội bộ (Internal API Contracts)
 
 ### `POST /internal/v1/catalog/resolutions`
+Endpoint bộ phân giải Đơn hàng nội bộ (Order Resolver). Được gọi bởi Order Service trong quá trình tạo hoặc tính lại giá đơn hàng nháp (`reprice`). Endpoint này chịu trách nhiệm xác thực tính hợp lệ và định giá toàn bộ giỏ hàng dựa trên một snapshot Catalog nhất quán duy nhất.
 
-Endpoint này xác thực và định giá một tập hợp lựa chọn hoàn chỉnh của Đơn hàng dựa trên một snapshot Catalog nhất quán duy nhất. Nó được gọi bởi Order Service trong quá trình tạo/cập nhật đơn hàng; nó không tạo Đơn hàng và không thực hiện giữ chỗ trong Inventory.
-
-**Xác thực:** Workload identity/mTLS của Order và một ngữ cảnh phân quyền hợp lệ từ Identity cho quyền `catalog:resolve`.
-
-**Yêu cầu (Request):**
+- **Thẩm quyền:** Workload Identity / mTLS của Order Service với quyền `catalog:resolve`.
+- **Tiêu đề Yêu cầu (Request Headers):**
+  - `X-Correlation-Id: <uuid>` (Bắt buộc)
+  - `Content-Type: application/json; charset=utf-8` (Bắt buộc)
+- **Dữ liệu Gửi lên (Request Body):**
 
 ```json
 {
@@ -465,17 +1086,12 @@ Endpoint này xác thực và định giá một tập hợp lựa chọn hoàn 
 }
 ```
 
-| Trường | Kiểu dữ liệu | Ràng buộc |
-|---|---|---|
-| `tenantId` | UUID | Bắt buộc; phải khớp với ngữ cảnh phân quyền workload. |
-| `branchId` | UUID | Bắt buộc; phải thuộc về tenant và đang hoạt động. |
-| `requestedCatalogVersion` | int64/null | Gợi ý tùy chọn. Không phải là điều kiện tiên quyết bắt buộc; phản hồi sẽ báo cáo phiên bản thực tế được sử dụng. |
-| `lines` | array | 1–100 dòng; từ chối các client line ID bị trùng lặp. |
-| `variantId` | UUID/null | Các client mới bắt buộc phải cung cấp. Giá trị null kiểu cũ chỉ phân giải được nếu có chính xác một biến thể đang hoạt động. |
-| `modifierOptionIds` | UUID array | Mỗi tùy chọn xuất hiện tối đa một lần; toàn bộ tùy chọn phải thuộc các nhóm được gắn vào món. |
-| `quantity` | int32 | 1–999; dùng cho việc xác thực yêu cầu, không dùng cho việc giữ chỗ tồn kho trong Catalog. |
+*Quy cách kiểm tra:*
+- `lines`: Từ 1 đến 100 dòng món; từ chối nếu có `clientLineId` bị trùng.
+- `variantId`: Bắt buộc cung cấp. Giá trị null kiểu cũ chỉ phân giải được khi món có duy nhất một biến thể active.
+- `quantity`: Số nguyên từ 1 đến 999 (chỉ dùng cho tính toán giá, Catalog không kiểm tra hay giữ chỗ tồn kho).
 
-**Phản hồi thành công:**
+- **Phản hồi Thành công (`200 OK` - Giỏ hàng Hợp lệ `valid: true`):**
 
 ```json
 {
@@ -494,7 +1110,7 @@ Endpoint này xác thực và định giá một tập hợp lựa chọn hoàn 
         "selectedModifiers": [
           {
             "optionId": "0192b2d0-7f22-7abc-8d2c-123456789012",
-            "optionName": "Trân châu",
+            "optionName": "Trân châu đen",
             "priceDelta": { "amountMinor": 5000, "currency": "VND" }
           }
         ],
@@ -514,7 +1130,8 @@ Endpoint này xác thực và định giá một tập hợp lựa chọn hoàn 
 }
 ```
 
-**Từ chối về mặt nghiệp vụ (Business rejection):** Trả về HTTP 200 với `data.valid=false` khi yêu cầu được xử lý thành công nhưng một lựa chọn hiện không thể bán được. Điều này giúp tránh việc xem việc từ chối thực đơn thông thường như một lỗi tầng truyền tải (transport failure).
+- **Phản hồi Từ chối Nghiệp vụ (`200 OK` - Giỏ hàng Không Hợp lệ `valid: false`):**
+Khi yêu cầu được xử lý thành công nhưng có món/biến thể đã ngừng bán hoặc vi phạm quy tắc modifier, hệ thống vẫn trả về HTTP 200 kèm `data.valid: false` và danh sách chi tiết các lý do từ chối:
 
 ```json
 {
@@ -538,22 +1155,251 @@ Endpoint này xác thực và định giá một tập hợp lựa chọn hoàn 
 }
 ```
 
-Các mã lý do từ chối cho phép bao gồm: `item_not_found`, `item_inactive`, `variant_required`, `variant_ambiguous`, `variant_inactive`, `modifier_group_required`, `modifier_group_too_few`, `modifier_group_too_many`, `modifier_duplicate`, `modifier_inactive`, `modifier_not_attached`, `category_inactive`, và `catalog_version_changed`.
+*Các mã lý do từ chối chuẩn:* `item_not_found`, `item_inactive`, `variant_required`, `variant_ambiguous`, `variant_inactive`, `modifier_group_required`, `modifier_group_too_few`, `modifier_group_too_many`, `modifier_duplicate`, `modifier_inactive`, `modifier_not_attached`, `category_inactive`, `catalog_version_changed`.
 
-Các lỗi kết nối/dependency là `401`, `403`, `422`, `503`. Order tuyệt đối không được lưu bất kỳ dòng nào từ phản hồi có `valid=false` và chỉ được chụp lại (snapshot) tên/giá/ID/phiên bản sau khi nhận được phản hồi hợp lệ (`valid=true`).
+- **Mã lỗi tầng hạ tầng:** `401 Unauthorized`, `403 Forbidden` (sai workload identity), `422 Unprocessable Entity`, `503 Service Unavailable`.
 
-## Tính Bất biến (Idempotency) và Tương tranh Lạc quan
+---
 
-- Các bản ghi idempotency có phạm vi `(tenantId, actorOrWorkloadId, operation, idempotencyKey)` và lưu trữ hash của yêu cầu cùng tham chiếu trạng thái/body gốc.
-- Gửi lại cùng một khóa và hash chuẩn hóa sẽ phát lại kết quả ban đầu mà không tạo thêm một biến đổi hay sự kiện outbox thứ hai. Một khóa mới sẽ tạo ra một biến đổi mới.
-- Tái sử dụng một khóa với một nội dung yêu cầu khác sẽ trả về lỗi `409 duplicate_request`.
-- Header `If-Match` so sánh phiên bản tài nguyên cho các biến đổi món/danh mục/nhóm/biến thể. Nếu không khớp sẽ trả về `409 catalog_version_conflict` và đính kèm phiên bản/ETag hiện tại trong metadata an toàn khi khả dụng.
-- Một biến đổi thành công sẽ tăng phiên bản tài nguyên và `catalogVersion` của tenant trong cùng một giao dịch cơ sở dữ liệu.
-- Một giao dịch thay đổi nhiều tài nguyên liên quan sẽ phát ra một sự kiện nhất quán duy nhất sau khi commit với phiên bản catalog cuối cùng của tenant. Không một consumer nào phải nhìn thấy trạng thái trung gian không hợp lệ.
+## Cấu trúc Schema Dùng lại (Reusable Schemas)
 
-## Hợp đồng Sự kiện (Event Contracts)
+### 1. `CategoryResponse`
 
-### Cấu trúc Bao bọc Chung (Common Envelope)
+| Tên trường | Kiểu dữ liệu | Bắt buộc | Mô tả ý nghĩa |
+|---|---|:---:|---|
+| `id` | UUID string | Có | Mã định danh danh mục UUID v7. |
+| `tenantId` | UUID string | Có | Tenant sở hữu danh mục. |
+| `name` | string | Có | Tên hiển thị của danh mục (1–120 ký tự). |
+| `displayOrder` | integer | Có | Thứ tự hiển thị số nguyên không âm. |
+| `status` | enum | Có | `ACTIVE`, `INACTIVE`, `ARCHIVED`. |
+| `itemCount` | integer | Có | Số lượng món thuộc danh mục (mang tính thông tin). |
+| `version` | integer | Có | Phiên bản dùng cho kiểm tra `If-Match`. |
+| `createdAt` / `updatedAt` | ISO-8601 UTC | Có | Mốc thời gian tạo và cập nhật UTC. |
+
+### 2. `CatalogItemResponse`
+
+| Tên trường | Kiểu dữ liệu | Bắt buộc | Mô tả ý nghĩa |
+|---|---|:---:|---|
+| `id` | UUID string | Có | Mã định danh món ăn UUID v7. |
+| `tenantId` | UUID string | Có | Tenant sở hữu món ăn. |
+| `sku` | string | Có | Mã SKU duy nhất trong tenant (1–64 ký tự). |
+| `name` | string | Có | Tên món ăn hiển thị (1–200 ký tự). |
+| `description` | string \| null | Không | Mô tả món ăn (tối đa 2.000 ký tự). |
+| `category` | object | Có | Chứa `id` và `name` của danh mục sở hữu. |
+| `status` | enum | Có | `ACTIVE`, `INACTIVE`, `ARCHIVED`. |
+| `variants` | array | Có | Danh sách các biến thể của món. |
+| `modifierGroups` | array | Có | Danh sách các nhóm modifier được gắn vào món. |
+| `catalogVersion` | integer | Có | Phiên bản sửa đổi toàn tenant phục vụ ETag cache. |
+| `version` | integer | Có | Phiên bản dùng cho kiểm tra `If-Match`. |
+| `createdAt` / `updatedAt` | ISO-8601 UTC | Có | Dấu vết thời gian kiểm toán. |
+
+### 3. `VariantResponse`
+
+| Tên trường | Kiểu dữ liệu | Bắt buộc | Mô tả ý nghĩa |
+|---|---|:---:|---|
+| `id` | UUID string | Có | Mã định danh biến thể UUID v7. |
+| `name` | string | Có | Tên biến thể (ví dụ: `SIZE_M`, `STANDARD`). |
+| `price` | Money object | Có | Đối tượng `{ "amountMinor": 35000, "currency": "VND" }`. |
+| `isDefault` | boolean | Có | Có phải là biến thể mặc định của món hay không. |
+| `status` | enum | Có | `ACTIVE`, `INACTIVE`, `ARCHIVED`. |
+| `displayOrder` | integer | Có | Thứ tự hiển thị. |
+| `version` | integer | Có | Phiên bản khóa lạc quan. |
+
+### 4. `ModifierGroupResponse`
+
+| Tên trường | Kiểu dữ liệu | Bắt buộc | Mô tả ý nghĩa |
+|---|---|:---:|---|
+| `id` | UUID string | Có | Mã định danh nhóm modifier. |
+| `name` | string | Có | Tên nhóm (ví dụ: `Topping`, `Mức đường`). |
+| `minSelections` | integer | Có | Số lựa chọn tối thiểu (`0` là tùy chọn, `>= 1` là bắt buộc). |
+| `maxSelections` | integer | Có | Số lựa chọn tối đa cho phép. |
+| `displayOrder` | integer | Có | Thứ tự hiển thị. |
+| `status` | enum | Có | `ACTIVE`, `INACTIVE`, `ARCHIVED`. |
+| `options` | array | Có | Danh sách các tùy chọn modifier trong nhóm. |
+| `version` | integer | Có | Phiên bản khóa lạc quan. |
+
+### 5. `ModifierOptionResponse`
+
+| Tên trường | Kiểu dữ liệu | Bắt buộc | Mô tả ý nghĩa |
+|---|---|:---:|---|
+| `id` | UUID string | Có | Mã định danh tùy chọn modifier. |
+| `name` | string | Có | Tên tùy chọn (ví dụ: `Trân châu đen`, `50% Đường`). |
+| `priceDelta` | Money object | Có | Mức giá phụ thu cộng thêm (VND). |
+| `status` | enum | Có | `ACTIVE`, `INACTIVE`, `ARCHIVED`. |
+| `displayOrder` | integer | Có | Thứ tự hiển thị trong nhóm. |
+| `version` | integer | Có | Phiên bản khóa lạc quan. |
+
+---
+
+## Cấu trúc Cơ sở Dữ liệu (Database Schema)
+
+Cơ sở dữ liệu Catalog sử dụng PostgreSQL 16+ / Aurora PostgreSQL. Mọi bảng đều chứa `tenant_id` phục vụ kiểm soát đa tenant tuyệt đối; không có khóa ngoại vật lý chéo sang database của service khác.
+
+### 1. Bảng `categories` (Danh mục thực đơn)
+
+| Cột | Kiểu | Null | Ràng buộc | Chú thích cột |
+|---|---|:---:|---|---|
+| `id` | uuid | Không | PK | Mã định danh danh mục UUID v7. |
+| `tenant_id` | uuid | Không | — | Ngữ cảnh tenant sở hữu. |
+| `name` | text | Không | `CHECK length(name) BETWEEN 1 AND 120` | Tên danh mục hiển thị. |
+| `normalized_name` | text | Không | Duy nhất theo tenant | Tên chuẩn hóa chữ thường phục vụ index duy nhất. |
+| `display_order` | integer | Không | Mặc định 0, `>= 0` | Thứ tự hiển thị. |
+| `status` | text | Không | `ACTIVE/INACTIVE/ARCHIVED` | Trạng thái vòng đời danh mục. |
+| `version` | bigint | Không | Mặc định 1 | Phiên bản khóa lạc quan `If-Match`. |
+| `created_at` / `updated_at` | timestamptz | Không | Mặc định `now()` | Thời điểm tạo và cập nhật UTC. |
+
+### 2. Bảng `catalog_items` (Món ăn)
+
+| Cột | Kiểu | Null | Ràng buộc | Chú thích cột |
+|---|---|:---:|---|---|
+| `id` | uuid | Không | PK | Mã định danh món ăn UUID v7. |
+| `tenant_id` | uuid | Không | — | Ngữ cảnh tenant sở hữu. |
+| `category_id` | uuid | Không | FK `categories(id)` | Thuộc danh mục nào. |
+| `sku` | text | Không | 1–64 ký tự | Mã SKU gốc do người dùng đặt. |
+| `normalized_sku` | text | Không | Duy nhất theo tenant | SKU chuẩn hóa chữ hoa phục vụ kiểm tra trùng lặp. |
+| `name` | text | Không | `CHECK length(name) BETWEEN 1 AND 200` | Tên hiển thị món ăn. |
+| `description` | text | Có | Tối đa 2.000 ký tự | Mô tả chi tiết món ăn. |
+| `display_order` | integer | Không | Mặc định 0 | Thứ tự hiển thị. |
+| `status` | text | Không | `ACTIVE/INACTIVE/ARCHIVED` | Trạng thái món ăn. |
+| `default_variant_id` | uuid | Có | FK `catalog_variants(id)` | Biến thể mặc định của món. |
+| `version` | bigint | Không | Mặc định 1 | Phiên bản khóa lạc quan `If-Match`. |
+| `created_at` / `updated_at` | timestamptz | Không | Mặc định `now()` | Dấu vết thời gian kiểm toán. |
+
+### 3. Bảng `catalog_variants` (Biến thể kích cỡ / Giá)
+
+| Cột | Kiểu | Null | Ràng buộc | Chú thích cột |
+|---|---|:---:|---|---|
+| `id` | uuid | Không | PK | Mã định danh biến thể UUID v7. |
+| `tenant_id` | uuid | Không | — | Tenant sở hữu. |
+| `item_id` | uuid | Không | FK `catalog_items(id)` | Thuộc món ăn nào. |
+| `name` | text | Không | 1–100 ký tự | Tên biến thể (ví dụ: `SIZE_M`, `SIZE_L`). |
+| `price_minor` | bigint | Không | `CHECK price_minor >= 0` | Giá cơ sở nguyên VND. |
+| `currency` | text | Không | Mặc định `'VND'` | Đơn vị tiền tệ. |
+| `is_default` | boolean | Không | Mặc định `false` | Có phải biến thể mặc định không. |
+| `display_order` | integer | Không | Mặc định 0 | Thứ tự hiển thị. |
+| `status` | text | Không | `ACTIVE/INACTIVE/ARCHIVED` | Trạng thái biến thể. |
+| `version` | bigint | Không | Mặc định 1 | Phiên bản khóa lạc quan. |
+| `created_at` / `updated_at` | timestamptz | Không | Mặc định `now()` | Dấu vết thời gian. |
+
+### 4. Bảng `modifier_groups` (Nhóm Modifier)
+
+| Cột | Kiểu | Null | Ràng buộc | Chú thích cột |
+|---|---|:---:|---|---|
+| `id` | uuid | Không | PK | Mã định danh nhóm modifier. |
+| `tenant_id` | uuid | Không | — | Tenant sở hữu. |
+| `name` | text | Không | 1–120 ký tự | Tên nhóm modifier. |
+| `normalized_name` | text | Không | Duy nhất theo tenant | Tên chuẩn hóa chữ thường. |
+| `min_selections` | integer | Không | `>= 0` | Số lựa chọn tối thiểu mặc định. |
+| `max_selections` | integer | Không | `>= min_selections` | Số lựa chọn tối đa mặc định. |
+| `display_order` | integer | Không | Mặc định 0 | Thứ tự hiển thị. |
+| `status` | text | Không | `ACTIVE/INACTIVE/ARCHIVED` | Trạng thái nhóm modifier. |
+| `version` | bigint | Không | Mặc định 1 | Phiên bản khóa lạc quan. |
+| `created_at` / `updated_at` | timestamptz | Không | Mặc định `now()` | Dấu vết thời gian. |
+
+### 5. Bảng `modifiers` (Tùy chọn Modifier)
+
+| Cột | Kiểu | Null | Ràng buộc | Chú thích cột |
+|---|---|:---:|---|---|
+| `id` | uuid | Không | PK | Mã định danh tùy chọn modifier. |
+| `tenant_id` | uuid | Không | — | Tenant sở hữu. |
+| `group_id` | uuid | Không | FK `modifier_groups(id)` | Thuộc nhóm modifier nào. |
+| `name` | text | Không | 1–120 ký tự | Tên tùy chọn modifier. |
+| `price_delta_minor` | bigint | Không | Mặc định 0, `>= 0` | Mức giá phụ thu cộng thêm (VND). |
+| `currency` | text | Không | Mặc định `'VND'` | Đơn vị tiền tệ. |
+| `display_order` | integer | Không | Mặc định 0 | Thứ tự hiển thị trong nhóm. |
+| `status` | text | Không | `ACTIVE/INACTIVE/ARCHIVED` | Trạng thái tùy chọn. |
+| `version` | bigint | Không | Mặc định 1 | Phiên bản khóa lạc quan. |
+| `created_at` / `updated_at` | timestamptz | Không | Mặc định `now()` | Dấu vết thời gian. |
+
+### 6. Bảng `item_modifier_groups` (Liên kết Món ăn - Nhóm Modifier)
+
+| Cột | Kiểu | Null | Ràng buộc | Chú thích cột |
+|---|---|:---:|---|---|
+| `item_id` | uuid | Không | FK `catalog_items(id)` | Khóa chính phức hợp. |
+| `group_id` | uuid | Không | FK `modifier_groups(id)` | Khóa chính phức hợp. |
+| `tenant_id` | uuid | Không | — | Đảm bảo cùng tenant. |
+| `override_min` | integer | Có | `>= 0` | Giá trị min ghi đè cho món. |
+| `override_max` | integer | Có | `>= override_min` | Giá trị max ghi đè cho món. |
+| `display_order` | integer | Không | Mặc định 0 | Thứ tự hiển thị của nhóm trong món. |
+
+### 7. Bảng `tenant_catalog_revisions` (Đếm phiên bản sửa đổi Catalog)
+
+| Cột | Kiểu | Null | Ràng buộc | Chú thích cột |
+|---|---|:---:|---|---|
+| `tenant_id` | uuid | Không | PK | Mỗi tenant có chính xác một bản ghi. |
+| `revision` | bigint | Không | Mặc định 1, tăng đơn điệu | Bộ đếm revision toàn tenant cho ETag và outbox. |
+| `updated_at` | timestamptz | Không | Mặc định `now()` | Thời điểm sửa đổi gần nhất. |
+
+### 8. Bảng `outbox_messages` (Transactional Outbox)
+
+| Cột | Kiểu | Null | Ràng buộc | Chú thích cột |
+|---|---|:---:|---|---|
+| `id` | uuid | Không | PK | Mã sự kiện UUID v7 để khử trùng lặp. |
+| `tenant_id` | uuid | Không | — | Ngữ cảnh tenant. |
+| `branch_id` | uuid | Có | — | Null ở P0; có giá trị ở P1 branch price. |
+| `event_type` | text | Không | — | Tên sự kiện (ví dụ: `catalog.item.changed`). |
+| `event_version` | integer | Không | Mặc định 1 | Phiên bản cấu trúc sự kiện. |
+| `catalog_revision` | bigint | Không | — | Phiên bản catalog tại thời điểm phát sinh sự kiện. |
+| `aggregate_type` | text | Không | — | `CATALOG_ITEM`, `CATEGORY`, v.v. |
+| `aggregate_id` | uuid | Không | — | Định danh đối tượng phát sinh sự kiện. |
+| `payload` | jsonb | Không | — | Dữ liệu sự kiện an toàn (không chứa secret). |
+| `correlation_id` | text | Không | — | Mã truy vết luồng. |
+| `publish_status` | text | Không | `PENDING/PUBLISHED/FAILED` | Trạng thái gửi lên broker. |
+| `attempt_count` | integer | Không | Mặc định 0 | Số lần đã thử publish. |
+| `next_attempt_at` | timestamptz | Có | — | Thời gian thử lại tiếp theo. |
+| `created_at` | timestamptz | Không | Mặc định `now()` | Thời điểm tạo sự kiện. |
+
+### 9. Bảng `idempotency_records` (Kiểm soát tính lũy kế)
+
+| Cột | Kiểu | Null | Ràng buộc | Chú thích cột |
+|---|---|:---:|---|---|
+| `id` | uuid | Không | PK | Mã bản ghi idempotency. |
+| `tenant_id` | uuid | Không | — | Ngữ cảnh tenant. |
+| `actor_subject` | text | Không | — | Định danh người gọi. |
+| `operation` | text | Không | — | Tên thao tác (ví dụ: `create_item`). |
+| `idempotency_key` | text | Không | — | Khóa client gửi lên. |
+| `request_hash` | text | Không | SHA-256 | Mã băm toàn bộ payload request. |
+| `response_status` | integer | Không | — | HTTP status code gốc. |
+| `response_metadata` | jsonb | Không | — | Nội dung phản hồi an toàn để replay. |
+| `expires_at` | timestamptz | Không | — | Thời hạn lưu trữ trước khi dọn dẹp. |
+| `created_at` | timestamptz | Không | Mặc định `now()` | Thời điểm tạo bản ghi. |
+
+---
+
+## Danh mục Chỉ mục Cơ sở Dữ liệu (Database Indexes)
+
+| Tên bảng | Tên chỉ mục / ràng buộc | Các cột (Columns) | Loại chỉ mục | Mục đích tối ưu hóa |
+|---|---|---|---|---|
+| `categories` | `uq_categories_tenant_name` | `(tenant_id, normalized_name)` | Unique B-tree | Tên danh mục duy nhất trong tenant. |
+| `categories` | `idx_categories_tenant_status` | `(tenant_id, status, display_order)` | B-tree | Tối ưu hóa truy vấn menu và bảng quản trị. |
+| `catalog_items` | `uq_catalog_items_tenant_sku` | `(tenant_id, normalized_sku)` | Unique B-tree | Mã SKU duy nhất trong tenant. |
+| `catalog_items` | `idx_catalog_items_pos_read` | `(tenant_id, status, category_id, display_order, id)` | B-tree | Tối ưu hóa API đọc menu POS `view=sellable`. |
+| `catalog_variants` | `idx_catalog_variants_item` | `(tenant_id, item_id, status, display_order, id)` | B-tree | Tối ưu hóa nạp các biến thể active của món. |
+| `modifier_groups` | `uq_modifier_groups_tenant_name` | `(tenant_id, normalized_name)` | Unique B-tree | Tên nhóm modifier duy nhất trong tenant. |
+| `modifiers` | `idx_modifiers_group` | `(tenant_id, group_id, status, display_order, id)` | B-tree | Nạp nhanh các tùy chọn trong nhóm modifier. |
+| `item_modifier_groups` | `idx_item_mod_groups_item` | `(tenant_id, item_id, display_order, group_id)` | B-tree | Nạp các nhóm modifier được gắn vào món ăn. |
+| `outbox_messages` | `idx_outbox_catalog_queue` | `(publish_status, next_attempt_at, created_at)` | B-tree | Tiến trình Outbox Publisher thăm dò sự kiện cần gửi. |
+| `idempotency_records` | `uq_idempotency_catalog_actor` | `(tenant_id, operation, actor_subject, idempotency_key)` | Unique B-tree | Phát hiện trùng lặp khóa và request hash. |
+
+---
+
+## Kế hoạch Thực thi Cơ sở Dữ liệu với Flyway
+
+| Thứ tự | Tên File Script Migration | Nội dung chính | Lưu ý Rollback / Phục hồi |
+|:---:|---|---|---|
+| 1 | `V1__create_catalog_extensions.sql` | Cấu hình extension UUID và các hàm tiện ích. | Forward-only. |
+| 2 | `V2__create_categories_and_items.sql` | Tạo bảng `categories`, `catalog_items`, `catalog_variants`, ràng buộc SKU và FK. | Khôi phục từ bản backup; không thực hiện DROP phá hủy. |
+| 3 | `V3__create_modifiers_and_links.sql` | Tạo bảng `modifier_groups`, `modifiers`, `item_modifier_groups` và các check constraint. | Điền dữ liệu trước khi bật ràng buộc trong DB có sẵn dữ liệu. |
+| 4 | `V4__create_catalog_revisions.sql` | Tạo bảng `tenant_catalog_revisions` và hàm tiện ích tăng revision đơn điệu. | Bảo toàn số revision hiện tại. |
+| 5 | `V5__create_idempotency_outbox.sql` | Tạo bảng `idempotency_records` và `outbox_messages`. | Giữ lại các sự kiện để replay; không xóa bản ghi chưa publish. |
+| 6 | `V6__create_p1_combos_branch_prices_tags.sql` | Tạo các bảng `combos`, `branch_variant_prices`, `tags` (bảo vệ sau cờ tính năng P1). | Triển khai schema trước khi bật feature flag; tắt cờ trước khi rollback. |
+| 7 | `V7__seed_local_demo_catalog.sql` | Nạp dữ liệu menu mẫu (Cà phê, Trà sữa, Topping) cho môi trường local demo. | Chỉ chạy trên môi trường local demo; tuyệt đối không chạy trên production. |
+
+---
+
+## Hợp đồng Sự kiện Tích hợp (Integration Event Contracts)
+
+### Cấu trúc Bao bì Sự kiện Chuẩn (Event Envelope)
 
 ```json
 {
@@ -569,110 +1415,53 @@ Các lỗi kết nối/dependency là `401`, `403`, `422`, `503`. Order tuyệt 
   "aggregateId": "0192b2d0-7f1e-7abc-8d2c-123456789012",
   "catalogVersion": 18,
   "correlationId": "cor_01J...",
-  "payload": {}
+  "payload": {
+    "changeType": "UPDATED",
+    "itemId": "0192b2d0-7f1e-7abc-8d2c-123456789012",
+    "categoryId": "0192b2d0-7f1c-7abc-8d2c-123456789012",
+    "sku": "CF-SUA",
+    "status": "ACTIVE",
+    "version": 4,
+    "sellable": true,
+    "changedFields": ["name", "description"]
+  }
 }
 ```
 
-Trường `branchId` có thể mang giá trị null đối với các sự kiện toàn tenant ở P0. Các sự kiện giá chi nhánh ở P1 sẽ đặt giá trị này là chi nhánh đang hoạt động bị ảnh hưởng. Đây là một sửa đổi tường minh của Catalog đối với trường sự kiện của hệ thống cha (vốn mặc định mọi sự kiện đều có branchId không null).
+*Lưu ý về `branchId`:* Trường `branchId` mang giá trị `null` đối với toàn bộ các sự kiện P0 toàn chuỗi (`scope: "TENANT"`). Các sự kiện giá chi nhánh ở P1 sẽ đặt giá trị này là chi nhánh bị ảnh hưởng.
 
-### Các Kiểu Sự kiện (Event Types)
+### Danh mục Sự kiện Domain (Event Registry)
 
-| Kiểu sự kiện | P0/P1 | Mục đích payload | Consumers |
-|---|---|---|---|
-| `catalog.category.changed` | P0 | Tên/thứ tự/trạng thái danh mục và phiên bản catalog. | POS cache, Reporting, Audit. |
-| `catalog.item.changed` | P0 | Định danh món, danh mục, trạng thái, SKU, tóm tắt mô tả và phiên bản. | POS cache, Order cache, Reporting, Recommendation. |
-| `catalog.variant.changed` | P0 | Định danh biến thể, ID món, trạng thái/mặc định, giá và phiên bản. | POS cache, Order cache, Reporting, bảng chiếu tham chiếu Inventory. |
-| `catalog.modifier-group.changed` | P0 | Nhóm, tùy chọn, tóm tắt liên kết/quy tắc và phiên bản. | POS cache, Recommendation, Reporting. |
-| `catalog.combo.changed` | P1 | Cấu thành combo/trạng thái/giá cố định. | POS cache, Recommendation, Reporting. |
-| `catalog.branch-price.changed` | P1 | Ghi đè chi nhánh được đặt/xóa và giá hiệu lực. | POS cache, Order cache, Reporting. |
-| `catalog.item-metadata.changed` | P1 | Mô tả/tag cho khởi động nguội AI. | Bảng chiếu Recommendation/AI, Reporting. |
+| Kiểu sự kiện | Giai đoạn | Mục đích của Payload | Các bên tiêu thụ (Consumers) |
+|---|:---:|---|---|
+| `catalog.category.changed` | P0 | Tên, thứ tự hiển thị, trạng thái danh mục và `catalogVersion`. | POS Cache, Reporting, Audit. |
+| `catalog.item.changed` | P0 | Định danh món, danh mục, trạng thái, SKU, khả năng bán và `catalogVersion`. | POS Cache, Order Cache, Reporting, Recommendation. |
+| `catalog.variant.changed` | P0 | Định danh biến thể, ID món, giá cơ sở, trạng thái mặc định và version. | POS Cache, Order Cache, Reporting, Inventory reference. |
+| `catalog.modifier-group.changed` | P0 | Nhóm, danh sách tùy chọn, liên kết món và quy tắc lựa chọn. | POS Cache, Recommendation, Reporting. |
+| `catalog.combo.changed` | P1 | Cấu thành combo, thành phần món, giá cố định và trạng thái. | POS Cache, Recommendation, Reporting. |
+| `catalog.branch-price.changed` | P1 | Ghi đè giá biến thể theo chi nhánh được thiết lập hoặc xóa bỏ. | POS Cache, Order Cache, Reporting. |
+| `catalog.item-metadata.changed` | P1 | Mô tả mở rộng, danh sách tag phục vụ thuật toán AI / gợi ý món. | Recommendation / AI Engine, Reporting. |
 
-Các sự kiện được xuất bản thông qua transactional outbox. Payload chứa các ID ổn định và trạng thái, không chứa bí mật, JWT claims, raw request body hoặc PII nhân viên không cần thiết. Consumer phải sử dụng `eventId` để khử trùng lặp và `catalogVersion` để phát hiện bảng chiếu bị lỗi thời (stale).
+---
 
-### Payload `catalog.item.changed`
+## Ma trận Kiểm thử Hợp đồng (Contract Test Requirements)
 
-```json
-{
-  "changeType": "UPDATED",
-  "itemId": "0192b2d0-7f1e-7abc-8d2c-123456789012",
-  "categoryId": "0192b2d0-7f1c-7abc-8d2c-123456789012",
-  "sku": "CF-SUA",
-  "status": "ACTIVE",
-  "version": 4,
-  "sellable": true,
-  "changedFields": ["name", "description"]
-}
-```
-
-Các sự kiện tiến hóa theo phương thức bổ sung (additive) trong cùng một `eventVersion`. Việc xóa/đổi tên trường hoặc thay đổi ngữ nghĩa yêu cầu phải nâng version sự kiện mới và hỗ trợ song song consumer trong quá trình migration.
-
-## Các Bổ sung Lược đồ P1
-
-### Combo
-
-`ComboResponse` chứa `id`, `name`, `description`, `status`, `fixedPrice`, `components`, `version` và `catalogVersion`. Một thành phần chứa một item ID, variant ID bắt buộc và một tập hợp modifier option ID. API từ chối combo con lồng nhau, thiếu thành phần bắt buộc, thành phần không hoạt động hoặc giá cố định âm. Order chụp lại cấu trúc combo đã phân giải; không bao giờ phụ thuộc vào một lần đọc Catalog sau đó để tái tạo một đơn hàng lịch sử.
-
-### Ghi đè Giá Chi nhánh (Branch Price Override)
-
-```json
-{
-  "branchId": "0192b2d0-7f23-7abc-8d2c-123456789012",
-  "variantId": "0192b2d0-7f20-7abc-8d2c-123456789012",
-  "price": { "amountMinor": 31000, "currency": "VND" }
-}
-```
-
-Có tối đa một bản ghi đè hiện tại cho bộ ba `(tenantId, branchId, variantId)`. Việc xóa bản ghi đè sẽ đưa phân giải giá quay về giá biến thể mặc định của tenant. Các client P0 bỏ qua phần mở rộng này và luôn dùng giá của tenant.
-
-### Tag và Metadata
-
-Tag slug là các giá trị chữ thường đã chuẩn hóa duy nhất trong tenant; tên hiển thị phục vụ người dùng. Endpoint `PUT /items/{itemId}/tags` thay thế tập hợp tag một cách nguyên tử. Các sự kiện metadata có phiên bản và có thể được tiêu thụ bất đồng bộ bởi bảng chiếu khởi động nguội AI.
-
-## Tính Tương thích Hợp đồng và Các Sửa đổi Bổ sung
-
-| Hợp đồng hiện có | Quyết định của Catalog | Hành động tiếp theo bắt buộc |
-|---|---|---|
-| Quyền ghi khả dụng của Thu ngân (Cashier) ở hợp đồng cha | Thu ngân là quyền chỉ đọc (read-only) đối với Catalog. | Sửa đổi ma trận phân quyền Catalog của hợp đồng cha trước khi triển khai. |
-| Cột `catalog_items.category` dạng chuỗi văn bản ở hệ thống cha | Danh mục là một thực thể tenant được tham chiếu qua `categoryId`. | Cập nhật định dạng lược đồ/DTO của hợp đồng cha. |
-| Mối quan hệ phẳng `item_modifiers` ở hệ thống cha | Nhóm modifier tái sử dụng cộng với quy tắc liên kết item-group. | Thay thế bằng hợp đồng group/options/link. |
-| Trường `OrderLineInput.variantId` có thể null ở hệ thống cha | Các client mới bắt buộc gửi biến thể cụ thể; null kiểu cũ chỉ phân giải khi có đúng một biến thể active. | Bổ sung hành vi của resolver vào các bài kiểm thử hợp đồng Order. |
-| Header `branchId` bắt buộc trong sự kiện của hệ thống cha | Các sự kiện P0 của Catalog có phạm vi toàn tenant và dùng `branchId: null`, `scope: TENANT`. | Cập nhật envelope của hệ thống cha cho phép branchId nullable kèm phạm vi tường minh. |
-| Khả năng sẵn sàng của Inventory và Catalog | Bật/tắt thực đơn của Catalog là độc lập với tồn kho vật lý. | Order gọi sang Inventory cho quyết định tồn kho/hoàn tất đơn. |
-
-Tuyệt đối không có endpoint nào của Catalog cấp quyền quản trị chi nhánh, quản lý nhân viên, biến đổi Order, biến đổi Inventory hay chuyển đổi tenant.
-
-## Ma trận Kiểm thử Hợp đồng (Contract Test Matrix)
-
-1. OpenAPI xác thực mọi yêu cầu, phản hồi, cấu trúc phân trang, ETag và cấu trúc bao bọc lỗi chuẩn.
-2. Owner và Manager đang active có thể biến đổi Catalog toàn tenant; Cashier/Kitchen nhận mã `403` cho mọi đường dẫn biến đổi, bao gồm cả bí danh availability kiểu cũ.
-3. Manager từ tenant A không thể đọc hoặc biến đổi tenant B bằng cách sử dụng ID, header hoặc tham chiếu body; các tài nguyên chéo tenant trả về `404` hoặc `403` theo chính sách dùng chung mà không làm lộ sự tồn tại.
-4. Thiếu hoặc bị thu hồi tư cách thành viên, hoặc quyết định từ Identity không khả dụng sẽ dẫn đến từ chối truy cập (fail closed).
-5. Header `If-Match` lỗi thời trả về `409 catalog_version_conflict`; các cập nhật hợp lệ đồng thời không bao giờ để lộ một món đang active nhưng cấu hình dang dở.
-6. Cùng một idempotency key và request sẽ phát lại kết quả mà không tạo trạng thái hoặc sự kiện trùng lặp; cùng key nhưng khác request trả về `409 duplicate_request`.
-7. Các endpoint item/variant/state thực thi các bất biến về biến thể mặc định/biến thể active cuối cùng và tính kết thúc của trạng thái lưu trữ.
-8. Thao tác gắn/cập nhật modifier xác thực min/max hiệu lực, lựa chọn trùng lặp, các tùy chọn không hoạt động và tính khả thi của nhóm bắt buộc.
-9. Yêu cầu `GET` đọc có thể bán được trả về header ETag; mã `304` được phép trả về khi đã xác thực hợp lệ, trong khi `304` chưa xác thực tuyệt đối không được trả về.
-10. Bộ phân giải chấp nhận các lựa chọn hợp lệ, từ chối `variantId=null` kiểu cũ nếu mơ hồ, trả về giá/tên/phiên bản nhất quán, và không bao giờ gọi sang Inventory.
-11. Từ chối nghiệp vụ của bộ phân giải sử dụng cấu trúc có định kiểu `valid=false`; lỗi kết nối/dependency sử dụng các mã lỗi HTTP đã tài liệu hóa.
-12. Payload sự kiện xác thực `branchId` có thể null ở P0, ID ổn định, phiên bản catalog và tính tiến hóa bổ sung; gửi lặp lại là an toàn.
-13. Các bài kiểm thử P1 bao phủ việc lồng combo, cơ chế rơi về giá tenant/cô lập giá chi nhánh và slug tag duy nhất theo tenant mà không ảnh hưởng tới client P0.
-
-## Các Sản phẩm Bàn giao Triển khai Bắt buộc Trước khi Viết Code
-
-- File `openapi.yaml` cho các hợp đồng REST công khai và nội bộ, bao gồm các ví dụ mẫu và schema tái sử dụng.
-- File `asyncapi.yaml` kèm theo các file JSON Schema cho 7 kiểu sự kiện và cấu trúc bao bọc chung.
-- Dữ liệu mẫu kiểm thử hợp đồng (fixtures) cho toàn bộ các mã lỗi chuẩn/đặc thù của Catalog và các trường hợp kiểm thử phủ định chéo tenant.
-- Bản ghi chú sửa đổi hợp đồng cha cho quyền availability của Cashier, cấu trúc thực thể danh mục, phạm vi sự kiện có branch nullable và phân giải biến thể Order.
-- Một client Angular được sinh tự động hoặc client có định kiểu tương đương từ tài liệu OpenAPI; các DTO viết tay lặp lại không phải là nguồn chân lý.
-
-## Các Kỹ năng Chuyên môn được Tham chiếu
-
-- **api-design:** Đặt tên tài nguyên REST, hợp đồng tiếp cận API-first qua OpenAPI, mô hình trạng thái/lỗi, phân trang, tương tranh lạc quan, lưu cache qua ETag và kiểm tra bảo mật.
-- **database-design:** Các trường ID, quyền sở hữu tenant và phiên bản được phản ánh trong các DTO công khai; lược đồ cơ sở dữ liệu vẫn do tài liệu Kiến trúc sở hữu.
-- **log-processing:** Các trường correlation/audit và yêu cầu làm sạch dữ liệu nhạy cảm trong các hợp đồng biến đổi và sự kiện.
-
-## Phê duyệt
-
-- **Trạng thái:** Đã được người dùng phê duyệt
-- **Giai đoạn:** Hợp đồng Dữ liệu & API (API & Data Contracts)
-- **Giai đoạn tiếp theo sau phê duyệt:** Hoàn thiện (Finalization)
+1. **Kiểm thử OpenAPI:** Tự động đối soát toàn bộ request, response body, pagination envelope, ETag header và error envelope với định nghĩa OpenAPI 3.1.
+2. **Kiểm thử Thẩm quyền & Phân quyền:**
+   - `OWNER` và `MANAGER` đang active có thể thực hiện mọi thao tác biến đổi Catalog trên toàn chuỗi.
+   - `CASHIER` và `KITCHEN` nhận mã HTTP `403 Forbidden` đối với mọi thao tác biến đổi (POST, PATCH, PUT, DELETE).
+3. **Kiểm thử Cô lập Đa Tenant & IDOR:** Manager từ tenant A không thể đọc hoặc sửa đổi dữ liệu của tenant B bằng cách truyền ID qua path hoặc body; tài nguyên thuộc tenant khác phải trả về `404 Not Found` (không làm lộ sự tồn tại của dữ liệu).
+4. **Kiểm thử Fail-Closed:** Khi không thể kết nối sang Identity Access để phân giải quyền, Catalog bắt buộc phải từ chối truy cập an toàn với mã `503 Service Unavailable`.
+5. **Kiểm thử Khóa Lạc quan (If-Match):** Gửi header `If-Match` lỗi thời bắt buộc phải bị từ chối với lỗi `409 catalog_version_conflict` kèm ETag hiện tại.
+6. **Kiểm thử Tính Lũy kế (Idempotency):**
+   - Gửi lại cùng một `Idempotency-Key` và cùng nội dung request body phải phát lại kết quả cũ mà không tạo thêm bản ghi hay sự kiện outbox thứ hai.
+   - Gửi cùng `Idempotency-Key` nhưng khác request body phải trả về mã `409 duplicate_request`.
+7. **Kiểm thử Bất biến Nghiệp vụ:**
+   - Không cho phép vô hiệu hóa hoặc lưu trữ biến thể nếu việc đó làm mất đi biến thể active cuối cùng của món (`last_active_variant`).
+   - Không cho phép lưu trữ danh mục khi vẫn còn món ăn chưa lưu trữ (`category_has_items`).
+   - Kiểm tra tính duy nhất của mã SKU trong cùng tenant (`sku_conflict`).
+8. **Kiểm thử Bộ phân giải Đơn hàng (Order Resolver):**
+   - Xác thực các giỏ hàng hợp lệ, trả về giá cơ sở, phụ thu modifier và `catalogVersion` nhất quán.
+   - Từ chối các lựa chọn không hợp lệ bằng phản hồi có định kiểu `valid: false` kèm mã lý do chính xác.
+   - Đảm bảo resolver không bao giờ gọi sang Inventory DB hay ghi dữ liệu vào Order DB.
+9. **Kiểm thử Bộ nhớ đệm (Cache & ETag):** Gửi `If-None-Match` khớp với ETag hiện tại trả về mã `304 Not Modified` chỉ sau khi đã xác thực và kiểm tra phân quyền thành công.

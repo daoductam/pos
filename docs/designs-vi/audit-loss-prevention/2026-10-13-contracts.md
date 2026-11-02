@@ -243,32 +243,57 @@ Mọi endpoint công khai đều yêu cầu Cognito JWT và quyền/phạm vi do
 | POST | `/api/v1/audit/exports` | `audit:operate` | `ExportOperationResponse` | Khởi tạo xuất dữ liệu lịch sử bất đồng bộ |
 | GET | `/api/v1/audit/exports/{operationId}` | `audit:operate` | `ExportOperationResponse` | Kiểm tra tiến độ tác vụ xuất dữ liệu |
 
+---
+
 ### 4.2 Danh sách sự kiện kiểm toán (Audit Events List)
 
-Các tham số query của `GET /api/v1/audit/events`:
+`GET /api/v1/audit/events`
 
-| Tham số | Kiểu | Quy tắc |
-|---|---|---|
-| `from`, `to` | ISO date/time | Bắt buộc/suy diễn; tối đa 90 ngày cho tương tác |
-| `branchIds` | UUID[] | Tối đa 20; phải là tập con của phạm vi đã phân giải |
-| `actions` | enum[] | `ORDER_LINE_CANCELLED`, `ORDER_CANCELLED`, `DISCOUNT_APPLIED`, `CASH_DRAWER_OPENED`, `AUTHORIZATION_DENIED`, `CASE_ACTION` |
-| `outcomes` | enum[] | `SUCCEEDED`, `REJECTED`, `FAILED`, `NO_OP` |
-| `actorId` | UUID | Tham chiếu nhân viên mờ; có kiểm tra phạm vi |
-| `effectiveOperatorId` | UUID | Tham chiếu thu ngân thao tác mờ; có kiểm tra phạm vi |
-| `resourceType` | enum | `ORDER`, `ORDER_LINE`, `PAYMENT`, `SHIFT`, `POS_DEVICE`, `AUDIT_CASE` |
-| `resourceId` | UUID | Bắt buộc thuộc phạm vi được cấp quyền |
-| `shiftId`, `deviceId`, `correlationId` | UUID/string | Các tham chiếu an toàn chính xác |
-| `limit` | int | Mặc định 20, tối đa 100 |
-| `cursor` | string | Chỉ dùng cursor do chính bộ lọc/phạm vi/phiên bản đó sinh ra |
+Truy vấn nhật ký sự kiện kiểm toán bảo mật với bộ lọc đa chiều và phân trang con trỏ (Cursor Pagination).
 
-Phản hồi:
+#### Tiêu đề Yêu cầu (Headers)
+```http
+Authorization: Bearer <Cognito JWT Token>
+Accept: application/json
+X-Correlation-ID: 0192b2d0-7f1d-7abc-8d2c-123456789001
+```
 
+#### Tham số Truy vấn (Query Parameters)
+| Tham số | Kiểu | Bắt buộc | Quy tắc |
+|---|---|:---:|---|
+| `from`, `to` | ISO date/time | Có | Tối đa 90 ngày cho tương tác phân tích trực tuyến |
+| `branchIds` | UUID[] | Không | Tối đa 20; phải là tập con của phạm vi đã phân giải |
+| `actions` | enum[] | Không | `ORDER_LINE_CANCELLED`, `ORDER_CANCELLED`, `DISCOUNT_APPLIED`, `CASH_DRAWER_OPENED`, `AUTHORIZATION_DENIED`, `CASE_ACTION` |
+| `outcomes` | enum[] | Không | `SUCCEEDED`, `REJECTED`, `FAILED`, `NO_OP` |
+| `actorId` | UUID | Không | Tham chiếu nhân viên mờ; có kiểm tra phạm vi |
+| `effectiveOperatorId` | UUID | Không | Tham chiếu thu ngân thao tác mờ; có kiểm tra phạm vi |
+| `resourceType` | enum | Không | `ORDER`, `ORDER_LINE`, `PAYMENT`, `SHIFT`, `POS_DEVICE`, `AUDIT_CASE` |
+| `resourceId` | UUID | Không | Bắt buộc thuộc phạm vi được cấp quyền |
+| `shiftId`, `deviceId`, `correlationId` | UUID/string | Không | Các tham chiếu an toàn chính xác |
+| `limit` | int | Không | Mặc định 20, tối đa 100 |
+| `cursor` | string | Không | Chỉ dùng cursor do chính bộ lọc/phạm vi/phiên bản đó sinh ra |
+
+#### Phản hồi Thành Công `200 OK`
 ```json
 {
   "data": {
-    "scope": {"type": "BRANCH", "branchIds": ["0192..."]},
-    "period": {"from": "2026-10-01", "to": "2026-10-13", "timezone": "Asia/Ho_Chi_Minh"},
-    "rows": [],
+    "scope": {"type": "BRANCH", "branchIds": ["0192b2d0-7f1d-7abc-8d2c-123456789002"]},
+    "period": {"from": "2026-10-01T00:00:00Z", "to": "2026-10-13T00:00:00Z", "timezone": "Asia/Ho_Chi_Minh"},
+    "rows": [
+      {
+        "id": "0192b2d0-7f1d-7abc-8d2c-123456789010",
+        "eventType": "DiscountApplied.v1",
+        "action": "DISCOUNT_APPLIED",
+        "outcome": "SUCCEEDED",
+        "actor": {"actorType": "USER", "actorId": "0192b2d0-7f1d-7abc-8d2c-123456789020", "displayLabel": "Thu ngân A", "role": "CASHIER"},
+        "effectiveOperator": {"actorId": "0192b2d0-7f1d-7abc-8d2c-123456789020", "displayLabel": "Thu ngân A", "role": "CASHIER"},
+        "resource": {"type": "ORDER_LINE", "id": "0192b2d0-7f1d-7abc-8d2c-123456789030"},
+        "reason": "Khách hàng thân thiết VIP",
+        "beforeSummary": {"discountMinor": 0, "currency": "VND"},
+        "afterSummary": {"discountMinor": 20000, "currency": "VND"},
+        "occurredAt": "2026-10-13T08:00:00Z"
+      }
+    ],
     "dataQuality": {
       "status": "FRESH",
       "freshnessLagSeconds": 15,
@@ -282,40 +307,136 @@ Phản hồi:
       "asOfWatermark": "audit:branch:v901"
     }
   },
-  "meta": {"requestId": "req_01J...", "correlationId": "cor_01J...", "nextCursor": null}
+  "meta": {
+    "limit": 20,
+    "hasMore": false,
+    "nextCursor": null,
+    "requestId": "req_0192b2d0-7f1d-7abc-8d2c-123456789001",
+    "correlationId": "cor_0192b2d0-7f1d-7abc-8d2c-123456789002",
+    "timestamp": "2026-10-13T08:00:20Z"
+  }
 }
 ```
 
-### 4.3 Danh sách và chi tiết phát hiện (Findings)
+---
 
-Endpoint `GET /api/v1/loss-prevention/findings` hỗ trợ `state`, `severity`, `ruleFamily`, `branchIds`, `subjectId`, `from`, `to`, `limit` và `cursor`. Trường `subjectId` luôn được kiểm tra phạm vi và tuyệt đối không bao giờ được dùng để làm lộ thông tin nhân viên ngoại lai.
+### 4.2.1 Chi tiết sự kiện kiểm toán (Get Audit Event Detail)
 
+`GET /api/v1/audit/events/{eventId}`
+
+Truy vấn toàn văn bằng chứng kiểm toán đã được làm sạch PII (không bao gồm payload thô chưa khử độc).
+
+#### Tiêu đề Yêu cầu (Headers)
+```http
+Authorization: Bearer <Cognito JWT Token>
+Accept: application/json
+X-Correlation-ID: 0192b2d0-7f1d-7abc-8d2c-123456789001
+```
+
+#### Phản hồi Thành Công `200 OK`
 ```json
 {
-  "findingId": "0192...",
-  "caseId": "0192...",
-  "state": "OPEN",
-  "severity": "MEDIUM",
-  "ruleFamily": "DISCOUNT_SPIKE",
-  "ruleVersion": "loss-rule-v1",
-  "subject": {"id": "0192...", "displayLabel": "Thu ngân A", "role": "CASHIER"},
-  "branchId": "0192...",
-  "observationWindow": {"from": "2026-10-12T00:00:00Z", "to": "2026-10-13T00:00:00Z", "timezone": "Asia/Ho_Chi_Minh"},
-  "metric": {"current": "0.1800", "baseline": "0.0400", "ratio": "4.5000", "unit": "discount_rate"},
-  "minimumSample": 30,
-  "sampleCount": 92,
-  "explanationCode": "ABOVE_BASELINE_AND_MIN_SAMPLE",
-  "evidenceRefs": [{"eventId": "0192...", "action": "DISCOUNT_APPLIED"}],
-  "dataQuality": {"status": "FRESH", "completenessStatus": "COMPLETE"},
-  "detectedAt": "2026-10-13T08:01:00Z",
-  "version": 2
+  "data": {
+    "id": "0192b2d0-7f1d-7abc-8d2c-123456789010",
+    "eventType": "DiscountApplied.v1",
+    "action": "DISCOUNT_APPLIED",
+    "outcome": "SUCCEEDED",
+    "tenantId": "0192b2d0-7f1d-7abc-8d2c-123456789001",
+    "branchId": "0192b2d0-7f1d-7abc-8d2c-123456789002",
+    "actor": {"actorType": "USER", "actorId": "0192b2d0-7f1d-7abc-8d2c-123456789020", "displayLabel": "Thu ngân A", "role": "CASHIER"},
+    "effectiveOperator": {"actorId": "0192b2d0-7f1d-7abc-8d2c-123456789020", "displayLabel": "Thu ngân A", "role": "CASHIER"},
+    "resource": {"type": "ORDER_LINE", "id": "0192b2d0-7f1d-7abc-8d2c-123456789030"},
+    "shiftId": "0192b2d0-7f1d-7abc-8d2c-123456789040",
+    "deviceId": "0192b2d0-7f1d-7abc-8d2c-123456789050",
+    "reason": "Khách hàng thân thiết VIP",
+    "beforeSummary": {"discountMinor": 0, "currency": "VND"},
+    "afterSummary": {"discountMinor": 20000, "currency": "VND"},
+    "occurredAt": "2026-10-13T08:00:00Z",
+    "sourceEventId": "0192b2d0-7f1d-7abc-8d2c-123456789099",
+    "sourceVersion": 18,
+    "correlationId": "0192b2d0-7f1d-7abc-8d2c-123456789001",
+    "digestVerified": true
+  },
+  "meta": {
+    "requestId": "req_0192b2d0-7f1d-7abc-8d2c-123456789001",
+    "correlationId": "cor_0192b2d0-7f1d-7abc-8d2c-123456789002",
+    "timestamp": "2026-10-13T08:00:20Z"
+  }
+}
+```
+
+---
+
+### 4.3 Danh sách và chi tiết phát hiện (Findings)
+
+`GET /api/v1/loss-prevention/findings`
+
+Hỗ trợ các tham số bộ lọc: `state`, `severity`, `ruleFamily`, `branchIds`, `subjectId`, `from`, `to`, `limit` và `cursor`. Trường `subjectId` luôn được kiểm tra phạm vi và tuyệt đối không bao giờ được dùng để làm lộ thông tin nhân viên ngoại lai.
+
+#### Tiêu đề Yêu cầu (Headers)
+```http
+Authorization: Bearer <Cognito JWT Token>
+Accept: application/json
+X-Correlation-ID: 0192b2d0-7f1d-7abc-8d2c-123456789001
+```
+
+#### Phản hồi Thành Công `200 OK`
+```json
+{
+  "data": [
+    {
+      "findingId": "0192b2d0-7f1d-7abc-8d2c-123456789100",
+      "caseId": "0192b2d0-7f1d-7abc-8d2c-123456789101",
+      "state": "OPEN",
+      "severity": "MEDIUM",
+      "ruleFamily": "DISCOUNT_SPIKE",
+      "ruleVersion": "loss-rule-v1",
+      "subject": {"id": "0192b2d0-7f1d-7abc-8d2c-123456789020", "displayLabel": "Thu ngân A", "role": "CASHIER"},
+      "branchId": "0192b2d0-7f1d-7abc-8d2c-123456789002",
+      "observationWindow": {"from": "2026-10-12T00:00:00Z", "to": "2026-10-13T00:00:00Z", "timezone": "Asia/Ho_Chi_Minh"},
+      "metric": {"current": "0.1800", "baseline": "0.0400", "ratio": "4.5000", "unit": "discount_rate"},
+      "minimumSample": 30,
+      "sampleCount": 92,
+      "explanationCode": "ABOVE_BASELINE_AND_MIN_SAMPLE",
+      "evidenceRefs": [{"eventId": "0192b2d0-7f1d-7abc-8d2c-123456789010", "action": "DISCOUNT_APPLIED"}],
+      "dataQuality": {"status": "FRESH", "completenessStatus": "COMPLETE"},
+      "detectedAt": "2026-10-13T08:01:00Z",
+      "version": 2
+    }
+  ],
+  "meta": {
+    "limit": 20,
+    "hasMore": false,
+    "nextCursor": null,
+    "requestId": "req_0192b2d0-7f1d-7abc-8d2c-123456789001",
+    "correlationId": "cor_0192b2d0-7f1d-7abc-8d2c-123456789002",
+    "timestamp": "2026-10-13T08:02:00Z"
+  }
 }
 ```
 
 `FindingResponse` bao gồm tóm tắt trạng thái/lịch sử vụ việc, không bao gồm payload nguồn thô. Các tham chiếu bằng chứng được kiểm tra quyền riêng lẻ trên từng mục.
 
-### 4.4 Các yêu cầu thay đổi trạng thái vụ việc
+---
 
+### 4.4 Các yêu cầu thay đổi trạng thái vụ việc (Case State Machine Actions)
+
+Các endpoint chuyển đổi trạng thái vụ việc:
+- Tiếp nhận: `POST /api/v1/loss-prevention/findings/{findingId}/acknowledge`
+- Điều tra: `POST /api/v1/loss-prevention/findings/{findingId}/investigation`
+- Giải quyết (Chỉ Owner): `POST /api/v1/loss-prevention/findings/{findingId}/resolve`
+- Bác bỏ (Chỉ Owner): `POST /api/v1/loss-prevention/findings/{findingId}/dismiss`
+
+#### Tiêu đề Yêu cầu (Headers)
+```http
+Authorization: Bearer <Cognito JWT Token>
+Content-Type: application/json
+Accept: application/json
+X-Correlation-ID: 0192b2d0-7f1d-7abc-8d2c-123456789001
+Idempotency-Key: 0192b2d0-7f1d-7abc-8d2c-123456789005
+```
+
+#### Request Body Mẫu
 ```json
 {
   "reason": "Đã kiểm tra camera và đối chiếu ca",
@@ -330,22 +451,103 @@ Endpoint `GET /api/v1/loss-prevention/findings` hỗ trợ `state`, `severity`, 
 - `Owner` có quyền giải quyết/bác bỏ; `Manager` nhận lỗi `403 forbidden` nếu thực hiện các hành động này.
 - Khi `expectedVersion` bị cũ, server trả về lỗi `409 case_version_conflict` mà không ghi nhận bán phần.
 
-### 4.5 Thao tác xuất dữ liệu (Export Operation)
-
-`POST /api/v1/audit/exports`:
-
+#### Phản hồi Thành Công `200 OK`
 ```json
 {
-  "branchIds": ["0192..."],
+  "data": {
+    "findingId": "0192b2d0-7f1d-7abc-8d2c-123456789100",
+    "caseId": "0192b2d0-7f1d-7abc-8d2c-123456789101",
+    "state": "INVESTIGATING",
+    "version": 3,
+    "lastAction": {
+      "action": "START_INVESTIGATION",
+      "performedBy": {"actorId": "0192b2d0-7f1d-7abc-8d2c-123456789025", "displayLabel": "Quản lý B", "role": "MANAGER"},
+      "reason": "Đã kiểm tra camera và đối chiếu ca",
+      "occurredAt": "2026-10-13T08:15:00Z"
+    }
+  },
+  "meta": {
+    "requestId": "req_0192b2d0-7f1d-7abc-8d2c-123456789001",
+    "correlationId": "cor_0192b2d0-7f1d-7abc-8d2c-123456789002",
+    "timestamp": "2026-10-13T08:15:01Z"
+  }
+}
+```
+
+---
+
+### 4.5 Thao tác xuất dữ liệu (Export Operation)
+
+#### 4.5.1 Khởi tạo tác vụ xuất dữ liệu
+`POST /api/v1/audit/exports`
+
+#### Tiêu đề Yêu cầu (Headers)
+```http
+Authorization: Bearer <Cognito JWT Token>
+Content-Type: application/json
+Accept: application/json
+X-Correlation-ID: 0192b2d0-7f1d-7abc-8d2c-123456789001
+Idempotency-Key: 0192b2d0-7f1d-7abc-8d2c-123456789006
+```
+
+#### Request Body Mẫu
+```json
+{
+  "branchIds": ["0192b2d0-7f1d-7abc-8d2c-123456789002"],
   "from": "2021-01-01T00:00:00Z",
   "to": "2026-10-13T00:00:00Z",
   "dataClasses": ["AUDIT_EVIDENCE", "CASE_ACTIONS"],
   "format": "JSONL",
-  "reason": "Kiểm tra nội bộ"
+  "reason": "Kiểm tra nội bộ định kỳ"
 }
 ```
 
-Quy tắc: tối đa 7 năm, chỉ định rõ phạm vi, đánh giá lưu trữ pháp lý, bắt buộc có `Idempotency-Key`, trả về `202` kèm `operationId`/`pollUrl`; khi hoàn tất trả về tham chiếu tải xuống an toàn có thời hạn và mã checksum, tuyệt đối không cung cấp URL bucket công khai.
+Quy tắc: tối đa 7 năm, chỉ định rõ phạm vi, đánh giá lưu trữ pháp lý, bắt buộc có `Idempotency-Key`, trả về `202 Accepted` kèm `operationId`/`pollUrl`.
+
+#### Phản hồi Tiếp Nhận `202 Accepted`
+```json
+{
+  "data": {
+    "operationId": "0192b2d0-7f1d-7abc-8d2c-123456789120",
+    "status": "PROCESSING",
+    "pollUrl": "/api/v1/audit/exports/0192b2d0-7f1d-7abc-8d2c-123456789120",
+    "pollAfterMs": 2000,
+    "createdAt": "2026-10-13T08:20:00Z"
+  },
+  "meta": {
+    "requestId": "req_0192b2d0-7f1d-7abc-8d2c-123456789001",
+    "correlationId": "cor_0192b2d0-7f1d-7abc-8d2c-123456789002",
+    "timestamp": "2026-10-13T08:20:00Z"
+  }
+}
+```
+
+#### 4.5.2 Kiểm tra trạng thái xuất dữ liệu
+`GET /api/v1/audit/exports/{operationId}`
+
+Khi hoàn tất trả về tham chiếu tải xuống an toàn có thời hạn và mã checksum SHA-256, tuyệt đối không cung cấp URL bucket công khai.
+
+#### Phản hồi Thành Công `200 OK` (Khi hoàn tất)
+```json
+{
+  "data": {
+    "operationId": "0192b2d0-7f1d-7abc-8d2c-123456789120",
+    "status": "COMPLETED",
+    "downloadUrl": "https://audit-export-store.s3.amazonaws.com/exports/0192.../audit.jsonl.gz?AWSAccessKeyId=...",
+    "expiresAt": "2026-10-14T08:20:00Z",
+    "checksumSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "rowCount": 14250,
+    "completedAt": "2026-10-13T08:22:15Z"
+  },
+  "meta": {
+    "requestId": "req_0192b2d0-7f1d-7abc-8d2c-123456789001",
+    "correlationId": "cor_0192b2d0-7f1d-7abc-8d2c-123456789002",
+    "timestamp": "2026-10-13T08:22:16Z"
+  }
+}
+```
+
+---
 
 ### 4.6 Bảng phân loại mã lỗi chung
 
@@ -912,6 +1114,173 @@ Thứ tự thực hiện Migration:
 7. Bổ sung các fixture tương thích producer cho Order, Promotion/Loyalty, Payment, Shift/POS Device và Identity.
 8. Nạp dữ liệu mẫu chỉ cho các fixture chính sách quy tắc đơn định; các ngưỡng sản xuất yêu cầu ban hành / kiểm toán có phiên bản.
 9. Kiểm tra hợp lệ các script Flyway migration trên cả database rỗng lẫn database sao chép; áp dụng chiến lược expand → migrate → contract cho các thay đổi tương lai.
+
+### 13.1 Các kịch bản Migration Flyway (Flyway Migration Scripts)
+
+#### 13.1.1 `V1__init_audit_core_and_events.sql`
+```sql
+CREATE TABLE audit_events (
+    id UUID PRIMARY KEY,
+    tenant_id UUID NOT NULL,
+    branch_id UUID,
+    event_type TEXT NOT NULL,
+    action TEXT NOT NULL CHECK (action IN ('ORDER_LINE_CANCELLED', 'ORDER_CANCELLED', 'DISCOUNT_APPLIED', 'CASH_DRAWER_OPENED', 'AUTHORIZATION_DENIED', 'CASE_ACTION')),
+    outcome TEXT NOT NULL CHECK (outcome IN ('SUCCEEDED', 'REJECTED', 'FAILED', 'NO_OP')),
+    actor JSONB NOT NULL,
+    effective_operator JSONB,
+    resource JSONB NOT NULL,
+    shift_id UUID,
+    pos_device_id UUID,
+    reason TEXT,
+    before_summary JSONB,
+    after_summary JSONB,
+    occurred_at TIMESTAMPTZ NOT NULL,
+    source_event_id UUID NOT NULL,
+    source_version BIGINT NOT NULL,
+    correlation_id UUID NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT uq_audit_source_event UNIQUE (tenant_id, source_event_id, action)
+) PARTITION BY RANGE (occurred_at);
+
+COMMENT ON TABLE audit_events IS 'Sổ cái bất biến ghi nhận mọi sự kiện kiểm toán bảo mật và hành động nhạy cảm';
+REVOKE UPDATE, DELETE ON audit_events FROM PUBLIC;
+
+CREATE TABLE audit_events_default PARTITION OF audit_events DEFAULT;
+```
+
+#### 13.1.2 `V2__init_audit_projections_and_digests.sql`
+```sql
+CREATE TABLE audit_event_projections (
+    id UUID PRIMARY KEY,
+    tenant_id UUID NOT NULL,
+    branch_id UUID,
+    action TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    actor_id UUID,
+    effective_operator_id UUID,
+    resource_type TEXT NOT NULL,
+    resource_id UUID NOT NULL,
+    shift_id UUID,
+    occurred_at TIMESTAMPTZ NOT NULL,
+    before_summary JSONB,
+    after_summary JSONB,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_audit_proj_tenant_branch ON audit_event_projections(tenant_id, branch_id, occurred_at DESC);
+CREATE INDEX idx_audit_proj_action ON audit_event_projections(tenant_id, action, occurred_at DESC);
+CREATE INDEX idx_audit_proj_operator ON audit_event_projections(tenant_id, effective_operator_id, occurred_at DESC);
+
+CREATE TABLE digest_batches (
+    id UUID PRIMARY KEY,
+    tenant_id UUID NOT NULL,
+    batch_sequence BIGINT NOT NULL,
+    from_occurred_at TIMESTAMPTZ NOT NULL,
+    to_occurred_at TIMESTAMPTZ NOT NULL,
+    event_count BIGINT NOT NULL,
+    sha256_digest TEXT NOT NULL,
+    previous_digest TEXT NOT NULL,
+    verified_at TIMESTAMPTZ,
+    status TEXT NOT NULL DEFAULT 'SEALED' CHECK (status IN ('SEALED', 'VERIFIED', 'CORRUPTED')),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT uq_audit_digest_seq UNIQUE (tenant_id, batch_sequence)
+);
+```
+
+#### 13.1.3 `V3__init_anomaly_rules_and_findings.sql`
+```sql
+CREATE TABLE anomaly_rule_versions (
+    id UUID PRIMARY KEY,
+    tenant_id UUID NOT NULL,
+    rule_family TEXT NOT NULL CHECK (rule_family IN ('CANCEL_SPIKE', 'DISCOUNT_SPIKE', 'DRAWER_FREQUENCY', 'REPEATED_ACTION')),
+    rule_version TEXT NOT NULL,
+    configuration JSONB NOT NULL,
+    status TEXT NOT NULL DEFAULT 'ACTIVE' CHECK (status IN ('ACTIVE', 'RETIRED')),
+    effective_from TIMESTAMPTZ NOT NULL,
+    effective_to TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT uq_audit_rule_ver UNIQUE (tenant_id, rule_family, rule_version)
+);
+
+CREATE TABLE anomaly_findings (
+    id UUID PRIMARY KEY,
+    tenant_id UUID NOT NULL,
+    branch_id UUID NOT NULL,
+    rule_family TEXT NOT NULL,
+    rule_version TEXT NOT NULL,
+    severity TEXT NOT NULL CHECK (severity IN ('LOW', 'MEDIUM', 'HIGH', 'CRITICAL')),
+    state TEXT NOT NULL DEFAULT 'OPEN' CHECK (state IN ('OPEN', 'ACKNOWLEDGED', 'INVESTIGATING', 'RESOLVED', 'DISMISSED')),
+    subject_user_id UUID NOT NULL,
+    observation_window JSONB NOT NULL,
+    metric_summary JSONB NOT NULL,
+    sample_count INTEGER NOT NULL,
+    evidence_refs JSONB NOT NULL,
+    version BIGINT NOT NULL DEFAULT 1,
+    detected_at TIMESTAMPTZ NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_audit_findings_state ON anomaly_findings(tenant_id, branch_id, state);
+```
+
+#### 13.1.4 `V4__init_case_actions_and_state_machine.sql`
+```sql
+CREATE TABLE case_actions (
+    id UUID PRIMARY KEY,
+    tenant_id UUID NOT NULL,
+    finding_id UUID NOT NULL REFERENCES anomaly_findings(id) ON DELETE CASCADE,
+    action TEXT NOT NULL CHECK (action IN ('ACKNOWLEDGE', 'START_INVESTIGATION', 'UPDATE_INVESTIGATION', 'RESOLVE', 'DISMISS', 'REOPEN')),
+    performed_by_actor JSONB NOT NULL,
+    reason TEXT NOT NULL,
+    note TEXT,
+    from_state TEXT NOT NULL,
+    to_state TEXT NOT NULL,
+    case_version_after BIGINT NOT NULL,
+    occurred_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+COMMENT ON TABLE case_actions IS 'Sổ cái bất biến ghi nhận mọi thao tác xử lý vụ việc chống thất thoát';
+REVOKE UPDATE, DELETE ON case_actions FROM PUBLIC;
+
+CREATE INDEX idx_case_actions_finding ON case_actions(tenant_id, finding_id, occurred_at);
+```
+
+#### 13.1.5 `V5__init_audit_exports_and_legal_holds.sql`
+```sql
+CREATE TABLE audit_exports (
+    id UUID PRIMARY KEY,
+    tenant_id UUID NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('QUEUED', 'PROCESSING', 'COMPLETED', 'FAILED', 'EXPIRED')),
+    scope JSONB NOT NULL,
+    date_from TIMESTAMPTZ NOT NULL,
+    date_to TIMESTAMPTZ NOT NULL,
+    data_classes JSONB NOT NULL,
+    export_format TEXT NOT NULL DEFAULT 'JSONL',
+    reason TEXT NOT NULL,
+    artifact_uri TEXT,
+    artifact_checksum_sha256 TEXT,
+    row_count BIGINT,
+    expires_at TIMESTAMPTZ NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    completed_at TIMESTAMPTZ
+);
+
+CREATE TABLE legal_holds (
+    id UUID PRIMARY KEY,
+    tenant_id UUID NOT NULL,
+    data_class TEXT NOT NULL,
+    scope JSONB NOT NULL,
+    from_time TIMESTAMPTZ NOT NULL,
+    to_time TIMESTAMPTZ NOT NULL,
+    reason TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'ACTIVE' CHECK (status IN ('ACTIVE', 'RELEASED')),
+    applied_by_user_id UUID NOT NULL,
+    applied_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    released_at TIMESTAMPTZ,
+    released_by_user_id UUID
+);
+```
 
 ## 14. Ma Trận Kiểm Thử Hợp Đồng (Contract Test Matrix)
 

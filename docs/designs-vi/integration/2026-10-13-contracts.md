@@ -229,71 +229,248 @@ Mã tham chiếu trace là các chuỗi mờ, có phạm vi và có thể ở tr
 | GET | `/api/v1/invoices/{invoiceOperationId}/deliveries` | `integration:invoice:read` | `DeliveryPage` | Xem lịch sử các kênh/lần thử chuyển phát |
 | POST | `/api/v1/invoices/{invoiceOperationId}/delivery-retries` | `integration:delivery:retry` | `202 DeliveryRetryResponse` | Yêu cầu gửi lại có phân quyền |
 
-### 4.2 Yêu cầu thu thập kênh nhận hóa đơn
+---
 
-`POST /api/v1/invoice-recipient-intents` bắt buộc có tiêu đề `Idempotency-Key`.
+### 4.2 Yêu Cầu Thu Thập Kênh Nhận Hóa Đơn
+`POST /api/v1/invoice-recipient-intents`  
+Quyền hạn: `integration:invoice:prepare`; Cashier, Manager, Owner.
 
+#### Headers
+| Tiêu đề | Bắt buộc | Giá trị mẫu / Mô tả |
+|---|---:|---|
+| `Authorization` | Có | `Bearer eyJhbGciOiJSUzI1NiIs...` (Cognito access token) |
+| `Idempotency-Key` | Có | `idem_rcpt_0192b2d0-8040` |
+| `X-Active-Branch-Id` | Có | `0192b2d0-7f23-7abc-8d2c-123456789012` |
+| `X-Correlation-Id` | Không | `cor_01J9X1234567890ABCDEF12345` |
+| `Content-Type` | Có | `application/json` |
+
+#### Request Body
 ```json
 {
-  "data": {
-    "orderId": "0192...",
-    "checkoutAttemptId": "0192...",
-    "channel": "EMAIL",
-    "contact": {"email": "customer@example.test"},
-    "consent": {
-      "policyVersion": "invoice-delivery-consent-v1",
-      "textVersion": "2026-10-13",
-      "capturedAt": "2026-10-13T08:00:00Z",
-      "purpose": "INVOICE_DELIVERY"
-    }
+  "orderId": "0192b2d0-7f30-7abc-8d2c-123456789012",
+  "checkoutAttemptId": "0192b2d0-8040-7abc-8d2c-123456789012",
+  "channel": "EMAIL",
+  "contact": {
+    "email": "customer@example.test"
+  },
+  "consent": {
+    "policyVersion": "invoice-delivery-consent-v1",
+    "textVersion": "2026-10-13",
+    "capturedAt": "2026-10-13T08:00:00Z",
+    "purpose": "INVOICE_DELIVERY"
   }
 }
 ```
 
-Phản hồi mã `201`:
-
+#### Response Body `201 Created`
 ```json
 {
   "data": {
-    "invoiceRecipientRef": "0192...",
+    "invoiceRecipientRef": "0192b2d0-80c0-7abc-8d2c-123456789012",
     "channel": "EMAIL",
     "maskedContact": "c***@example.test",
     "version": 1,
     "status": "ACTIVE",
     "expiresAt": "2026-10-13T10:00:00Z"
   },
-  "meta": {"requestId": "req_01J...", "correlationId": "cor_01J..."}
+  "meta": {
+    "requestId": "req_01J9X1234567890ABCDEF12345",
+    "correlationId": "cor_01J9X1234567890ABCDEF12345"
+  }
 }
 ```
+*Quy tắc:* Cùng khóa lũy quyền và yêu cầu chuẩn sẽ phát lại đúng phản hồi ban đầu. Cùng khóa nhưng sai khác thông tin liên hệ/kênh sẽ trả về mã lỗi `409 idempotency_conflict`.
 
-Cùng khóa lũy quyền và yêu cầu chuẩn sẽ phát lại đúng phản hồi ban đầu. Cùng khóa nhưng sai khác thông tin liên hệ/kênh sẽ trả về mã lỗi `409 idempotency_conflict`.
+---
 
-### 4.3 Danh sách và chi tiết hóa đơn
+### 4.3 Danh Sách Hóa Đơn Điện Tử
+`GET /api/v1/invoices`  
+Quyền hạn: `integration:invoice:read`; Cashier, Manager, Owner.
 
-Đường dẫn: `GET /api/v1/invoices?from=&to=&branchIds=&orderId=&status=&deliveryStatus=&cursor=&limit=`.
+#### Headers & Query Parameters
+- **Headers:** `Authorization: Bearer <token>`, `X-Active-Branch-Id`, `X-Correlation-Id`
+- **Query Parameters:**
+  | Tham số | Bắt buộc | Mặc định | Mô tả |
+  |---|---:|---|---|
+  | `from` | Không | null | Dấu thời gian bắt đầu (tối đa 90 ngày) |
+  | `to` | Không | null | Dấu thời gian kết thúc |
+  | `branchIds` | Không | null | Danh sách ID chi nhánh phân tách dấu phẩy (tối đa 20) |
+  | `orderId` | Không | null | Lọc theo đơn hàng |
+  | `status` | Không | null | Lọc theo trạng thái hóa đơn: `ISSUED`, `ISSUING`, `FAILED_RETRYABLE`, `FAILED_TERMINAL` |
+  | `deliveryStatus` | Không | null | Lọc theo trạng thái chuyển phát: `PENDING`, `SENT`, `FAILED` |
+  | `cursor` | Không | null | Con trỏ phân trang |
+  | `limit` | Không | 20 | Số lượng bản ghi (tối đa 100) |
 
-Quy tắc: Máy chủ tự giải quyết phạm vi chi nhánh; khoảng thời gian tối đa 90 ngày; `branchIds` tối đa 20 chi nhánh và phải là tập con của quyền được cấp; không trả thông tin liên hệ thô hay phản hồi thô của provider; trường `technicalReference` của hóa đơn chỉ trả về mã tham chiếu nhà cung cấp an toàn.
-
-### 4.4 Yêu cầu gửi lại chuyển phát (Delivery Retry)
-
-`POST /api/v1/invoices/{invoiceOperationId}/delivery-retries` bắt buộc có `Idempotency-Key` và tùy chọn `If-Match`.
-
+#### Response Body `200 OK`
 ```json
 {
-  "data": {
-    "channel": "EMAIL",
-    "reason": "Khách yêu cầu gửi lại",
-    "expectedVersion": 3
+  "data": [
+    {
+      "invoiceOperationId": "0192b2d0-80d0-7abc-8d2c-123456789012",
+      "tenantId": "0192b2d0-7f1d-7abc-8d2c-123456789012",
+      "branchId": "0192b2d0-7f23-7abc-8d2c-123456789012",
+      "orderId": "0192b2d0-7f30-7abc-8d2c-123456789012",
+      "checkoutAttemptId": "0192b2d0-8040-7abc-8d2c-123456789012",
+      "profile": "SANDBOX_TECHNICAL",
+      "status": "ISSUED",
+      "technicalReference": "sandbox-inv-123",
+      "total": {
+        "amountMinor": 105000,
+        "currency": "VND"
+      },
+      "recipient": {
+        "channel": "EMAIL",
+        "maskedContact": "c***@example.test"
+      },
+      "deliveryStatus": "SENT",
+      "version": 3,
+      "createdAt": "2026-10-13T08:00:01Z",
+      "updatedAt": "2026-10-13T08:00:05Z"
+    }
+  ],
+  "meta": {
+    "pagination": {
+      "hasMore": false,
+      "nextCursor": null
+    },
+    "requestId": "req_01J9X1234567890ABCDEF12345",
+    "correlationId": "cor_01J9X1234567890ABCDEF12345"
   }
 }
 ```
 
-Quy tắc nghiệp vụ:
+---
 
-- Máy chủ kiểm tra lại phạm vi hiện tại, sự đồng ý, trạng thái liên hệ, trạng thái hóa đơn và năng lực kênh gửi.
-- Thao tác gửi lại tuyệt đối không chấp nhận thông tin liên hệ thô mới; việc đổi thông tin liên hệ đòi hỏi phải tạo bản chụp sự đồng ý mới.
-- Phản hồi `202` trả về `deliveryOperationId`, `attemptId`, trạng thái hiện tại và địa chỉ `pollUrl`.
-- Phiên bản bị cũ trả về mã `409 invoice_state_conflict`; cùng yêu cầu lũy quyền trả về đúng tác vụ gốc.
+### 4.4 Xem Chi Tiết Hóa Đơn
+`GET /api/v1/invoices/{invoiceOperationId}`  
+Quyền hạn: `integration:invoice:read`.
+
+#### Headers & Path Parameters
+- **Headers:** `Authorization: Bearer <token>`, `X-Active-Branch-Id`, `X-Correlation-Id`
+- **Path Parameters:**
+  - `invoiceOperationId` (UUID, bắt buộc): Định danh tác vụ hóa đơn.
+
+#### Response Body `200 OK`
+```json
+{
+  "data": {
+    "invoiceOperationId": "0192b2d0-80d0-7abc-8d2c-123456789012",
+    "tenantId": "0192b2d0-7f1d-7abc-8d2c-123456789012",
+    "branchId": "0192b2d0-7f23-7abc-8d2c-123456789012",
+    "orderId": "0192b2d0-7f30-7abc-8d2c-123456789012",
+    "checkoutAttemptId": "0192b2d0-8040-7abc-8d2c-123456789012",
+    "sourceEventId": "0192b2d0-7f35-7abc-8d2c-123456789012",
+    "profile": "SANDBOX_TECHNICAL",
+    "status": "ISSUED",
+    "technicalReference": "sandbox-inv-123",
+    "amounts": {
+      "subtotalMinor": 100000,
+      "discountMinor": 10000,
+      "vatMinor": 15000,
+      "totalMinor": 105000,
+      "currency": "VND"
+    },
+    "items": [
+      {
+        "itemId": "0192b2d0-8050-7abc-8d2c-123456789012",
+        "itemName": "Trà Sữa Ô Long",
+        "quantity": 2,
+        "unitPriceMinor": 50000,
+        "discountMinor": 10000,
+        "taxMinor": 15000,
+        "lineTotalMinor": 105000
+      }
+    ],
+    "recipient": {
+      "channel": "EMAIL",
+      "maskedContact": "c***@example.test",
+      "status": "ACTIVE"
+    },
+    "deliveryStatus": "SENT",
+    "version": 3,
+    "createdAt": "2026-10-13T08:00:01Z",
+    "updatedAt": "2026-10-13T08:00:05Z"
+  },
+  "meta": {
+    "requestId": "req_01J9X1234567890ABCDEF12345",
+    "correlationId": "cor_01J9X1234567890ABCDEF12345"
+  }
+}
+```
+
+---
+
+### 4.5 Lịch Sử Chuyển Phát Của Hóa Đơn
+`GET /api/v1/invoices/{invoiceOperationId}/deliveries`  
+Quyền hạn: `integration:invoice:read`.
+
+#### Headers & Path Parameters
+- **Headers:** `Authorization: Bearer <token>`, `X-Active-Branch-Id`, `X-Correlation-Id`
+- **Path Parameters:**
+  - `invoiceOperationId` (UUID, bắt buộc): Định danh tác vụ hóa đơn.
+
+#### Response Body `200 OK`
+```json
+{
+  "data": [
+    {
+      "deliveryOperationId": "0192b2d0-80e0-7abc-8d2c-123456789012",
+      "channel": "EMAIL",
+      "maskedContact": "c***@example.test",
+      "status": "SENT",
+      "attemptCount": 1,
+      "lastAttemptAt": "2026-10-13T08:00:04Z",
+      "providerReference": "mailgun-msg-01J9X"
+    }
+  ],
+  "meta": {
+    "requestId": "req_01J9X1234567890ABCDEF12345",
+    "correlationId": "cor_01J9X1234567890ABCDEF12345"
+  }
+}
+```
+
+---
+
+### 4.6 Yêu Cầu Gửi Lại Chuyển Phát (Delivery Retry)
+`POST /api/v1/invoices/{invoiceOperationId}/delivery-retries`  
+Quyền hạn: `integration:delivery:retry`; Cashier, Manager, Owner. Bắt buộc có `Idempotency-Key`.
+
+#### Headers
+| Tiêu đề | Bắt buộc | Giá trị mẫu / Mô tả |
+|---|---:|---|
+| `Authorization` | Có | `Bearer eyJhbGciOiJSUzI1NiIs...` |
+| `Idempotency-Key` | Có | `idem_retry_inv_0192b2d0` |
+| `If-Match` | Không | `"3"` (Phiên bản hóa đơn kỳ vọng) |
+| `Content-Type` | Có | `application/json` |
+
+#### Request Body
+```json
+{
+  "channel": "EMAIL",
+  "reason": "Khách hàng yêu cầu gửi lại hóa đơn vào email",
+  "expectedVersion": 3
+}
+```
+
+#### Response Body `202 Accepted`
+```json
+{
+  "data": {
+    "deliveryOperationId": "0192b2d0-80e0-7abc-8d2c-123456789012",
+    "attemptId": "0192b2d0-80e5-7abc-8d2c-123456789012",
+    "status": "QUEUED",
+    "channel": "EMAIL",
+    "pollUrl": "/api/v1/invoices/0192b2d0-80d0-7abc-8d2c-123456789012/deliveries"
+  },
+  "meta": {
+    "requestId": "req_01J9X1234567890ABCDEF12345",
+    "correlationId": "cor_01J9X1234567890ABCDEF12345"
+  }
+}
+```
+
+---
 
 ## 5. Giao ước API nội bộ phục vụ Demo (Internal/Demo API Contracts)
 
@@ -310,63 +487,183 @@ Quy tắc nghiệp vụ:
 | GET | `/internal/v1/demo/runs/{demoRunId}/traces` | `demo:trace:read` | `TraceReferencePage` |
 | GET | `/internal/v1/integration/health` | workload/ops | `IntegrationHealthResponse` |
 
-### 5.2 Khởi tạo phiên chạy Demo
+---
 
+### 5.2 Khởi Tạo Phiên Chạy Demo
+`POST /internal/v1/demo/runs`  
+Quyền hạn: `demo:run` Workload Identity (chỉ cho phép trên môi trường non-prod DEMO/TEST).
+
+#### Request Body
+```json
+{
+  "scenarioKey": "POS_P0_SUCCESS_AND_PAYMENT_OUTAGE",
+  "scenarioVersion": 1,
+  "seedVersion": "pos-demo-seed-v1",
+  "tenantNamespace": "demo-tenant-01",
+  "branchNamespace": "demo-branch-01",
+  "requestedSteps": ["SUCCESS", "PAYMENT_UNAVAILABLE"]
+}
+```
+
+#### Response Body `201 Created`
 ```json
 {
   "data": {
+    "demoRunId": "0192b2d0-80f0-7abc-8d2c-123456789012",
     "scenarioKey": "POS_P0_SUCCESS_AND_PAYMENT_OUTAGE",
-    "scenarioVersion": 1,
-    "seedVersion": "pos-demo-seed-v1",
+    "status": "READY",
     "tenantNamespace": "demo-tenant-01",
     "branchNamespace": "demo-branch-01",
-    "requestedSteps": ["SUCCESS", "PAYMENT_UNAVAILABLE"]
+    "expiresAt": "2026-10-13T10:00:00Z",
+    "createdAt": "2026-10-13T08:00:00Z"
+  },
+  "meta": {
+    "requestId": "req_01J9X1234567890ABCDEF12345",
+    "correlationId": "cor_01J9X1234567890ABCDEF12345"
   }
 }
 ```
 
-Máy chủ bỏ qua thông tin môi trường do client tự gửi; môi trường triển khai bắt buộc phải là `DEMO` hoặc `TEST`. Việc tạo phiên chạy sẽ xác lập quyền sở hữu namespace/khóa thuê và chạy kiểm tra sơ bộ preflight trước khi chuyển sang trạng thái `READY`.
+---
 
-### 5.3 Khóa thuê tiêm lỗi (Fault Lease)
+### 5.3 Cấp Khóa Thuê Tiêm Lỗi (Fault Lease)
+`POST /internal/v1/demo/runs/{demoRunId}/fault-leases`  
+Quyền hạn: `demo:fault-inject`.
 
+#### Request Body
+```json
+{
+  "faultType": "PAYMENT_UNAVAILABLE",
+  "target": "payment-initiate",
+  "stepKey": "PAYMENT_FAILURE",
+  "reason": "Verify Saga releases Inventory reservation",
+  "ttlSeconds": 300
+}
+```
+
+#### Response Body `201 Created`
 ```json
 {
   "data": {
+    "faultLeaseId": "fl_0192b2d0-8100-7abc-8d2c-123456789012",
+    "demoRunId": "0192b2d0-80f0-7abc-8d2c-123456789012",
     "faultType": "PAYMENT_UNAVAILABLE",
     "target": "payment-initiate",
-    "stepKey": "PAYMENT_FAILURE",
-    "reason": "Verify Saga releases Inventory reservation",
-    "ttlSeconds": 300
+    "status": "ACTIVE",
+    "expiresAt": "2026-10-13T08:05:00Z"
+  },
+  "meta": {
+    "requestId": "req_01J9X1234567890ABCDEF12345",
+    "correlationId": "cor_01J9X1234567890ABCDEF12345"
   }
 }
 ```
 
-Máy chủ chặn trần thời gian TTL, thẩm định danh mục kịch bản cho phép, gắn khóa thuê với phiên chạy/môi trường/người sở hữu và trả về `faultLeaseId`, thời điểm hết hạn và trạng thái. Khóa thuê khi hết hạn hoặc bị thu hồi sẽ được ghi nhận kiểm toán và tự động trả về hành vi bình thường.
+---
 
-### 5.4 Kiểm tra sức khỏe và đối soát nhà cung cấp
+### 5.4 Thu Hồi Khóa Thuê Tiêm Lỗi
+`DELETE /internal/v1/demo/runs/{demoRunId}/fault-leases/{faultLeaseId}`  
+Quyền hạn: `demo:fault-inject`. Trả về `204 No Content` khi thu hồi thành công.
 
-Đường dẫn: `GET /internal/v1/integration/health` trả về trạng thái chi tiết theo nguồn/hàng đợi/nhà cung cấp:
+---
 
+### 5.5 Kiểm Tra Sức Khỏe và Đối Soát Nhà Cung Cấp
+`GET /internal/v1/integration/health`  
+Quyền hạn: Workload / Ops Token.
+
+#### Response Body `200 OK`
 ```json
 {
   "data": {
     "environment": "DEMO",
-    "sources": [{
-      "name": "order-paid-consumer",
-      "status": "HEALTHY",
-      "lagSeconds": 2,
-      "dlqCount": 0,
-      "watermark": "order-paid:v901"
-    }],
-    "providers": [{
-      "name": "invoice-sandbox",
-      "profile": "SANDBOX_TECHNICAL",
-      "status": "HEALTHY",
-      "latencyMsP95": 240
-    }]
+    "sources": [
+      {
+        "name": "order-paid-consumer",
+        "status": "HEALTHY",
+        "lagSeconds": 2,
+        "dlqCount": 0,
+        "watermark": "order-paid:v901"
+      }
+    ],
+    "providers": [
+      {
+        "name": "invoice-sandbox",
+        "profile": "SANDBOX_TECHNICAL",
+        "status": "HEALTHY",
+        "latencyMsP95": 240
+      },
+      {
+        "name": "mailgun-email",
+        "status": "HEALTHY",
+        "latencyMsP95": 180
+      }
+    ]
+  },
+  "meta": {
+    "requestId": "req_01J9X1234567890ABCDEF12345",
+    "correlationId": "cor_01J9X1234567890ABCDEF12345"
   }
 }
 ```
+
+---
+
+## 6. Giao Ước Webhook Callbacks Từ Nhà Cung Cấp (Callback Webhook Contracts)
+
+### 6.1 Webhook Callback Hóa Đơn Điện Tử
+`POST /callbacks/v1/einvoice/{provider}`  
+Xác thực: Xác thực chữ ký số tại header `X-Provider-Signature` thông qua public key / HMAC secret cấu hình tại Secrets Manager.
+
+#### Headers
+| Tiêu đề | Bắt buộc | Mô tả |
+|---|---:|---|
+| `X-Provider-Signature` | Có | Chữ ký số mã băm xác thực nguồn từ Provider |
+| `Content-Type` | Có | `application/json` |
+
+#### Request Body
+```json
+{
+  "providerReference": "sandbox-inv-123",
+  "clientTrackingId": "0192b2d0-80d0-7abc-8d2c-123456789012",
+  "status": "ISSUED",
+  "issueTimestamp": "2026-10-13T08:00:03Z",
+  "invoiceNumber": "HD-2026-0001",
+  "verificationUrl": "https://sandbox-invoice.provider.test/verify/HD-2026-0001"
+}
+```
+
+#### Response Body `200 OK`
+```json
+{
+  "acknowledged": true,
+  "processedAt": "2026-10-13T08:00:04Z"
+}
+```
+
+---
+
+### 6.2 Webhook Callback Trạng Thái Chuyển Phát (Email / Zalo)
+`POST /callbacks/v1/notifications/{channel}`  
+Xác thực: Chữ ký số webhook từ hệ thống Email (Mailgun/SES) hoặc Zalo ZNS.
+
+#### Request Body
+```json
+{
+  "providerMessageId": "mailgun-msg-01J9X",
+  "trackingId": "0192b2d0-80e0-7abc-8d2c-123456789012",
+  "deliveryStatus": "DELIVERED",
+  "deliveredAt": "2026-10-13T08:00:06Z"
+}
+```
+
+#### Response Body `200 OK`
+```json
+{
+  "acknowledged": true,
+  "processedAt": "2026-10-13T08:00:06Z"
+}
+```
+
 
 ## 6. Giao ước cổng Adapter nhà cung cấp (Provider Adapter Ports)
 
@@ -589,6 +886,295 @@ Trường dữ liệu trong `delivery_provider_attempts`: `id`, mã tác vụ ch
 | `idx_demo_run_state` | environment, state, expires_at | Quản lý khóa thuê / Dọn dẹp phiên chạy demo |
 | `idx_demo_checkpoint` | demo_run_id, sequence | Tóm tắt điểm kiểm tra demo |
 | `idx_fault_lease_expiry` | environment, status, expires_at | Tự động hết hạn / Công tắc ngắt khẩn cấp |
+
+### 9.3 Các Kịch Bản Migration Flyway (Flyway Migration Scripts)
+
+#### `V1__init_integration_invoices.sql`
+```sql
+-- Flyway Migration V1: Bảng bản chụp người nhận, tác vụ hóa đơn và chi tiết dòng hóa đơn
+CREATE TABLE invoice_recipient_snapshots (
+    id UUID PRIMARY KEY,
+    tenant_id UUID NOT NULL,
+    branch_id UUID NOT NULL,
+    order_id UUID NOT NULL,
+    checkout_attempt_id UUID NOT NULL,
+    channel VARCHAR(20) NOT NULL CHECK (channel IN ('EMAIL', 'ZALO')),
+    encrypted_contact BYTEA NOT NULL,
+    masked_contact VARCHAR(255) NOT NULL,
+    consent_policy_version VARCHAR(64) NOT NULL,
+    consent_text_version VARCHAR(64) NOT NULL,
+    consented_at TIMESTAMPTZ NOT NULL,
+    status VARCHAR(20) NOT NULL DEFAULT 'ACTIVE' CHECK (status IN ('ACTIVE', 'REVOKED', 'EXPIRED', 'USED')),
+    version INT NOT NULL DEFAULT 1,
+    expires_at TIMESTAMPTZ NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE UNIQUE INDEX uq_recipient_snapshot_order ON invoice_recipient_snapshots (tenant_id, order_id, checkout_attempt_id, version);
+COMMENT ON TABLE invoice_recipient_snapshots IS 'Bản chụp thông tin liên hệ và sự đồng ý nhận hóa đơn điện tử của khách hàng';
+
+CREATE TABLE invoice_operations (
+    id UUID PRIMARY KEY,
+    tenant_id UUID NOT NULL,
+    branch_id UUID NOT NULL,
+    order_id UUID NOT NULL,
+    checkout_attempt_id UUID NOT NULL,
+    source_event_id UUID NOT NULL,
+    source_version BIGINT NOT NULL,
+    profile VARCHAR(64) NOT NULL DEFAULT 'SANDBOX_TECHNICAL',
+    status VARCHAR(30) NOT NULL DEFAULT 'REQUESTED' CHECK (status IN ('REQUESTED', 'ISSUING', 'ISSUED', 'FAILED_RETRYABLE', 'FAILED_TERMINAL')),
+    currency VARCHAR(3) NOT NULL DEFAULT 'VND',
+    subtotal_minor BIGINT NOT NULL DEFAULT 0 CHECK (subtotal_minor >= 0),
+    discount_minor BIGINT NOT NULL DEFAULT 0 CHECK (discount_minor >= 0),
+    vat_minor BIGINT NOT NULL DEFAULT 0 CHECK (vat_minor >= 0),
+    total_minor BIGINT NOT NULL DEFAULT 0 CHECK (total_minor >= 0),
+    technical_reference VARCHAR(255),
+    artifact_ref TEXT,
+    version INT NOT NULL DEFAULT 1,
+    next_attempt_at TIMESTAMPTZ,
+    quality_code VARCHAR(30),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE UNIQUE INDEX uq_invoice_order_attempt ON invoice_operations (tenant_id, order_id, checkout_attempt_id, profile);
+CREATE UNIQUE INDEX uq_invoice_source_event ON invoice_operations (tenant_id, source_event_id);
+CREATE INDEX idx_invoice_scope_time ON invoice_operations (tenant_id, branch_id, created_at DESC, id DESC);
+CREATE INDEX idx_invoice_worker ON invoice_operations (tenant_id, status, next_attempt_at);
+COMMENT ON TABLE invoice_operations IS 'Quản lý tác vụ phát hành hóa đơn kỹ thuật và đối soát nhà cung cấp';
+
+CREATE TABLE invoice_items (
+    id UUID PRIMARY KEY,
+    tenant_id UUID NOT NULL,
+    invoice_operation_id UUID NOT NULL REFERENCES invoice_operations(id) ON DELETE RESTRICT,
+    item_id UUID NOT NULL,
+    item_name VARCHAR(255) NOT NULL,
+    quantity INT NOT NULL CHECK (quantity > 0),
+    unit_price_minor BIGINT NOT NULL CHECK (unit_price_minor >= 0),
+    discount_minor BIGINT NOT NULL DEFAULT 0 CHECK (discount_minor >= 0),
+    vat_minor BIGINT NOT NULL DEFAULT 0 CHECK (vat_minor >= 0),
+    line_total_minor BIGINT NOT NULL CHECK (line_total_minor >= 0),
+    currency VARCHAR(3) NOT NULL DEFAULT 'VND',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX idx_invoice_items_op ON invoice_items (tenant_id, invoice_operation_id);
+```
+
+#### `V2__init_provider_and_deliveries.sql`
+```sql
+-- Flyway Migration V2: Quản lý lần thử nhà cung cấp và tác vụ chuyển phát
+CREATE TABLE invoice_provider_attempts (
+    id UUID PRIMARY KEY,
+    tenant_id UUID NOT NULL,
+    invoice_operation_id UUID NOT NULL REFERENCES invoice_operations(id) ON DELETE RESTRICT,
+    provider_key VARCHAR(64) NOT NULL,
+    idempotency_key VARCHAR(128) NOT NULL,
+    attempt_number INT NOT NULL CHECK (attempt_number > 0),
+    status VARCHAR(30) NOT NULL CHECK (status IN ('PENDING', 'ACCEPTED', 'REJECTED', 'TIMEOUT', 'FAILED')),
+    standardized_error_code VARCHAR(64),
+    provider_reference VARCHAR(255),
+    retry_after_seconds INT,
+    started_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    completed_at TIMESTAMPTZ,
+    next_attempt_at TIMESTAMPTZ,
+    response_fingerprint VARCHAR(128),
+    correlation_id VARCHAR(128) NOT NULL,
+    error_classification VARCHAR(30)
+);
+CREATE UNIQUE INDEX uq_invoice_provider_attempt ON invoice_provider_attempts (tenant_id, provider_key, idempotency_key);
+COMMENT ON TABLE invoice_provider_attempts IS 'Ghi nhận lịch sử từng lần gọi adapter nhà cung cấp hóa đơn';
+
+CREATE TABLE delivery_operations (
+    id UUID PRIMARY KEY,
+    tenant_id UUID NOT NULL,
+    branch_id UUID NOT NULL,
+    invoice_operation_id UUID NOT NULL REFERENCES invoice_operations(id) ON DELETE RESTRICT,
+    channel VARCHAR(20) NOT NULL CHECK (channel IN ('EMAIL', 'ZALO')),
+    recipient_snapshot_id UUID NOT NULL REFERENCES invoice_recipient_snapshots(id) ON DELETE RESTRICT,
+    status VARCHAR(30) NOT NULL DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'SENT', 'FAILED', 'EXPIRED')),
+    attempt_count INT NOT NULL DEFAULT 0,
+    expires_at TIMESTAMPTZ NOT NULL,
+    provider_reference VARCHAR(255),
+    version INT NOT NULL DEFAULT 1,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE UNIQUE INDEX uq_delivery_op_recipient ON delivery_operations (tenant_id, invoice_operation_id, channel, recipient_snapshot_id);
+CREATE INDEX idx_delivery_worker ON delivery_operations (tenant_id, status, next_attempt_at, channel);
+CREATE INDEX idx_delivery_invoice ON delivery_operations (tenant_id, invoice_operation_id, created_at DESC);
+
+CREATE TABLE delivery_provider_attempts (
+    id UUID PRIMARY KEY,
+    tenant_id UUID NOT NULL,
+    delivery_operation_id UUID NOT NULL REFERENCES delivery_operations(id) ON DELETE RESTRICT,
+    provider_key VARCHAR(64) NOT NULL,
+    idempotency_key VARCHAR(128) NOT NULL,
+    attempt_number INT NOT NULL CHECK (attempt_number > 0),
+    status VARCHAR(30) NOT NULL CHECK (status IN ('PENDING', 'DELIVERED', 'FAILED', 'BOUNCED')),
+    standardized_error_code VARCHAR(64),
+    provider_reference VARCHAR(255),
+    retry_after_seconds INT,
+    callback_fingerprint VARCHAR(128),
+    started_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    completed_at TIMESTAMPTZ
+);
+CREATE INDEX idx_delivery_provider_attempts ON delivery_provider_attempts (tenant_id, delivery_operation_id, attempt_number DESC);
+```
+
+#### `V3__init_integration_inbox_outbox_watermarks.sql`
+```sql
+-- Flyway Migration V3: Hạ tầng Inbox, Outbox, Watermark và Audit
+CREATE TABLE inbox_events (
+    id UUID PRIMARY KEY,
+    producer VARCHAR(64) NOT NULL,
+    source_event_id VARCHAR(128) NOT NULL,
+    event_type VARCHAR(64) NOT NULL,
+    tenant_id UUID NOT NULL,
+    branch_id UUID,
+    status VARCHAR(20) NOT NULL DEFAULT 'RECEIVED' CHECK (status IN ('RECEIVED', 'PROCESSED', 'FAILED', 'DLQ')),
+    received_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    processed_at TIMESTAMPTZ,
+    retry_count INT NOT NULL DEFAULT 0,
+    next_attempt_at TIMESTAMPTZ,
+    payload_fingerprint VARCHAR(128) NOT NULL
+);
+CREATE UNIQUE INDEX uq_inbox_source ON inbox_events (producer, source_event_id);
+CREATE INDEX idx_inbox_retry ON inbox_events (status, next_attempt_at);
+
+CREATE TABLE outbox_messages (
+    id UUID PRIMARY KEY,
+    event_id UUID NOT NULL,
+    event_type VARCHAR(64) NOT NULL,
+    event_version INT NOT NULL DEFAULT 1,
+    aggregate_type VARCHAR(64) NOT NULL,
+    tenant_id UUID NOT NULL,
+    branch_id UUID,
+    payload JSONB NOT NULL,
+    status VARCHAR(20) NOT NULL DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'PUBLISHED', 'FAILED', 'DLQ')),
+    next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    retry_count INT NOT NULL DEFAULT 0,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX idx_outbox_publish ON outbox_messages (status, next_attempt_at);
+
+CREATE TABLE projection_watermarks (
+    source_name VARCHAR(64) NOT NULL,
+    scope VARCHAR(64) NOT NULL,
+    watermark_version BIGINT NOT NULL,
+    freshness_status VARCHAR(20) NOT NULL DEFAULT 'FRESH' CHECK (freshness_status IN ('FRESH', 'STALE', 'PARTIAL', 'UNAVAILABLE')),
+    last_updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT pk_projection_watermarks PRIMARY KEY (source_name, scope)
+);
+CREATE INDEX idx_watermark_health ON projection_watermarks (source_name, scope, last_updated_at);
+
+CREATE TABLE audit_references (
+    id UUID PRIMARY KEY,
+    tenant_id UUID NOT NULL,
+    branch_id UUID,
+    actor_id VARCHAR(64) NOT NULL,
+    actor_workload VARCHAR(64) NOT NULL,
+    action VARCHAR(64) NOT NULL,
+    resource_type VARCHAR(64) NOT NULL,
+    resource_id UUID NOT NULL,
+    reason VARCHAR(255),
+    correlation_id VARCHAR(128) NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX idx_audit_refs_tenant_time ON audit_references (tenant_id, created_at DESC);
+```
+
+#### `V4__init_demo_control_plane.sql`
+```sql
+-- Flyway Migration V4: Bảng điều khiển Demo Control Plane (Non-production)
+CREATE TABLE demo_runs (
+    id UUID PRIMARY KEY,
+    scenario_key VARCHAR(128) NOT NULL,
+    scenario_version INT NOT NULL DEFAULT 1,
+    seed_version VARCHAR(64) NOT NULL,
+    environment VARCHAR(20) NOT NULL CHECK (environment IN ('DEMO', 'TEST')),
+    tenant_namespace VARCHAR(64) NOT NULL,
+    branch_namespace VARCHAR(64) NOT NULL,
+    owner_id VARCHAR(64) NOT NULL,
+    status VARCHAR(30) NOT NULL DEFAULT 'READY' CHECK (status IN ('READY', 'RUNNING', 'COMPLETED', 'FAILED', 'RESETTING')),
+    expires_at TIMESTAMPTZ NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    completed_at TIMESTAMPTZ
+);
+CREATE INDEX idx_demo_run_state ON demo_runs (environment, status, expires_at);
+
+CREATE TABLE demo_resource_manifests (
+    id UUID PRIMARY KEY,
+    demo_run_id UUID NOT NULL REFERENCES demo_runs(id) ON DELETE CASCADE,
+    parent_service VARCHAR(64) NOT NULL,
+    resource_type VARCHAR(64) NOT NULL,
+    opaque_resource_id VARCHAR(128) NOT NULL,
+    cleanup_order INT NOT NULL DEFAULT 1,
+    deletion_policy VARCHAR(30) NOT NULL DEFAULT 'HARD_DELETE',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX idx_demo_resources_run ON demo_resource_manifests (demo_run_id, cleanup_order);
+
+CREATE TABLE demo_checkpoints (
+    id UUID PRIMARY KEY,
+    demo_run_id UUID NOT NULL REFERENCES demo_runs(id) ON DELETE CASCADE,
+    step_key VARCHAR(64) NOT NULL,
+    sequence_number INT NOT NULL,
+    expected_state JSONB NOT NULL,
+    observed_state JSONB NOT NULL,
+    result_status VARCHAR(20) NOT NULL CHECK (result_status IN ('PASSED', 'FAILED', 'SKIPPED')),
+    data_quality VARCHAR(20) NOT NULL DEFAULT 'FRESH',
+    trace_references TEXT[],
+    correlation_id VARCHAR(128) NOT NULL,
+    recorded_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX idx_demo_checkpoint ON demo_checkpoints (demo_run_id, sequence_number);
+
+CREATE TABLE fault_leases (
+    id UUID PRIMARY KEY,
+    demo_run_id UUID NOT NULL REFERENCES demo_runs(id) ON DELETE CASCADE,
+    environment VARCHAR(20) NOT NULL CHECK (environment IN ('DEMO', 'TEST')),
+    fault_type VARCHAR(64) NOT NULL,
+    target_component VARCHAR(128) NOT NULL,
+    step_key VARCHAR(64) NOT NULL,
+    owner_id VARCHAR(64) NOT NULL,
+    reason VARCHAR(255) NOT NULL,
+    status VARCHAR(20) NOT NULL DEFAULT 'ACTIVE' CHECK (status IN ('ACTIVE', 'EXPIRED', 'REVOKED')),
+    granted_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    expires_at TIMESTAMPTZ NOT NULL,
+    revoked_at TIMESTAMPTZ
+);
+CREATE INDEX idx_fault_lease_expiry ON fault_leases (environment, status, expires_at);
+
+CREATE TABLE demo_reset_operations (
+    id UUID PRIMARY KEY,
+    demo_run_id UUID NOT NULL REFERENCES demo_runs(id) ON DELETE CASCADE,
+    idempotency_key VARCHAR(128) NOT NULL,
+    status VARCHAR(30) NOT NULL DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'IN_PROGRESS', 'COMPLETED', 'FAILED')),
+    items_deleted INT NOT NULL DEFAULT 0,
+    started_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    completed_at TIMESTAMPTZ
+);
+```
+
+#### `V5__init_integration_views_and_rules.sql`
+```sql
+-- Flyway Migration V5: Tạo view báo cáo tổng hợp và ràng buộc chính sách lưu trữ
+CREATE VIEW v_active_invoice_deliveries AS
+SELECT 
+    inv.id AS invoice_operation_id,
+    inv.tenant_id,
+    inv.branch_id,
+    inv.order_id,
+    inv.status AS invoice_status,
+    inv.technical_reference,
+    del.id AS delivery_operation_id,
+    del.channel,
+    del.status AS delivery_status,
+    del.provider_reference AS delivery_provider_reference,
+    del.updated_at AS last_delivery_update
+FROM invoice_operations inv
+LEFT JOIN delivery_operations del ON inv.id = del.invoice_operation_id;
+COMMENT ON VIEW v_active_invoice_deliveries IS 'View tổng hợp trạng thái hóa đơn và chuyển phát phục vụ truy vấn quầy POS và quản lý';
+```
+
 
 ## 10. Thời hạn lưu trữ, quyền riêng tư và lưu giữ pháp lý (Retention Matrix)
 

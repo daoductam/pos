@@ -152,7 +152,15 @@ Phản hồi danh sách phân trang theo con trỏ (Cursor pagination):
 `POST /api/v1/customers/lookup`  
 Quyền hạn: `loyalty:customer-read`; Cashier, Manager, Owner.
 
-Request Body:
+#### Headers
+| Header | Bắt buộc | Giá trị mẫu / Mô tả |
+|---|---:|---|
+| `Authorization` | Có | `Bearer eyJhbGciOiJSUzI1NiIs...` (Cognito access token) |
+| `X-Active-Branch-Id` | Có | `0192b2d0-7f23-7abc-8d2c-123456789012` |
+| `X-Correlation-Id` | Không | `cor_01J9X1234567890ABCDEF12345` |
+| `Content-Type` | Có | `application/json` |
+
+#### Request Body
 ```json
 {
   "phone": "+84901234567"
@@ -160,7 +168,7 @@ Request Body:
 ```
 *Quy tắc:* Server tự động chuẩn hóa số điện thoại theo định dạng E.164; không nhận chuỗi hash từ client. Số điện thoại không truyền qua URL path/query để tránh lọt vào access log. Nếu không tìm thấy, trả về lỗi `404 customer_not_found`.
 
-Response Body `200 OK`:
+#### Response Body `200 OK`
 ```json
 {
   "data": {
@@ -178,17 +186,43 @@ Response Body `200 OK`:
     "activeVoucherCount": 2
   },
   "meta": {
-    "requestId": "req_01J...",
-    "correlationId": "cor_01J..."
+    "requestId": "req_01J9X1234567890ABCDEF12345",
+    "correlationId": "cor_01J9X1234567890ABCDEF12345"
   }
 }
 ```
 
+#### Phản Hồi Lỗi
+- `404 Not Found`: Khi không tìm thấy khách hàng trong tenant.
+```json
+{
+  "error": {
+    "code": "customer_not_found",
+    "message": "Không tìm thấy hồ sơ khách hàng gắn với số điện thoại đã cung cấp",
+    "details": [],
+    "requestId": "req_01J9X1234567890ABCDEF12345",
+    "correlationId": "cor_01J9X1234567890ABCDEF12345"
+  }
+}
+```
+- `422 Unprocessable Content`: `invalid_phone` khi số điện thoại không thể chuẩn hóa thành E.164.
+
+---
+
 ### 4.2 Tạo Mới Hồ Sơ Khách Hàng
 `POST /api/v1/customers`  
-Quyền hạn: `loyalty:customer-create`; Bắt buộc có header `Idempotency-Key`.
+Quyền hạn: `loyalty:customer-create`; Cashier, Manager, Owner.
 
-Request Body:
+#### Headers
+| Header | Bắt buộc | Giá trị mẫu / Mô tả |
+|---|---:|---|
+| `Authorization` | Có | `Bearer eyJhbGciOiJSUzI1NiIs...` |
+| `X-Active-Branch-Id` | Có | `0192b2d0-7f23-7abc-8d2c-123456789012` |
+| `Idempotency-Key` | Có | `idem_cust_create_01J9X234` |
+| `X-Correlation-Id` | Không | `cor_01J9X1234567890ABCDEF12345` |
+| `Content-Type` | Có | `application/json` |
+
+#### Request Body
 ```json
 {
   "phone": "+84901234567",
@@ -197,15 +231,118 @@ Request Body:
 ```
 *Quy tắc:* `phone` là bắt buộc, chuẩn hóa E.164. `displayName` là tùy chọn (tối đa 200 ký tự). Trả về `201 Created` nếu tạo mới thành công. Nếu số điện thoại đã tồn tại với cùng fingerprint request, trả về hồ sơ hiện tại với `200 OK`; nếu khác fingerprint trả về lỗi `409 customer_phone_conflict`. Tuyệt đối không tự động gộp hồ sơ.
 
-### 4.3 Xem & Cập Nhật Hồ Sơ Khách Hàng
-- `GET /api/v1/customers/{customerId}` (Quyền: `loyalty:customer-read`): Trả về chi tiết hồ sơ với số điện thoại đã che mờ `maskedPhone`.
-- `PATCH /api/v1/customers/{customerId}` (Quyền: `loyalty:customer-write`; Bắt buộc có header `If-Match`): Trong giai đoạn P0 chỉ cho phép chỉnh sửa `displayName` và chuyển đổi trạng thái `status` (`ACTIVE`/`BLOCKED`). Tuyệt đối không cho phép sửa số điện thoại qua lệnh PATCH. Mọi thao tác đều được ghi nhật ký kiểm toán.
+#### Response Body `201 Created`
+```json
+{
+  "data": {
+    "customerId": "0192b2d0-8000-7abc-8d2c-123456789012",
+    "maskedPhone": "+84******567",
+    "displayName": "Nguyễn An",
+    "status": "ACTIVE",
+    "currentTier": "SILVER",
+    "balance": {
+      "availablePoints": 0,
+      "heldPoints": 0,
+      "expiredPoints": 0,
+      "asOf": "2026-10-13T09:00:00Z"
+    },
+    "createdAt": "2026-10-13T09:00:00Z",
+    "version": 1
+  },
+  "meta": {
+    "requestId": "req_01J9X1234567890ABCDEF12345",
+    "correlationId": "cor_01J9X1234567890ABCDEF12345"
+  }
+}
+```
 
-### 4.4 Tra Cứu Số Dư Điểm Thưởng
+---
+
+### 4.3 Xem Chi Tiết Hồ Sơ Khách Hàng
+`GET /api/v1/customers/{customerId}`  
+Quyền hạn: `loyalty:customer-read`; Cashier, Manager, Owner.
+
+#### Headers & Path Parameters
+- **Headers:** `Authorization: Bearer <token>`, `X-Active-Branch-Id`, `X-Correlation-Id`
+- **Path Parameters:**
+  - `customerId` (UUID, bắt buộc): Định danh khách hàng.
+
+#### Response Body `200 OK`
+```json
+{
+  "data": {
+    "customerId": "0192b2d0-8000-7abc-8d2c-123456789012",
+    "maskedPhone": "+84******567",
+    "displayName": "Nguyễn An",
+    "status": "ACTIVE",
+    "currentTier": "GOLD",
+    "totalSpentMinor": 8500000,
+    "currency": "VND",
+    "createdAt": "2026-01-15T08:30:00Z",
+    "updatedAt": "2026-10-13T09:00:00Z",
+    "version": 4
+  },
+  "meta": {
+    "requestId": "req_01J9X1234567890ABCDEF12345",
+    "correlationId": "cor_01J9X1234567890ABCDEF12345"
+  }
+}
+```
+
+---
+
+### 4.4 Cập Nhật Hồ Sơ Khách Hàng
+`PATCH /api/v1/customers/{customerId}`  
+Quyền hạn: `loyalty:customer-write`; Manager, Owner.
+
+#### Headers
+| Header | Bắt buộc | Giá trị mẫu / Mô tả |
+|---|---:|---|
+| `Authorization` | Có | `Bearer eyJhbGciOiJSUzI1NiIs...` |
+| `If-Match` | Có | `"4"` (Số phiên bản optimistic lock) |
+| `Idempotency-Key` | Có | `idem_cust_patch_01J9X` |
+| `Content-Type` | Có | `application/json` |
+
+#### Request Body
+```json
+{
+  "displayName": "Nguyễn Văn An",
+  "status": "ACTIVE"
+}
+```
+*Quy tắc:* Trong giai đoạn P0 chỉ cho phép chỉnh sửa `displayName` và chuyển đổi trạng thái `status` (`ACTIVE`/`BLOCKED`). Tuyệt đối không cho phép sửa số điện thoại qua lệnh PATCH. Mọi thao tác đều được ghi nhật ký kiểm toán.
+
+#### Response Body `200 OK`
+```json
+{
+  "data": {
+    "customerId": "0192b2d0-8000-7abc-8d2c-123456789012",
+    "maskedPhone": "+84******567",
+    "displayName": "Nguyễn Văn An",
+    "status": "ACTIVE",
+    "currentTier": "GOLD",
+    "updatedAt": "2026-10-13T09:05:00Z",
+    "version": 5
+  },
+  "meta": {
+    "requestId": "req_01J9X1234567890ABCDEF12345",
+    "correlationId": "cor_01J9X1234567890ABCDEF12345"
+  }
+}
+```
+
+---
+
+### 4.5 Tra Cứu Số Dư Điểm Thưởng
 `GET /api/v1/customers/{customerId}/loyalty-balance`  
 Quyền hạn: `loyalty:customer-read`.
 
-Response Body `200 OK`:
+#### Headers & Path Parameters
+- **Headers:** `Authorization: Bearer <token>`, `X-Active-Branch-Id`, `X-Correlation-Id`
+- **Path Parameters:**
+  - `customerId` (UUID, bắt buộc): Định danh khách hàng.
+
+#### Response Body `200 OK`
 ```json
 {
   "data": {
@@ -221,47 +358,115 @@ Response Body `200 OK`:
     "projectionVersion": 154
   },
   "meta": {
-    "requestId": "req_01J...",
-    "correlationId": "cor_01J..."
+    "requestId": "req_01J9X1234567890ABCDEF12345",
+    "correlationId": "cor_01J9X1234567890ABCDEF12345"
   }
 }
 ```
 *Lưu ý:* Nếu bảng tổng hợp số dư đang trong quá trình rebuild hoặc bị trễ vượt ngưỡng an toàn, API trả về lỗi `503 loyalty_temporarily_unavailable` đối với các quyết định giao dịch mutation.
 
-### 4.5 Tra Cứu Lịch Sử Sổ Cái Biến Động Điểm
-`GET /api/v1/customers/{customerId}/ledger`  
-Tham số truy vấn: `cursor`, `limit` (mặc định 20, max 100), `entryType` (`EARNED`, `REDEEMED`, `REVERSED`, `EXPIRED`), khoảng thời gian `from`/`to`, và `sourceType`.
+---
 
-Phần tử dữ liệu phản hồi:
+### 4.6 Tra Cứu Lịch Sử Sổ Cái Biến Động Điểm
+`GET /api/v1/customers/{customerId}/ledger`  
+Quyền hạn: `loyalty:customer-read`.
+
+#### Headers & Query Parameters
+- **Headers:** `Authorization: Bearer <token>`, `X-Active-Branch-Id`, `X-Correlation-Id`
+- **Path Parameters:**
+  - `customerId` (UUID, bắt buộc): Định danh khách hàng.
+- **Query Parameters:**
+  | Tham số | Bắt buộc | Mặc định | Mô tả |
+  |---|---:|---|---|
+  | `cursor` | Không | null | Con trỏ phân trang từ trang trước |
+  | `limit` | Không | 20 | Số lượng bản ghi (tối đa 100) |
+  | `entryType` | Không | null | Lọc theo loại biến động: `EARNED`, `REDEEMED`, `REVERSED`, `EXPIRED` |
+  | `sourceType` | Không | null | Lọc theo nguồn: `ORDER_PAID`, `ORDER_REFUND`, `EXPIRY` |
+  | `from` | Không | null | Dấu thời gian bắt đầu (ISO-8601 UTC) |
+  | `to` | Không | null | Dấu thời gian kết thúc (ISO-8601 UTC) |
+
+#### Response Body `200 OK`
 ```json
 {
-  "entryId": "0192b2d0-8010-7abc-8d2c-123456789012",
-  "entryType": "EARNED",
-  "pointsDelta": 120,
-  "sourceType": "ORDER_PAID",
-  "sourceId": "0192b2d0-7f30-7abc-8d2c-123456789012",
-  "relatedEntryId": null,
-  "policyVersion": 4,
-  "occurredAt": "2026-10-12T09:03:00Z"
+  "data": [
+    {
+      "entryId": "0192b2d0-8010-7abc-8d2c-123456789012",
+      "entryType": "EARNED",
+      "pointsDelta": 120,
+      "sourceType": "ORDER_PAID",
+      "sourceId": "0192b2d0-7f30-7abc-8d2c-123456789012",
+      "relatedEntryId": null,
+      "policyVersion": 4,
+      "occurredAt": "2026-10-12T09:03:00Z"
+    },
+    {
+      "entryId": "0192b2d0-7e00-7abc-8d2c-123456789012",
+      "entryType": "REDEEMED",
+      "pointsDelta": -100,
+      "sourceType": "ORDER_PAID",
+      "sourceId": "0192b2d0-7d10-7abc-8d2c-123456789012",
+      "relatedEntryId": null,
+      "policyVersion": 4,
+      "occurredAt": "2026-10-10T14:20:00Z"
+    }
+  ],
+  "meta": {
+    "pagination": {
+      "hasMore": true,
+      "nextCursor": "eyJvY2N1cnJlZEF0IjoiMjAyNi0xMC0xMFQxNDoyMDowMFoiLCJpZCI6IjAxOTJiMmQwLTdlMDAtN2FiYy04ZDJjLTEyMzQ1Njc4OTAxMiJ9"
+    },
+    "requestId": "req_01J9X1234567890ABCDEF12345",
+    "correlationId": "cor_01J9X1234567890ABCDEF12345"
+  }
 }
 ```
 
-### 4.6 Tra Cứu Danh Sách Voucher Của Khách Hàng
-`GET /api/v1/customers/{customerId}/vouchers`  
-Tham số truy vấn: `cursor`, `limit`, `status` (`AVAILABLE`, `RESERVED`, `CONSUMED`, `EXPIRED`, `RELEASED`), `includeExpired` (mặc định false).
+---
 
-Phần tử dữ liệu phản hồi:
+### 4.7 Tra Cứu Danh Sách Voucher Của Khách Hàng
+`GET /api/v1/customers/{customerId}/vouchers`  
+Quyền hạn: `loyalty:customer-read`.
+
+#### Headers & Query Parameters
+- **Headers:** `Authorization: Bearer <token>`, `X-Active-Branch-Id`, `X-Correlation-Id`
+- **Path Parameters:**
+  - `customerId` (UUID, bắt buộc): Định danh khách hàng.
+- **Query Parameters:**
+  | Tham số | Bắt buộc | Mặc định | Mô tả |
+  |---|---:|---|---|
+  | `cursor` | Không | null | Con trỏ phân trang |
+  | `limit` | Không | 20 | Số lượng bản ghi (tối đa 100) |
+  | `status` | Không | null | Lọc trạng thái: `AVAILABLE`, `RESERVED`, `CONSUMED`, `EXPIRED`, `RELEASED` |
+  | `includeExpired` | Không | false | Có bao gồm voucher đã quá hạn hay không |
+
+#### Response Body `200 OK`
 ```json
 {
-  "voucherId": "0192b2d0-8020-7abc-8d2c-123456789012",
-  "codeMasked": "WELCOME-****",
-  "status": "AVAILABLE",
-  "promotionId": "0192b2d0-8030-7abc-8d2c-123456789012",
-  "validFrom": "2026-10-01T00:00:00Z",
-  "validTo": "2026-10-31T16:59:59Z",
-  "minSpendMinor": 100000,
-  "currency": "VND",
-  "scope": { "branches": ["branch-1"], "channels": ["POS"] }
+  "data": [
+    {
+      "voucherId": "0192b2d0-8020-7abc-8d2c-123456789012",
+      "codeMasked": "WELCOME-****",
+      "status": "AVAILABLE",
+      "promotionId": "0192b2d0-8030-7abc-8d2c-123456789012",
+      "promotionTitle": "Voucher Chào Mừng Thành Viên Mới 10%",
+      "validFrom": "2026-10-01T00:00:00Z",
+      "validTo": "2026-10-31T16:59:59Z",
+      "minSpendMinor": 100000,
+      "currency": "VND",
+      "scope": {
+        "branches": ["0192b2d0-7f23-7abc-8d2c-123456789012"],
+        "channels": ["POS"]
+      }
+    }
+  ],
+  "meta": {
+    "pagination": {
+      "hasMore": false,
+      "nextCursor": null
+    },
+    "requestId": "req_01J9X1234567890ABCDEF12345",
+    "correlationId": "cor_01J9X1234567890ABCDEF12345"
+  }
 }
 ```
 
@@ -271,9 +476,17 @@ Phần tử dữ liệu phản hồi:
 
 ### 5.1 Báo Giá Khuyến Mãi & Giữ Chỗ Điểm/Voucher Nguyên Tử
 `POST /internal/v1/loyalty/checkout-quotes`  
-Xác thực: `loyalty:checkout` Workload Identity; Bắt buộc có header `Idempotency-Key`.
+Xác thực: `loyalty:checkout` Workload Identity / mTLS tin cậy; Bắt buộc có header `Idempotency-Key`.
 
-Request Body:
+#### Headers
+| Header | Bắt buộc | Giá trị mẫu / Mô tả |
+|---|---:|---|
+| `Authorization` | Có | `Bearer <Internal-Workload-Token>` |
+| `Idempotency-Key` | Có | `idem_quote_chk_0192b2d0-8040` |
+| `X-Correlation-Id` | Không | `cor_01J9X1234567890ABCDEF12345` |
+| `Content-Type` | Có | `application/json` |
+
+#### Request Body
 ```json
 {
   "tenantId": "0192b2d0-7f1d-7abc-8d2c-123456789012",
@@ -310,7 +523,7 @@ Request Body:
 - Giỏ hàng `basket` là bản chụp dữ liệu (snapshot) để tính toán chiết khấu; Loyalty Service tuyệt đối không truy vấn ngược vào Catalog hay Order database.
 - Lệnh giữ điểm (`point hold`) và tạm giữ voucher (`voucher reservation`) được thực thi trong cùng một transaction nguyên tử; nếu một trong hai tác vụ thất bại thì toàn bộ transaction sẽ rollback.
 
-Response Body `201 Created`:
+#### Response Body `201 Created`
 ```json
 {
   "data": {
@@ -319,10 +532,18 @@ Response Body `201 Created`:
     "expiresAt": "2026-10-13T09:15:00Z",
     "discountTotalMinor": 12000,
     "lineDiscounts": [
-      { "lineId": "line-1", "discountMinor": 12000, "reason": "WELCOME10" }
+      {
+        "lineId": "line-1",
+        "discountMinor": 12000,
+        "reason": "WELCOME10"
+      }
     ],
     "appliedPromotions": [
-      { "promotionId": "0192b2d0-8030-7abc-8d2c-123456789012", "version": 2, "discountMinor": 12000 }
+      {
+        "promotionId": "0192b2d0-8030-7abc-8d2c-123456789012",
+        "version": 2,
+        "discountMinor": 12000
+      }
     ],
     "rejectedPromotions": [],
     "promotionExplanation": ["WELCOME10 selected in conflict group default-voucher"],
@@ -344,17 +565,24 @@ Response Body `201 Created`:
     }
   },
   "meta": {
-    "requestId": "req_01J...",
-    "correlationId": "cor_01J..."
+    "requestId": "req_01J9X1234567890ABCDEF12345",
+    "correlationId": "cor_01J9X1234567890ABCDEF12345"
   }
 }
 ```
+
+---
 
 ### 5.2 Giải Phóng Lượt Giữ Điểm (Release Point Hold)
 `POST /internal/v1/loyalty/point-holds/{holdId}/release`  
 Xác thực: `loyalty:checkout` Workload Identity.
 
-Request Body:
+#### Headers & Path Parameters
+- **Headers:** `Authorization: Bearer <Workload-Token>`, `Content-Type: application/json`
+- **Path Parameters:**
+  - `holdId` (UUID, bắt buộc): Định danh lượt giữ điểm cần giải phóng.
+
+#### Request Body
 ```json
 {
   "tenantId": "0192b2d0-7f1d-7abc-8d2c-123456789012",
@@ -365,14 +593,126 @@ Request Body:
 ```
 *Quy tắc:* Gửi lại yêu cầu release trên đơn giữ điểm đã ở trạng thái terminal sẽ trả về trạng thái hiện tại một cách idempotent. Yêu cầu sai tenant hoặc sai lượt checkout sẽ bị từ chối với lỗi `403/404` mà không làm lộ dữ liệu.
 
+#### Response Body `200 OK`
+```json
+{
+  "data": {
+    "holdId": "0192b2d0-8080-7abc-8d2c-123456789012",
+    "state": "RELEASED",
+    "releasedPoints": 100,
+    "releasedAt": "2026-10-13T09:05:00Z",
+    "reasonCode": "PAYMENT_FAILED"
+  },
+  "meta": {
+    "requestId": "req_01J9X1234567890ABCDEF12345",
+    "correlationId": "cor_01J9X1234567890ABCDEF12345"
+  }
+}
+```
+
+---
+
 ### 5.3 Giải Phóng Lượt Tạm Giữ Voucher (Release Voucher Reservation)
 `POST /internal/v1/loyalty/voucher-reservations/{reservationId}/release`  
-Xác thực: `loyalty:checkout` Workload Identity. Các trường request: `tenantId`, `checkoutAttemptId`, `reasonCode`, `reason`. Thao tác đảm bảo tính idempotent và không làm giảm bộ đếm số lượt đã sử dụng trong lịch sử vì voucher chưa từng bị tiêu thụ chính thức.
+Xác thực: `loyalty:checkout` Workload Identity.
+
+#### Headers & Path Parameters
+- **Headers:** `Authorization: Bearer <Workload-Token>`, `Content-Type: application/json`
+- **Path Parameters:**
+  - `reservationId` (UUID, bắt buộc): Định danh lượt tạm giữ voucher.
+
+#### Request Body
+```json
+{
+  "tenantId": "0192b2d0-7f1d-7abc-8d2c-123456789012",
+  "checkoutAttemptId": "0192b2d0-8040-7abc-8d2c-123456789012",
+  "reasonCode": "PAYMENT_FAILED",
+  "reason": "Nhà cung cấp thanh toán phản hồi giao dịch thất bại"
+}
+```
+*Quy tắc:* Thao tác đảm bảo tính idempotent và không làm giảm bộ đếm số lượt đã sử dụng trong lịch sử vì voucher chưa từng bị tiêu thụ chính thức.
+
+#### Response Body `200 OK`
+```json
+{
+  "data": {
+    "reservationId": "0192b2d0-8090-7abc-8d2c-123456789012",
+    "voucherId": "0192b2d0-8020-7abc-8d2c-123456789012",
+    "state": "RELEASED",
+    "releasedAt": "2026-10-13T09:05:00Z",
+    "reasonCode": "PAYMENT_FAILED"
+  },
+  "meta": {
+    "requestId": "req_01J9X1234567890ABCDEF12345",
+    "correlationId": "cor_01J9X1234567890ABCDEF12345"
+  }
+}
+```
+
+---
 
 ### 5.4 Các API Đọc & Vận Hành Nội Bộ
-- `GET /internal/v1/loyalty/checkout-attempts/{checkoutAttemptId}`: Đọc trạng thái lượt giữ điểm và voucher phục vụ đối soát quy trình Step Functions Saga.
-- `POST /internal/v1/loyalty/rebuilds`: Bắt đầu tiến trình tái tạo projection số dư điểm theo phạm vi chỉ định (dành riêng cho Worker / Quản trị viên).
-- `POST /internal/v1/loyalty/dlq-replays`: Replay danh sách các sự kiện lỗi từ hàng đợi chết DLQ qua luồng Inbox chuẩn.
+
+#### Tra cứu trạng thái phiên checkout nội bộ
+`GET /internal/v1/loyalty/checkout-attempts/{checkoutAttemptId}`  
+Xác thực: `loyalty:checkout` Workload Identity. Đọc trạng thái lượt giữ điểm và voucher phục vụ đối soát quy trình Step Functions Saga.
+
+#### Response Body `200 OK`
+```json
+{
+  "data": {
+    "checkoutAttemptId": "0192b2d0-8040-7abc-8d2c-123456789012",
+    "orderId": "0192b2d0-7f30-7abc-8d2c-123456789012",
+    "pointHold": {
+      "holdId": "0192b2d0-8080-7abc-8d2c-123456789012",
+      "state": "HELD",
+      "heldPoints": 100
+    },
+    "voucherReservation": {
+      "reservationId": "0192b2d0-8090-7abc-8d2c-123456789012",
+      "state": "RESERVED",
+      "voucherId": "0192b2d0-8020-7abc-8d2c-123456789012"
+    }
+  },
+  "meta": {
+    "requestId": "req_01J9X1234567890ABCDEF12345",
+    "correlationId": "cor_01J9X1234567890ABCDEF12345"
+  }
+}
+```
+
+#### Kích hoạt Rebuild Projection số dư
+`POST /internal/v1/loyalty/rebuilds`  
+Xác thực: `loyalty:replay` Workload Identity. Bắt đầu tiến trình tái tạo projection số dư điểm theo phạm vi chỉ định (dành riêng cho Worker / Quản trị viên).
+
+#### Request Body
+```json
+{
+  "tenantId": "0192b2d0-7f1d-7abc-8d2c-123456789012",
+  "customerId": "0192b2d0-8000-7abc-8d2c-123456789012",
+  "triggerReason": "DISCREPANCY_DETECTED"
+}
+```
+
+#### Response Body `202 Accepted`
+```json
+{
+  "data": {
+    "jobId": "job_rebuild_loyalty_01J9X",
+    "status": "QUEUED",
+    "estimatedDurationSeconds": 10
+  },
+  "meta": {
+    "requestId": "req_01J9X1234567890ABCDEF12345",
+    "correlationId": "cor_01J9X1234567890ABCDEF12345"
+  }
+}
+```
+
+#### Replay sự kiện DLQ
+`POST /internal/v1/loyalty/dlq-replays`  
+Xác thực: `loyalty:replay` Workload Identity. Replay danh sách các sự kiện lỗi từ hàng đợi chết DLQ qua luồng Inbox chuẩn.
+
 
 ---
 
@@ -551,6 +891,292 @@ Bao gồm chi tiết cấu trúc cho: `inbox_events`, `outbox_events`, `audit_ev
 - `idx_active_reservations_expiry`: `(tenant_id, state, expires_at)`.
 - `idx_outbox_pending`: `(publish_state, next_attempt_at, created_at)`.
 - Toàn bộ các ràng buộc kiểm tra số lượng không âm (`CHECK >= 0`), tỷ lệ quy đổi dương, và mã trạng thái hợp lệ.
+
+### 9.6 Các Kịch Bản Migration Flyway (Flyway Migration Scripts)
+
+#### `V1__init_loyalty_customers_and_ledger.sql`
+```sql
+-- Flyway Migration V1: Bảng hồ sơ khách hàng và sổ cái điểm thưởng bất biến
+CREATE TABLE customers (
+    id UUID PRIMARY KEY,
+    tenant_id UUID NOT NULL,
+    phone_ciphertext BYTEA NOT NULL,
+    phone_lookup_hash BYTEA NOT NULL,
+    phone_key_version SMALLINT NOT NULL DEFAULT 1,
+    display_name VARCHAR(200),
+    status VARCHAR(20) NOT NULL DEFAULT 'ACTIVE' CHECK (status IN ('ACTIVE', 'BLOCKED')),
+    current_tier VARCHAR(20) NOT NULL DEFAULT 'SILVER' CHECK (current_tier IN ('SILVER', 'GOLD', 'DIAMOND')),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    version BIGINT NOT NULL DEFAULT 1
+);
+CREATE UNIQUE INDEX uq_customers_tenant_phone_hash ON customers (tenant_id, phone_lookup_hash);
+CREATE INDEX idx_customers_tenant_status ON customers (tenant_id, status);
+COMMENT ON TABLE customers IS 'Hồ sơ khách hàng định danh bằng số điện thoại được mã hóa (PII protection)';
+
+CREATE TABLE point_ledger_entries (
+    id UUID PRIMARY KEY,
+    tenant_id UUID NOT NULL,
+    customer_id UUID NOT NULL REFERENCES customers(id) ON DELETE RESTRICT,
+    entry_type VARCHAR(20) NOT NULL CHECK (entry_type IN ('EARNED', 'REDEEMED', 'REVERSED', 'EXPIRED')),
+    points_delta BIGINT NOT NULL CHECK (points_delta <> 0),
+    source_type VARCHAR(30) NOT NULL CHECK (source_type IN ('ORDER_PAID', 'ORDER_REFUND', 'POINT_HOLD', 'EXPIRY', 'MANUAL_ADJUSTMENT')),
+    source_id UUID NOT NULL,
+    related_entry_id UUID REFERENCES point_ledger_entries(id) ON DELETE RESTRICT,
+    policy_version BIGINT,
+    idempotency_key VARCHAR(128) NOT NULL,
+    occurred_at TIMESTAMPTZ NOT NULL,
+    metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE UNIQUE INDEX uq_ledger_accrual_source ON point_ledger_entries (tenant_id, source_type, source_id, entry_type);
+CREATE INDEX idx_ledger_customer_time ON point_ledger_entries (tenant_id, customer_id, occurred_at DESC, id);
+COMMENT ON TABLE point_ledger_entries IS 'Sổ cái điểm thưởng bất biến chỉ ghi thêm (append-only ledger)';
+```
+
+#### `V2__init_point_lots_and_holds.sql`
+```sql
+-- Flyway Migration V2: Quản lý lô điểm FIFO, lệnh giữ điểm và tổng hợp số dư
+CREATE TABLE point_lots (
+    id UUID PRIMARY KEY,
+    tenant_id UUID NOT NULL,
+    customer_id UUID NOT NULL REFERENCES customers(id) ON DELETE RESTRICT,
+    source_entry_id UUID NOT NULL REFERENCES point_ledger_entries(id) ON DELETE RESTRICT,
+    earned_at TIMESTAMPTZ NOT NULL,
+    expires_at TIMESTAMPTZ NOT NULL,
+    original_points BIGINT NOT NULL CHECK (original_points > 0),
+    remaining_points BIGINT NOT NULL CHECK (remaining_points >= 0 AND remaining_points <= original_points),
+    status VARCHAR(20) NOT NULL DEFAULT 'OPEN' CHECK (status IN ('OPEN', 'DEPLETED', 'EXPIRED')),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    version BIGINT NOT NULL DEFAULT 1
+);
+CREATE INDEX idx_point_lots_fifo ON point_lots (tenant_id, customer_id, expires_at, earned_at, id);
+COMMENT ON TABLE point_lots IS 'Lô điểm phục vụ khấu trừ theo nguyên tắc FIFO';
+
+CREATE TABLE point_lot_allocations (
+    id UUID PRIMARY KEY,
+    tenant_id UUID NOT NULL,
+    lot_id UUID NOT NULL REFERENCES point_lots(id) ON DELETE RESTRICT,
+    customer_id UUID NOT NULL REFERENCES customers(id) ON DELETE RESTRICT,
+    allocation_type VARCHAR(20) NOT NULL CHECK (allocation_type IN ('HOLD', 'REDEEM', 'RELEASE', 'REVERSE', 'EXPIRE')),
+    source_type VARCHAR(30) NOT NULL,
+    source_id UUID NOT NULL,
+    points BIGINT NOT NULL CHECK (points > 0),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX idx_allocations_source ON point_lot_allocations (tenant_id, source_type, source_id);
+
+CREATE TABLE point_holds (
+    id UUID PRIMARY KEY,
+    tenant_id UUID NOT NULL,
+    customer_id UUID NOT NULL REFERENCES customers(id) ON DELETE RESTRICT,
+    order_id UUID NOT NULL,
+    checkout_attempt_id UUID NOT NULL,
+    requested_points BIGINT NOT NULL CHECK (requested_points >= 0),
+    held_points BIGINT NOT NULL CHECK (held_points >= 0),
+    state VARCHAR(20) NOT NULL DEFAULT 'HELD' CHECK (state IN ('HELD', 'COMMITTED', 'RELEASED', 'EXPIRED')),
+    expires_at TIMESTAMPTZ NOT NULL,
+    idempotency_key VARCHAR(128) NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    version BIGINT NOT NULL DEFAULT 1
+);
+CREATE UNIQUE INDEX uq_point_hold_checkout_attempt ON point_holds (tenant_id, checkout_attempt_id);
+CREATE INDEX idx_point_holds_expiry ON point_holds (tenant_id, state, expires_at);
+COMMENT ON TABLE point_holds IS 'Lệnh giữ điểm tạm thời trong phiên checkout Saga';
+
+CREATE TABLE loyalty_balances (
+    tenant_id UUID NOT NULL,
+    customer_id UUID NOT NULL REFERENCES customers(id) ON DELETE RESTRICT,
+    earned_points BIGINT NOT NULL DEFAULT 0 CHECK (earned_points >= 0),
+    redeemed_points BIGINT NOT NULL DEFAULT 0 CHECK (redeemed_points >= 0),
+    reversed_points BIGINT NOT NULL DEFAULT 0 CHECK (reversed_points >= 0),
+    expired_points BIGINT NOT NULL DEFAULT 0 CHECK (expired_points >= 0),
+    held_points BIGINT NOT NULL DEFAULT 0 CHECK (held_points >= 0),
+    available_points BIGINT NOT NULL DEFAULT 0 CHECK (available_points >= 0),
+    projection_version BIGINT NOT NULL DEFAULT 1,
+    calculated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT pk_loyalty_balances PRIMARY KEY (tenant_id, customer_id)
+);
+COMMENT ON TABLE loyalty_balances IS 'Read model tổng hợp số dư điểm thưởng có thể tính toán lại hoàn toàn từ ledger';
+```
+
+#### `V3__init_loyalty_policies_and_tiers.sql`
+```sql
+-- Flyway Migration V3: Chính sách tích/đổi điểm và cấu hình hạng thành viên
+CREATE TABLE loyalty_point_policies (
+    id UUID PRIMARY KEY,
+    tenant_id UUID NOT NULL,
+    earn_rate_basis_points INT NOT NULL DEFAULT 1000, -- 10% = 1000 bps
+    redeem_rate_points_per_minor INT NOT NULL DEFAULT 1, -- 1 điểm = 100 VND
+    max_redeem_percent_order INT NOT NULL DEFAULT 50 CHECK (max_redeem_percent_order >= 0 AND max_redeem_percent_order <= 100),
+    point_validity_days INT NOT NULL DEFAULT 365,
+    is_active BOOLEAN NOT NULL DEFAULT true,
+    published_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    version BIGINT NOT NULL DEFAULT 1
+);
+CREATE INDEX idx_point_policies_active ON loyalty_point_policies (tenant_id, is_active, version DESC);
+
+CREATE TABLE membership_tier_configs (
+    id UUID PRIMARY KEY,
+    tenant_id UUID NOT NULL,
+    tier_name VARCHAR(20) NOT NULL CHECK (tier_name IN ('SILVER', 'GOLD', 'DIAMOND')),
+    min_spend_minor BIGINT NOT NULL DEFAULT 0 CHECK (min_spend_minor >= 0),
+    min_points_earned BIGINT NOT NULL DEFAULT 0 CHECK (min_points_earned >= 0),
+    tier_discount_percent_bps INT NOT NULL DEFAULT 0,
+    validity_months INT NOT NULL DEFAULT 12,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT uq_tier_config_tenant_tier UNIQUE (tenant_id, tier_name)
+);
+
+CREATE TABLE membership_tier_history (
+    id UUID PRIMARY KEY,
+    tenant_id UUID NOT NULL,
+    customer_id UUID NOT NULL REFERENCES customers(id) ON DELETE RESTRICT,
+    from_tier VARCHAR(20) NOT NULL,
+    to_tier VARCHAR(20) NOT NULL,
+    reason VARCHAR(100) NOT NULL,
+    effective_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX idx_tier_history_customer ON membership_tier_history (tenant_id, customer_id, effective_at DESC);
+```
+
+#### `V4__init_promotions_and_vouchers.sql`
+```sql
+-- Flyway Migration V4: Quản lý chương trình khuyến mãi và voucher
+CREATE TABLE promotions (
+    id UUID PRIMARY KEY,
+    tenant_id UUID NOT NULL,
+    name VARCHAR(255) NOT NULL,
+    description TEXT,
+    is_active BOOLEAN NOT NULL DEFAULT true,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE promotion_versions (
+    id UUID PRIMARY KEY,
+    promotion_id UUID NOT NULL REFERENCES promotions(id) ON DELETE CASCADE,
+    tenant_id UUID NOT NULL,
+    version INT NOT NULL,
+    rule_type VARCHAR(30) NOT NULL CHECK (rule_type IN ('PERCENT_DISCOUNT', 'BUY_X_GET_Y', 'HAPPY_HOUR')),
+    priority INT NOT NULL DEFAULT 100,
+    stackable BOOLEAN NOT NULL DEFAULT false,
+    conflict_group VARCHAR(64) NOT NULL DEFAULT 'default',
+    scope_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    rule_config JSONB NOT NULL,
+    valid_from TIMESTAMPTZ NOT NULL,
+    valid_to TIMESTAMPTZ NOT NULL,
+    is_published BOOLEAN NOT NULL DEFAULT false,
+    published_at TIMESTAMPTZ,
+    CONSTRAINT uq_promotion_version UNIQUE (promotion_id, version)
+);
+CREATE INDEX idx_promo_versions_scope ON promotion_versions (tenant_id, is_published, valid_from, valid_to);
+
+CREATE TABLE vouchers (
+    id UUID PRIMARY KEY,
+    tenant_id UUID NOT NULL,
+    promotion_id UUID NOT NULL REFERENCES promotions(id) ON DELETE RESTRICT,
+    code_normalized VARCHAR(64) NOT NULL,
+    customer_id UUID REFERENCES customers(id) ON DELETE RESTRICT,
+    status VARCHAR(20) NOT NULL DEFAULT 'AVAILABLE' CHECK (status IN ('AVAILABLE', 'RESERVED', 'CONSUMED', 'EXPIRED', 'RELEASED')),
+    min_spend_minor BIGINT NOT NULL DEFAULT 0,
+    valid_from TIMESTAMPTZ NOT NULL,
+    valid_to TIMESTAMPTZ NOT NULL,
+    scope_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE UNIQUE INDEX uq_voucher_tenant_code ON vouchers (tenant_id, code_normalized);
+CREATE INDEX idx_vouchers_customer ON vouchers (tenant_id, customer_id, status);
+
+CREATE TABLE voucher_reservations (
+    id UUID PRIMARY KEY,
+    tenant_id UUID NOT NULL,
+    voucher_id UUID NOT NULL REFERENCES vouchers(id) ON DELETE RESTRICT,
+    customer_id UUID NOT NULL REFERENCES customers(id) ON DELETE RESTRICT,
+    checkout_attempt_id UUID NOT NULL,
+    state VARCHAR(20) NOT NULL DEFAULT 'RESERVED' CHECK (state IN ('RESERVED', 'COMMITTED', 'RELEASED', 'EXPIRED')),
+    expires_at TIMESTAMPTZ NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE UNIQUE INDEX uq_voucher_reservation_attempt ON voucher_reservations (tenant_id, voucher_id, checkout_attempt_id, customer_id);
+CREATE INDEX idx_active_reservations_expiry ON voucher_reservations (tenant_id, state, expires_at);
+
+CREATE TABLE voucher_usages (
+    id UUID PRIMARY KEY,
+    tenant_id UUID NOT NULL,
+    voucher_id UUID NOT NULL REFERENCES vouchers(id) ON DELETE RESTRICT,
+    customer_id UUID NOT NULL REFERENCES customers(id) ON DELETE RESTRICT,
+    order_id UUID NOT NULL,
+    checkout_attempt_id UUID NOT NULL,
+    promotion_version INT NOT NULL,
+    discount_amount_minor BIGINT NOT NULL CHECK (discount_amount_minor >= 0),
+    consumed_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE UNIQUE INDEX uq_voucher_usage_attempt ON voucher_usages (tenant_id, voucher_id, checkout_attempt_id);
+```
+
+#### `V5__init_loyalty_inbox_outbox_audit.sql`
+```sql
+-- Flyway Migration V5: Inbox, Outbox và Bảng Audit sự kiện
+CREATE TABLE loyalty_inbox_events (
+    id UUID PRIMARY KEY,
+    tenant_id UUID NOT NULL,
+    event_id VARCHAR(128) NOT NULL,
+    event_type VARCHAR(64) NOT NULL,
+    producer VARCHAR(64) NOT NULL,
+    payload JSONB NOT NULL,
+    processed_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE UNIQUE INDEX uq_inbox_event ON loyalty_inbox_events (tenant_id, event_id);
+
+CREATE TABLE loyalty_outbox_events (
+    id UUID PRIMARY KEY,
+    tenant_id UUID NOT NULL,
+    event_id UUID NOT NULL,
+    event_type VARCHAR(64) NOT NULL,
+    event_version INT NOT NULL DEFAULT 1,
+    payload JSONB NOT NULL,
+    publish_state VARCHAR(20) NOT NULL DEFAULT 'PENDING' CHECK (publish_state IN ('PENDING', 'PUBLISHED', 'FAILED')),
+    next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    retry_count INT NOT NULL DEFAULT 0,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX idx_outbox_pending ON loyalty_outbox_events (publish_state, next_attempt_at, created_at);
+
+CREATE TABLE loyalty_audit_events (
+    id UUID PRIMARY KEY,
+    tenant_id UUID NOT NULL,
+    branch_id UUID,
+    actor_id VARCHAR(64) NOT NULL,
+    actor_role VARCHAR(64) NOT NULL,
+    action VARCHAR(64) NOT NULL,
+    resource_type VARCHAR(64) NOT NULL,
+    resource_id VARCHAR(64) NOT NULL,
+    changes JSONB,
+    occurred_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX idx_loyalty_audit_tenant_time ON loyalty_audit_events (tenant_id, occurred_at DESC);
+```
+
+#### `V6__init_loyalty_worker_runs.sql`
+```sql
+-- Flyway Migration V6: Bảng quản lý worker chạy nền và dọn dẹp phiếu giữ hết hạn
+CREATE TABLE loyalty_worker_runs (
+    id UUID PRIMARY KEY,
+    job_type VARCHAR(64) NOT NULL,
+    status VARCHAR(20) NOT NULL DEFAULT 'RUNNING' CHECK (status IN ('RUNNING', 'COMPLETED', 'FAILED')),
+    items_processed INT NOT NULL DEFAULT 0,
+    started_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    completed_at TIMESTAMPTZ,
+    error_message TEXT
+);
+CREATE INDEX idx_worker_runs_type_time ON loyalty_worker_runs (job_type, started_at DESC);
+```
+
 
 ---
 

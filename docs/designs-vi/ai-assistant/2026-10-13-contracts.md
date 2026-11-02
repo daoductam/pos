@@ -161,6 +161,18 @@ API công khai tuyệt đối không làm lộ danh mục công cụ nội bộ,
 
 `POST /api/v1/ai/conversations`
 
+API khởi tạo ngữ cảnh hội thoại AI cho chủ chuỗi hoặc quản lý chi nhánh. Máy chủ thẩm định quyền hạn trực tuyến với Identity Service và chỉ cấp phạm vi hợp lệ.
+
+#### Tiêu đề Yêu cầu (Headers)
+```http
+Authorization: Bearer <Cognito JWT Token>
+Content-Type: application/json
+Accept: application/json
+X-Correlation-ID: 0192b2d0-7f1d-7abc-8d2c-123456789001
+Idempotency-Key: 0192b2d0-7f1d-7abc-8d2c-123456789002
+```
+
+#### Request Body Mẫu
 ```json
 {
   "requestedScope": {
@@ -173,16 +185,13 @@ API công khai tuyệt đối không làm lộ danh mục công cụ nội bộ,
 ```
 
 | Trường | Kiểu dữ liệu | Bắt buộc | Quy tắc nghiệp vụ |
-|---|---|---:|---|
-| `requestedScope.type` | enum | Có | `TENANT` hoặc `BRANCH` |
-| `requestedScope.branchIds` | UUID[] | Có điều kiện | Bắt buộc khi là `BRANCH`; tối đa 20 chi nhánh; máy chủ thẩm định |
-| `locale` | string | Không | Danh mục cho phép; mặc định `vi-VN` |
+|---|---|:---:|---|
+| `requestedScope.type` | enum (`TENANT`, `BRANCH`) | Có | Loại phạm vi truy vấn dữ liệu |
+| `requestedScope.branchIds` | UUID[] | Có điều kiện | Bắt buộc khi `type=BRANCH`; tối đa 20 chi nhánh; máy chủ thẩm định quyền sở hữu |
+| `locale` | string | Không | Mã ngôn ngữ cho phép; mặc định `vi-VN` |
 | `clientReference` | string | Không | Tối đa 128 ký tự; chỉ dùng truy vết UI; cấm chứa PII |
 
-Máy chủ bỏ qua các thông tin tenant/vai trò/quyền do client tự gửi và trả về phiên bản phạm vi quyền do chính máy chủ giải quyết.
-
-### 4.2 ConversationResponse
-
+#### Phản hồi Thành Công `201 Created`
 ```json
 {
   "data": {
@@ -197,16 +206,126 @@ Máy chủ bỏ qua các thông tin tenant/vai trò/quyền do client tự gửi
     "expiresAt": "2026-10-13T10:00:00Z",
     "createdAt": "2026-10-13T08:00:00Z"
   },
-  "meta": {"requestId": "req_01J...", "correlationId": "cor_01J..."}
+  "meta": {
+    "requestId": "req_0192b2d0-7f1d-7abc-8d2c-123456789001",
+    "correlationId": "cor_0192b2d0-7f1d-7abc-8d2c-123456789002",
+    "timestamp": "2026-10-13T08:00:00Z"
+  }
 }
 ```
 
-Phản hồi không trả về `subjectId`, danh sách thành viên chi tiết, Cognito subject, prompt thô hay thông tin chi tiết nhà cung cấp.
+#### Phản hồi Lỗi Thường Gặp
+- `401 Unauthorized` (`code: "unauthorized"`): JWT token thiếu hoặc hết hạn.
+- `403 Forbidden` (`code: "forbidden"`): Người dùng không có quyền `ai:report:read` trên chi nhánh yêu cầu.
+- `422 Unprocessable Entity` (`code: "validation_error"`): Chi nhánh không tồn tại hoặc vượt quá 20 chi nhánh.
 
-### 4.3 Tạo lượt hỏi đáp mới (Create Turn)
+---
+
+### 4.2 Chi tiết cuộc hội thoại (Get Conversation Detail)
+
+`GET /api/v1/ai/conversations/{conversationId}`
+
+Truy vấn thông tin chi tiết và trạng thái hiệu lực của một cuộc hội thoại.
+
+#### Tiêu đề Yêu cầu (Headers)
+```http
+Authorization: Bearer <Cognito JWT Token>
+Accept: application/json
+X-Correlation-ID: 0192b2d0-7f1d-7abc-8d2c-123456789001
+```
+
+#### Tham số Đường dẫn (Path Parameters)
+| Tham số | Kiểu | Bắt buộc | Mô tả |
+|---|---|:---:|---|
+| `conversationId` | UUIDv7 | Có | Mã định danh cuộc hội thoại |
+
+#### Phản hồi Thành Công `200 OK`
+```json
+{
+  "data": {
+    "conversationId": "0192b2d0-7f1d-7abc-8d2c-123456789010",
+    "status": "ACTIVE",
+    "scope": {
+      "type": "BRANCH",
+      "branchIds": ["0192b2d0-7f1d-7abc-8d2c-123456789002"],
+      "authorizationVersion": 7
+    },
+    "policyVersion": "ai-policy-v1",
+    "totalTurns": 3,
+    "expiresAt": "2026-10-13T10:00:00Z",
+    "createdAt": "2026-10-13T08:00:00Z",
+    "updatedAt": "2026-10-13T08:15:20Z"
+  },
+  "meta": {
+    "requestId": "req_0192b2d0-7f1d-7abc-8d2c-123456789001",
+    "correlationId": "cor_0192b2d0-7f1d-7abc-8d2c-123456789002",
+    "timestamp": "2026-10-13T08:15:21Z"
+  }
+}
+```
+
+---
+
+### 4.3 Danh sách lượt hỏi đáp trong hội thoại (List Conversation Turns)
+
+`GET /api/v1/ai/conversations/{conversationId}/turns`
+
+Truy vấn lịch sử các lượt hỏi đáp trong hội thoại theo cơ chế phân trang con trỏ (Cursor Pagination).
+
+#### Tiêu đề Yêu cầu (Headers)
+```http
+Authorization: Bearer <Cognito JWT Token>
+Accept: application/json
+X-Correlation-ID: 0192b2d0-7f1d-7abc-8d2c-123456789001
+```
+
+#### Tham số Truy vấn (Query Parameters)
+| Tham số | Kiểu | Mặc định | Mô tả |
+|---|---|:---:|---|
+| `limit` | integer | 20 | Số bản ghi trên mỗi trang (tối đa 50) |
+| `cursor` | string | null | Con trỏ phân trang trả về từ trang trước |
+
+#### Phản hồi Thành Công `200 OK`
+```json
+{
+  "data": [
+    {
+      "turnId": "0192b2d0-7f1d-7abc-8d2c-123456789011",
+      "conversationId": "0192b2d0-7f1d-7abc-8d2c-123456789010",
+      "status": "ANSWERED",
+      "headline": "Doanh thu giảm 12,4%",
+      "createdAt": "2026-10-13T08:00:05Z"
+    }
+  ],
+  "meta": {
+    "limit": 20,
+    "hasMore": false,
+    "nextCursor": null,
+    "requestId": "req_0192b2d0-7f1d-7abc-8d2c-123456789001",
+    "correlationId": "cor_0192b2d0-7f1d-7abc-8d2c-123456789002",
+    "timestamp": "2026-10-13T08:16:00Z"
+  }
+}
+```
+
+---
+
+### 4.4 Tạo lượt hỏi đáp mới (Create Turn)
 
 `POST /api/v1/ai/conversations/{conversationId}/turns`
 
+Gửi câu hỏi báo cáo phân tích vào cuộc hội thoại. Hệ thống hỗ trợ xử lý đồng bộ (trả kết quả ngay nếu câu trả lời đã sẵn sàng trong cache hoặc mô hình phản hồi nhanh) hoặc xử lý bất đồng bộ (trả `202 Accepted` kèm URL polling).
+
+#### Tiêu đề Yêu cầu (Headers)
+```http
+Authorization: Bearer <Cognito JWT Token>
+Content-Type: application/json
+Accept: application/json
+X-Correlation-ID: 0192b2d0-7f1d-7abc-8d2c-123456789001
+Idempotency-Key: 0192b2d0-7f1d-7abc-8d2c-123456789003
+```
+
+#### Request Body Mẫu
 ```json
 {
   "clientTurnId": "turn-client-0004",
@@ -220,17 +339,14 @@ Phản hồi không trả về `subjectId`, danh sách thành viên chi tiết, 
 ```
 
 | Trường | Kiểu dữ liệu | Bắt buộc | Quy tắc nghiệp vụ |
-|---|---|---:|---|
+|---|---|:---:|---|
 | `clientTurnId` | string | Có | Tối đa 128 ký tự; duy nhất trong hội thoại; là khóa lũy quyền |
 | `question` | string | Có | 1–4.000 ký tự Unicode; luôn bị coi là dữ liệu không đáng tin cậy |
 | `requestedPeriod` | object/null | Không | Máy chủ tự chuẩn hóa khoảng thời gian/múi giờ chính xác |
 | `requestedScope` | object/null | Không | Phải là tập con của phạm vi quyền hiện hành |
 | `responseMode` | enum | Không | `TEXT_WITH_PROVENANCE`; MVP không hỗ trợ chế độ xem công cụ thô |
 
-Máy chủ chuẩn hóa ngày tháng, giải quyết lại phạm vi quyền, kiểm tra chính sách và tiến hành thực thi. Câu hỏi thô không được lưu trực tiếp; hệ thống chỉ lưu mã băm kèm muối (keyed hash) và ngữ cảnh ngữ nghĩa đã che giấu thông tin nhạy cảm.
-
-### 4.4 TurnResponse
-
+#### Phản hồi Thành Công Đồng Bộ `200 OK`
 ```json
 {
   "data": {
@@ -238,8 +354,8 @@ Máy chủ chuẩn hóa ngày tháng, giải quyết lại phạm vi quyền, ki
     "conversationId": "0192b2d0-7f1d-7abc-8d2c-123456789010",
     "status": "ANSWERED",
     "answer": {
-      "text": "Doanh thu ...",
       "headline": "Doanh thu giảm 12,4%",
+      "text": "Doanh thu chi nhánh Quận 1 tuần này đạt 12.400.000 đ, giảm 12,4% so với cùng kỳ tuần trước (14.155.200 đ). Nguyên nhân chính do món Trà sữa Ô long nướng giảm lượng bán vào buổi chiều.",
       "warnings": []
     },
     "scope": {
@@ -267,16 +383,15 @@ Máy chủ chuẩn hóa ngày tháng, giải quyết lại phạm vi quyền, ki
     "warnings": [],
     "createdAt": "2026-10-13T08:00:05Z"
   },
-  "meta": {"requestId": "req_01J...", "correlationId": "cor_01J..."}
+  "meta": {
+    "requestId": "req_0192b2d0-7f1d-7abc-8d2c-123456789001",
+    "correlationId": "cor_0192b2d0-7f1d-7abc-8d2c-123456789002",
+    "timestamp": "2026-10-13T08:00:05Z"
+  }
 }
 ```
 
-Danh sách các giá trị `status` cho phép: `QUEUED`, `RUNNING`, `ANSWERED`, `NEEDS_SCOPE`, `UNSUPPORTED`, `NO_DATA`, `STALE_DATA`, `PARTIAL`, `PROVIDER_UNAVAILABLE`, `EXPIRED`, `FAILED`.
-
-Phản hồi `202` trả về cùng `turnId`, trạng thái và đường dẫn polling; tuyệt đối không đánh dấu nội dung chưa hoàn chỉnh là kết quả cuối cùng.
-
-Cấu trúc chuẩn của phản hồi trong hàng đợi (Queued Response):
-
+#### Phản hồi Chờ Xử Lý `202 Accepted` (Polling Mode)
 ```json
 {
   "data": {
@@ -287,11 +402,15 @@ Cấu trúc chuẩn của phản hồi trong hàng đợi (Queued Response):
     "pollAfterMs": 500,
     "expiresAt": "2026-10-13T08:00:30Z"
   },
-  "meta": {"requestId": "req_01J...", "correlationId": "cor_01J..."}
+  "meta": {
+    "requestId": "req_0192b2d0-7f1d-7abc-8d2c-123456789001",
+    "correlationId": "cor_0192b2d0-7f1d-7abc-8d2c-123456789002",
+    "timestamp": "2026-10-13T08:00:00Z"
+  }
 }
 ```
 
-Client tiến hành polling định kỳ cho đến khi nhận được trạng thái kết thúc (`ANSWERED`, `NEEDS_SCOPE`, `UNSUPPORTED`, `NO_DATA`, `STALE_DATA`, `PARTIAL`, `PROVIDER_UNAVAILABLE`, `EXPIRED` hoặc `FAILED`). Giá trị `pollAfterMs` nằm trong khoảng `250..5000` mili-giây; nếu lượt hỏi hết hạn sẽ trả về mã `409 turn_expired`. Các trạng thái `PROVIDER_UNAVAILABLE` và `FAILED` chỉ chứa `safeFacts` hoặc `warningCodes` nếu có và tuyệt đối không trả câu trả lời chưa qua kiểm định. Không tồn tại câu trả lời thành công nào có trạng thái `QUEUED` hay `RUNNING`.
+---
 
 ### 4.4.1 Schema chuẩn cho câu trả lời an toàn (Normative Safe Answer Schema)
 
@@ -311,47 +430,181 @@ Trường `answer_payload` chỉ được chấp nhận khi khớp chính xác v
 
 Các trường `headline`, `text`, `claims`, `sourceRefs` và `warnings` là bắt buộc; `claims[].sourceRef` phải tham chiếu đến một lần thực thi công cụ hợp lệ trong cùng lượt hỏi. Các con số trong văn bản được kiểm tra đối chiếu chặt chẽ với claims/facts sau khi áp dụng quy tắc làm tròn đã cấu hình. Bộ xác thực sẽ từ chối chuỗi ký tự dạng số điện thoại, ID thô của UUID/đơn hàng/thanh toán, câu lệnh SQL, văn bản hướng dẫn prompt và các luận điểm không có căn cứ. Mọi thất bại trong khâu che giấu dữ liệu hoặc đối soát đều được gán mã `privacy_redaction_failed`/`provider_output_invalid` và đóng ngắt an toàn.
 
-### 4.5 Danh sách và chi tiết tóm tắt ngày (Summary List/Detail)
+---
+
+### 4.5 Chi tiết lượt hỏi đáp / Endpoint Polling (Get Turn Detail)
+
+`GET /api/v1/ai/conversations/{conversationId}/turns/{turnId}`
+
+Dùng để lấy chi tiết lượt hỏi hoặc để client thăm dò (polling) khi nhận mã phản hồi `202 Accepted`.
+
+#### Tiêu đề Yêu cầu (Headers)
+```http
+Authorization: Bearer <Cognito JWT Token>
+Accept: application/json
+X-Correlation-ID: 0192b2d0-7f1d-7abc-8d2c-123456789001
+```
+
+#### Tham số Đường dẫn (Path Parameters)
+| Tham số | Kiểu | Bắt buộc | Mô tả |
+|---|---|:---:|---|
+| `conversationId` | UUIDv7 | Có | Mã định danh cuộc hội thoại |
+| `turnId` | UUIDv7 | Có | Mã định danh lượt hỏi đáp |
+
+#### Phản hồi Thành Công `200 OK` (Khi trạng thái là `ANSWERED`)
+Cấu trúc dữ liệu tương tự phản hồi `200 OK` của mục 4.4. Nếu trạng thái vẫn là `QUEUED` hoặc `RUNNING`, trả về mã `200 OK` với thông tin `pollAfterMs` và `status`.
+
+---
+
+### 4.6 Danh sách bản tóm tắt ngày (List Daily Summaries)
 
 `GET /api/v1/ai/daily-summaries`
 
-Danh mục bộ lọc cho phép: `branchId` (chỉ áp dụng với Owner hoặc chi nhánh được phân công của Manager), `businessDateFrom`, `businessDateTo`, `status`, `cursor`, `limit`. Máy chủ sẽ từ chối các ngày nằm ngoài chính sách lưu trữ hoặc ngoài thẩm quyền của vai trò.
+Truy vấn danh sách các bản tóm tắt kinh doanh ngày được AI tự động tạo sau giờ chốt ca.
 
-`SummaryResponse` bao gồm:
+#### Tiêu đề Yêu cầu (Headers)
+```http
+Authorization: Bearer <Cognito JWT Token>
+Accept: application/json
+X-Correlation-ID: 0192b2d0-7f1d-7abc-8d2c-123456789001
+```
 
-- `summaryId`, `tenantId` (lược bỏ khỏi UI trừ khi chính sách phong bì cha cho phép);
-- `branchId`, `businessDate`, `timezone`;
-- `status`: `PUBLISHED`, `NO_BASELINE`, `DATA_LATE`, `PROVIDER_UNAVAILABLE`, `FAILED`, `SUPERSEDED`; trạng thái `READY` chỉ là trạng thái của `ai_daily_summary_jobs`, không phải của bản tóm tắt;
-- `revision`, `supersedesSummaryId`, `supersededBySummaryId`;
-- `safeContent` đã qua kiểm định (tiêu đề, thực tế/mốc so sánh, các yếu tố đóng góp, lưu ý);
-- Mốc kiểm chứng nguồn / phiên bản tính toán / chính sách / mô hình;
-- `generatedAt`, `publishedAt`, `lastUpdatedAt`.
+#### Tham số Truy vấn (Query Parameters)
+| Tham số | Kiểu | Bắt buộc | Mô tả |
+|---|---|:---:|---|
+| `branchId` | UUID | Không | Lọc theo chi nhánh (bắt buộc với Manager) |
+| `businessDateFrom` | date (YYYY-MM-DD) | Không | Ngày kinh doanh bắt đầu |
+| `businessDateTo` | date (YYYY-MM-DD) | Không | Ngày kinh doanh kết thúc |
+| `status` | string | Không | Trạng thái: `PUBLISHED`, `DATA_LATE`, `NO_BASELINE`, `FAILED` |
+| `limit` | integer | Không | Số bản ghi (mặc định 20, tối đa 100) |
+| `cursor` | string | Không | Con trỏ phân trang |
 
-Cấu trúc chuẩn của `safeContent`:
-
+#### Phản hồi Thành Công `200 OK`
 ```json
 {
-  "headline": "Doanh thu giảm 12,4%",
-  "actual": {"metric": "NET_REVENUE", "valueMinor": 12400000, "currency": "VND"},
-  "baseline": {"type": "SAME_WEEKDAY_LAST_WEEK", "valueMinor": 14155200},
-  "deltaRatio": "-0.124",
-  "drivers": [{"safeLabel": "Trà sữa truyền thống", "signedDeltaMinor": -600000, "causalEvidence": false}],
-  "caveats": ["Dữ liệu đã hoàn tất đến 17:00 giờ địa phương."],
-  "wordingMode": "OBSERVED_CONTRIBUTION"
+  "data": [
+    {
+      "summaryId": "0192b2d0-7f1d-7abc-8d2c-123456789060",
+      "branchId": "0192b2d0-7f1d-7abc-8d2c-123456789002",
+      "businessDate": "2026-10-12",
+      "timezone": "Asia/Ho_Chi_Minh",
+      "status": "PUBLISHED",
+      "revision": 1,
+      "headline": "Doanh thu giảm 12,4%",
+      "publishedAt": "2026-10-12T17:30:00Z"
+    }
+  ],
+  "meta": {
+    "limit": 20,
+    "hasMore": false,
+    "nextCursor": null,
+    "requestId": "req_0192b2d0-7f1d-7abc-8d2c-123456789001",
+    "correlationId": "cor_0192b2d0-7f1d-7abc-8d2c-123456789002",
+    "timestamp": "2026-10-13T08:20:00Z"
+  }
 }
 ```
 
-Quy định `wordingMode=OBSERVED_CONTRIBUTION` là bắt buộc trừ khi mọi yếu tố đóng góp đều có cờ khẳng định `causalEvidence=true`. Toàn bộ `safeContent` phải được xác thực theo schema và rà soát PII/ID trước khi hiển thị tới người dùng.
+---
 
-### 4.6 Yêu cầu chạy lại tóm tắt (Summary Rerun)
+### 4.7 Chi tiết bản tóm tắt ngày (Get Daily Summary Detail)
+
+`GET /api/v1/ai/daily-summaries/{summaryId}`
+
+Truy vấn toàn văn nội dung bản tóm tắt an toàn và các nhân tố đóng góp (drivers).
+
+#### Tiêu đề Yêu cầu (Headers)
+```http
+Authorization: Bearer <Cognito JWT Token>
+Accept: application/json
+X-Correlation-ID: 0192b2d0-7f1d-7abc-8d2c-123456789001
+```
+
+#### Phản hồi Thành Công `200 OK`
+```json
+{
+  "data": {
+    "summaryId": "0192b2d0-7f1d-7abc-8d2c-123456789060",
+    "branchId": "0192b2d0-7f1d-7abc-8d2c-123456789002",
+    "businessDate": "2026-10-12",
+    "timezone": "Asia/Ho_Chi_Minh",
+    "status": "PUBLISHED",
+    "revision": 1,
+    "supersedesSummaryId": null,
+    "supersededBySummaryId": null,
+    "safeContent": {
+      "headline": "Doanh thu giảm 12,4%",
+      "actual": {"metric": "NET_REVENUE", "valueMinor": 12400000, "currency": "VND"},
+      "baseline": {"type": "SAME_WEEKDAY_LAST_WEEK", "valueMinor": 14155200},
+      "deltaRatio": "-0.124",
+      "drivers": [
+        {"safeLabel": "Trà sữa Ô long nướng", "signedDeltaMinor": -600000, "causalEvidence": false}
+      ],
+      "caveats": ["Dữ liệu đã hoàn tất đến 17:00 giờ địa phương."],
+      "wordingMode": "OBSERVED_CONTRIBUTION"
+    },
+    "watermark": "reporting:branch:42:v901",
+    "calculationVersion": "sales-metric-v2",
+    "policyVersion": "summary-policy-v1",
+    "modelVersion": "configured-model-reference",
+    "generatedAt": "2026-10-12T17:28:10Z",
+    "publishedAt": "2026-10-12T17:30:00Z"
+  },
+  "meta": {
+    "requestId": "req_0192b2d0-7f1d-7abc-8d2c-123456789001",
+    "correlationId": "cor_0192b2d0-7f1d-7abc-8d2c-123456789002",
+    "timestamp": "2026-10-13T08:20:00Z"
+  }
+}
+```
+
+---
+
+### 4.8 Yêu cầu chạy lại tóm tắt ngày (Summary Rerun)
 
 `POST /api/v1/ai/daily-summaries/{summaryId}/reruns`
 
+Yêu cầu kích hoạt lại quá trình tạo bản tóm tắt khi phát hiện có dữ liệu doanh thu bổ sung muộn từ Reporting Service.
+
+#### Tiêu đề Yêu cầu (Headers)
+```http
+Authorization: Bearer <Cognito JWT Token>
+Content-Type: application/json
+Accept: application/json
+X-Correlation-ID: 0192b2d0-7f1d-7abc-8d2c-123456789001
+Idempotency-Key: 0192b2d0-7f1d-7abc-8d2c-123456789004
+```
+
+#### Request Body Mẫu
 ```json
 {
   "reason": "Late OrderPaid projection completed",
   "expectedRevision": 1,
   "requestedSourceWatermark": "reporting:branch:42:v902"
+}
+```
+
+| Trường | Kiểu dữ liệu | Bắt buộc | Mô tả |
+|---|---|:---:|---|
+| `reason` | string | Có | Lý do chạy lại bản tóm tắt (tối đa 250 ký tự) |
+| `expectedRevision` | integer | Có | Số revision hiện tại mà client đang nhìn thấy (chống race condition) |
+| `requestedSourceWatermark` | string | Có | Mốc dữ liệu mới từ Reporting Service |
+
+#### Phản hồi Tiếp Nhận `202 Accepted`
+```json
+{
+  "data": {
+    "summaryJobId": "0192b2d0-7f1d-7abc-8d2c-123456789070",
+    "summaryId": "0192b2d0-7f1d-7abc-8d2c-123456789060",
+    "status": "READY",
+    "targetRevision": 2,
+    "queuedAt": "2026-10-13T08:25:00Z"
+  },
+  "meta": {
+    "requestId": "req_0192b2d0-7f1d-7abc-8d2c-123456789001",
+    "correlationId": "cor_0192b2d0-7f1d-7abc-8d2c-123456789002",
+    "timestamp": "2026-10-13T08:25:01Z"
+  }
 }
 ```
 
@@ -1003,6 +1256,225 @@ Các tác vụ xóa dữ liệu đảm bảo tính lũy quyền, chỉ phát ra 
 7. Tạo các chỉ mục bảng outbox/inbox và các ràng buộc khóa thuê của worker.
 8. Nạp dữ liệu tham chiếu hạt giống cho danh mục công cụ, chính sách và phiên bản tính toán; tuyệt đối không nạp nội dung người dùng.
 9. Mặc định không cần backfill dữ liệu; việc xây dựng lại các sự kiện Reporting phải thông qua quy trình do chính Reporting sở hữu, không tự suy diễn từ cơ sở dữ liệu của AI.
+
+### 11.5 Các kịch bản Migration Flyway (Flyway Migration Scripts)
+
+#### 11.5.1 `V1__init_ai_core_and_conversations.sql`
+```sql
+CREATE TABLE ai_conversations (
+    id UUID PRIMARY KEY,
+    tenant_id UUID NOT NULL,
+    created_by_subject_hash TEXT NOT NULL,
+    role TEXT NOT NULL CHECK (role IN ('OWNER', 'MANAGER')),
+    scope_type TEXT NOT NULL CHECK (scope_type IN ('TENANT', 'BRANCH')),
+    policy_version TEXT NOT NULL,
+    authorization_version BIGINT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'ACTIVE' CHECK (status IN ('ACTIVE', 'EXPIRED', 'REVOKED')),
+    client_reference_hash TEXT,
+    expires_at TIMESTAMPTZ NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+COMMENT ON TABLE ai_conversations IS 'Lưu trữ các phiên hội thoại hỏi đáp báo cáo AI có giới hạn phạm vi';
+COMMENT ON COLUMN ai_conversations.created_by_subject_hash IS 'Mã băm có muối của người dùng; cấm lưu Cognito subject thô';
+
+CREATE INDEX idx_ai_conv_tenant_status ON ai_conversations(tenant_id, status);
+CREATE INDEX idx_ai_conv_expires ON ai_conversations(expires_at) WHERE status = 'ACTIVE';
+
+CREATE TABLE ai_scope_revisions (
+    id UUID PRIMARY KEY,
+    tenant_id UUID NOT NULL,
+    conversation_id UUID NOT NULL REFERENCES ai_conversations(id) ON DELETE CASCADE,
+    revision BIGINT NOT NULL,
+    scope_type TEXT NOT NULL CHECK (scope_type IN ('TENANT', 'BRANCH')),
+    branch_ids JSONB NOT NULL,
+    role TEXT NOT NULL,
+    permission TEXT NOT NULL,
+    membership_version BIGINT NOT NULL,
+    authorization_version BIGINT NOT NULL,
+    resolved_at TIMESTAMPTZ NOT NULL,
+    expires_at TIMESTAMPTZ NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT uq_ai_scope_rev UNIQUE (tenant_id, conversation_id, revision)
+);
+
+CREATE TABLE ai_turns (
+    id UUID PRIMARY KEY,
+    tenant_id UUID NOT NULL,
+    conversation_id UUID NOT NULL REFERENCES ai_conversations(id) ON DELETE CASCADE,
+    scope_revision_id UUID NOT NULL REFERENCES ai_scope_revisions(id),
+    client_turn_id TEXT NOT NULL,
+    question_hash TEXT NOT NULL,
+    semantic_context JSONB NOT NULL,
+    intent TEXT,
+    requested_period JSONB,
+    status TEXT NOT NULL CHECK (status IN ('QUEUED', 'RUNNING', 'ANSWERED', 'NEEDS_SCOPE', 'UNSUPPORTED', 'NO_DATA', 'STALE_DATA', 'PARTIAL', 'PROVIDER_UNAVAILABLE', 'EXPIRED', 'FAILED')),
+    answer_payload JSONB,
+    response_hash TEXT,
+    warning_codes JSONB NOT NULL DEFAULT '[]'::jsonb,
+    policy_version TEXT NOT NULL,
+    model_version TEXT,
+    poll_after_ms INTEGER DEFAULT 500,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    answered_at TIMESTAMPTZ,
+    expires_at TIMESTAMPTZ NOT NULL,
+    CONSTRAINT uq_ai_turn_client UNIQUE (tenant_id, conversation_id, client_turn_id)
+);
+
+CREATE INDEX idx_ai_turns_conv_created ON ai_turns(tenant_id, conversation_id, created_at DESC);
+```
+
+#### 11.5.2 `V2__init_ai_tool_executions.sql`
+```sql
+CREATE TABLE ai_tool_executions (
+    id UUID PRIMARY KEY,
+    tenant_id UUID NOT NULL,
+    turn_id UUID NOT NULL REFERENCES ai_turns(id) ON DELETE CASCADE,
+    tool_name TEXT NOT NULL CHECK (tool_name IN ('getSalesSummary', 'getOrderCount', 'getAverageOrderValue', 'getTopItems', 'compareBranches', 'getHourlySales', 'getContributionDrivers')),
+    execution_order INTEGER NOT NULL,
+    safe_arguments JSONB NOT NULL,
+    result_summary JSONB,
+    source_watermark TEXT,
+    watermark_version BIGINT,
+    calculation_version TEXT,
+    freshness_status TEXT CHECK (freshness_status IN ('FRESH', 'ACCEPTABLE', 'STALE', 'REBUILDING')),
+    status TEXT NOT NULL CHECK (status IN ('PENDING', 'SUCCESS', 'FAILED', 'CIRCUIT_OPEN', 'INVALID_ARGUMENTS')),
+    error_code TEXT,
+    latency_ms INTEGER,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT uq_ai_tool_turn_order UNIQUE (tenant_id, turn_id, execution_order)
+);
+
+CREATE INDEX idx_ai_tools_turn ON ai_tool_executions(tenant_id, turn_id);
+```
+
+#### 11.5.3 `V3__init_ai_daily_summaries.sql`
+```sql
+CREATE TABLE ai_daily_summary_jobs (
+    id UUID PRIMARY KEY,
+    tenant_id UUID NOT NULL,
+    branch_id UUID NOT NULL,
+    business_date DATE NOT NULL,
+    branch_timezone TEXT NOT NULL,
+    cutoff_at TIMESTAMPTZ NOT NULL,
+    summary_policy_version TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('SCHEDULED', 'WAITING_FOR_DATA', 'READY', 'GENERATING', 'PUBLISHED', 'NO_BASELINE', 'DATA_LATE', 'PROVIDER_UNAVAILABLE', 'FAILED', 'SUPERSEDED')),
+    worker_lease_id UUID,
+    lease_expires_at TIMESTAMPTZ,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    target_revision INTEGER NOT NULL DEFAULT 1,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT uq_ai_job_target UNIQUE (tenant_id, branch_id, business_date, summary_policy_version, target_revision)
+);
+
+CREATE TABLE ai_daily_summaries (
+    id UUID PRIMARY KEY,
+    tenant_id UUID NOT NULL,
+    branch_id UUID NOT NULL,
+    business_date DATE NOT NULL,
+    timezone TEXT NOT NULL,
+    revision INTEGER NOT NULL DEFAULT 1,
+    status TEXT NOT NULL CHECK (status IN ('PUBLISHED', 'NO_BASELINE', 'DATA_LATE', 'PROVIDER_UNAVAILABLE', 'FAILED', 'SUPERSEDED')),
+    supersedes_summary_id UUID REFERENCES ai_daily_summaries(id),
+    superseded_by_summary_id UUID REFERENCES ai_daily_summaries(id),
+    safe_content JSONB NOT NULL,
+    watermark TEXT NOT NULL,
+    calculation_version TEXT NOT NULL,
+    policy_version TEXT NOT NULL,
+    model_version TEXT NOT NULL,
+    generated_at TIMESTAMPTZ NOT NULL,
+    published_at TIMESTAMPTZ NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT uq_ai_summary_branch_date_rev UNIQUE (tenant_id, branch_id, business_date, revision)
+);
+
+CREATE TABLE ai_summary_sources (
+    id UUID PRIMARY KEY,
+    tenant_id UUID NOT NULL,
+    summary_id UUID NOT NULL REFERENCES ai_daily_summaries(id) ON DELETE CASCADE,
+    source_type TEXT NOT NULL,
+    source_watermark TEXT NOT NULL,
+    watermark_version BIGINT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+#### 11.5.4 `V4__init_ai_provider_policies_and_usage.sql`
+```sql
+CREATE TABLE ai_provider_policies (
+    id UUID PRIMARY KEY,
+    tenant_id UUID NOT NULL,
+    policy_version TEXT NOT NULL,
+    provider_name TEXT NOT NULL,
+    model_name TEXT NOT NULL,
+    region_policy TEXT NOT NULL,
+    prompt_policy_version TEXT NOT NULL,
+    max_input_tokens INTEGER NOT NULL,
+    max_output_tokens INTEGER NOT NULL,
+    request_timeout_ms INTEGER NOT NULL,
+    max_retries INTEGER NOT NULL DEFAULT 1,
+    daily_budget_minor BIGINT NOT NULL,
+    budget_currency TEXT NOT NULL DEFAULT 'VND',
+    secret_reference TEXT NOT NULL,
+    enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    created_by_user_id UUID,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT uq_ai_policy_ver UNIQUE (tenant_id, policy_version)
+);
+
+CREATE TABLE ai_provider_usage (
+    id UUID PRIMARY KEY,
+    tenant_id UUID NOT NULL,
+    policy_version TEXT NOT NULL,
+    business_date DATE NOT NULL,
+    attempt_id UUID NOT NULL,
+    provider_request_id UUID NOT NULL,
+    reservation_status TEXT NOT NULL CHECK (reservation_status IN ('RESERVED', 'FINALIZED', 'RELEASED', 'BUDGET_EXCEEDED', 'POLICY_DISABLED')),
+    estimated_cost_minor BIGINT NOT NULL,
+    actual_cost_minor BIGINT,
+    budget_currency TEXT NOT NULL DEFAULT 'VND',
+    input_tokens INTEGER,
+    output_tokens INTEGER,
+    retry_no INTEGER NOT NULL DEFAULT 0,
+    outcome TEXT CHECK (outcome IN ('SUCCESS', 'TIMEOUT', 'INVALID_OUTPUT', 'CIRCUIT_OPEN', 'ERROR')),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    finalized_at TIMESTAMPTZ,
+    CONSTRAINT uq_ai_usage_attempt UNIQUE (tenant_id, attempt_id),
+    CONSTRAINT uq_ai_usage_req UNIQUE (tenant_id, provider_request_id)
+);
+
+CREATE INDEX idx_ai_usage_budget ON ai_provider_usage(tenant_id, policy_version, business_date, reservation_status);
+```
+
+#### 11.5.5 `V5__init_ai_reliability_tables.sql`
+```sql
+CREATE TABLE ai_outbox_events (
+    id UUID PRIMARY KEY,
+    tenant_id UUID NOT NULL,
+    aggregate_type TEXT NOT NULL,
+    aggregate_id UUID NOT NULL,
+    event_type TEXT NOT NULL,
+    event_version INTEGER NOT NULL DEFAULT 1,
+    payload JSONB NOT NULL,
+    correlation_id UUID NOT NULL,
+    status TEXT NOT NULL DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'PUBLISHED', 'FAILED')),
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    published_at TIMESTAMPTZ
+);
+
+CREATE INDEX idx_ai_outbox_pending ON ai_outbox_events(status, created_at) WHERE status = 'PENDING';
+
+CREATE TABLE ai_inbox_dedup (
+    event_id UUID PRIMARY KEY,
+    tenant_id UUID NOT NULL,
+    event_type TEXT NOT NULL,
+    processed_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+```
 
 ## 12. Ma trận kiểm thử giao ước (Contract Test Matrix)
 

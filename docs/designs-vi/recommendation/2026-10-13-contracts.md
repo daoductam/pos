@@ -142,8 +142,22 @@ Danh sách luật sử dụng phân trang theo cursor, mặc định `20`, tối
 
 ## 4. Schema API gợi ý (Recommendation API schemas)
 
-### 4.1 `RecommendationRequest`
+### 4.1 Lấy danh sách gợi ý món theo giỏ hàng (Get Cart Recommendations)
 
+`POST /api/v1/recommendations`
+
+API thời gian thực tính toán gợi ý món thêm (upsell/cross-sell) dựa trên giỏ hàng hiện tại với SLA p95 ≤ 150ms.
+
+#### Tiêu đề Yêu cầu (Headers)
+```http
+Authorization: Bearer <Cognito JWT Token>
+Content-Type: application/json
+Accept: application/json
+X-Correlation-ID: 0192b2d0-7f1d-7abc-8d2c-123456789001
+Idempotency-Key: 0192b2d0-7f1d-7abc-8d2c-123456789002
+```
+
+#### Request Body Mẫu
 ```json
 {
   "orderId": "0192b2d0-7f1d-7abc-8d2c-123456789001",
@@ -156,7 +170,7 @@ Danh sách luật sử dụng phân trang theo cursor, mặc định `20`, tối
 ```
 
 | Trường | Kiểu | Bắt buộc | Quy tắc |
-|---|---|---:|---|
+|---|---|:---:|---|
 | `orderId` | UUID | Có | Đơn hàng thuộc cùng ngữ cảnh tenant / chi nhánh |
 | `branchId` | UUID | Có | Máy chủ thẩm định chi nhánh được ủy quyền |
 | `cartVersion` | int64 | Có | Phải khớp với ngữ cảnh / hình chiếu của Order |
@@ -166,8 +180,7 @@ Danh sách luật sử dụng phân trang theo cursor, mặc định `20`, tối
 
 Recommendation sẽ gọi hợp đồng ngữ cảnh của Order khi cache bị miss hoặc phiên bản không khớp; client công khai không thể tự gửi ảnh chụp danh sách món để làm chân lý.
 
-### 4.2 `RecommendationResponse`
-
+#### Phản hồi Thành Công `200 OK`
 ```json
 {
   "data": {
@@ -199,18 +212,37 @@ Recommendation sẽ gọi hợp đồng ngữ cảnh của Order khi cache bị 
     "generatedAt": "2026-10-13T08:00:01Z"
   },
   "meta": {
-    "requestId": "req_01J...",
-    "correlationId": "cor_01J..."
+    "requestId": "req_0192b2d0-7f1d-7abc-8d2c-123456789001",
+    "correlationId": "cor_0192b2d0-7f1d-7abc-8d2c-123456789002",
+    "timestamp": "2026-10-13T08:00:01Z"
   }
 }
 ```
 
-Trường `strategy` nhận các giá trị: `ASSOCIATION`, `PERSONALIZED_ALS` hoặc `ASSOCIATION_FALLBACK`. Mảng `items` rỗng là kết quả hoàn toàn hợp lệ.
+Trường `strategy` nhận các giá trị: `ASSOCIATION`, `PERSONALIZED_ALS` hoặc `ASSOCIATION_FALLBACK`. Mảng `items` rỗng là kết quả hoàn toàn hợp lệ khi không có ứng viên phù hợp.
 
-### 4.3 Tương tác hiển thị (Shown interaction)
+#### Phản hồi Lỗi Thường Gặp
+- `403 Forbidden` (`code: "forbidden"`): Không có quyền `recommendation:read` tại chi nhánh.
+- `409 Conflict` (`code: "cart_version_mismatch"`): Phiên bản giỏ hàng của client cũ hơn server.
+- `422 Unprocessable Entity` (`code: "validation_error"`): Chi nhánh không hợp lệ.
+
+---
+
+### 4.2 Ghi nhận tương tác hiển thị gợi ý (Shown Interaction)
 
 `POST /api/v1/recommendations/{suggestionId}/shown`
 
+Ghi nhận sự kiện món gợi ý đã được hiển thị trên giao diện POS phục vụ tính tỷ lệ chuyển đổi (conversion tracking).
+
+#### Tiêu đề Yêu cầu (Headers)
+```http
+Authorization: Bearer <Cognito JWT Token>
+Content-Type: application/json
+Accept: application/json
+X-Correlation-ID: 0192b2d0-7f1d-7abc-8d2c-123456789001
+```
+
+#### Request Body Mẫu
 ```json
 {
   "itemId": "0192b2d0-7f1d-7abc-8d2c-123456789011",
@@ -221,12 +253,45 @@ Trường `strategy` nhận các giá trị: `ASSOCIATION`, `PERSONALIZED_ALS` h
 }
 ```
 
-Máy chủ trích xuất thông tin tenant, chi nhánh và người thực hiện từ token xác thực và phiên gợi ý. Lệnh chỉ hợp lệ với món ứng viên thuộc phiên đó; gửi trùng lặp bộ `(suggestionId, itemId, interactionId, SHOWN)` sẽ trả về kết quả ban đầu.
+Máy chủ trích xuất thông tin tenant, chi nhánh và người thực hiện từ token xác thực và phiên gợi ý. Lệnh chỉ hợp lệ với món ứng viên thuộc phiên đó; gửi trùng lặp bộ `(suggestionId, itemId, interactionId, SHOWN)` sẽ trả về kết quả ban đầu (idempotent).
 
-### 4.4 Tương tác chấp thuận (Accepted interaction)
+#### Phản hồi Thành Công `200 OK`
+```json
+{
+  "data": {
+    "interactionId": "ui-interaction-01J...",
+    "suggestionId": "0192b2d0-7f1d-7abc-8d2c-123456789010",
+    "itemId": "0192b2d0-7f1d-7abc-8d2c-123456789011",
+    "eventType": "SHOWN",
+    "status": "RECORDED",
+    "eventId": "0192b2d0-7f1d-7abc-8d2c-123456789015",
+    "recordedAt": "2026-10-13T08:00:02Z"
+  },
+  "meta": {
+    "requestId": "req_0192b2d0-7f1d-7abc-8d2c-123456789001",
+    "correlationId": "cor_0192b2d0-7f1d-7abc-8d2c-123456789002",
+    "timestamp": "2026-10-13T08:00:02Z"
+  }
+}
+```
+
+---
+
+### 4.3 Ghi nhận tương tác chấp thuận gợi ý (Accepted Interaction)
 
 `POST /api/v1/recommendations/{suggestionId}/accept`
 
+Ghi nhận sự kiện thu ngân hoặc khách hàng chấp thuận thêm món gợi ý vào đơn hàng.
+
+#### Tiêu đề Yêu cầu (Headers)
+```http
+Authorization: Bearer <Cognito JWT Token>
+Content-Type: application/json
+Accept: application/json
+X-Correlation-ID: 0192b2d0-7f1d-7abc-8d2c-123456789001
+```
+
+#### Request Body Mẫu
 ```json
 {
   "itemId": "0192b2d0-7f1d-7abc-8d2c-123456789011",
@@ -240,34 +305,108 @@ Máy chủ trích xuất thông tin tenant, chi nhánh và người thực hiệ
 
 Giao diện POS bắt buộc phải gọi Order thêm dòng trước và chỉ gọi endpoint này sau khi Order phản hồi thành công. Recommendation kiểm tra mối liên kết phiên/đơn hàng/món và lưu lại bằng chứng; tuyệt đối không gọi sang Payment hay tự ý thay đổi Order.
 
-### 4.5 Phản hồi tương tác (Interaction response)
-
+#### Phản hồi Thành Công `200 OK`
 ```json
 {
   "data": {
-    "interactionId": "ui-interaction-01J...",
+    "interactionId": "ui-interaction-01J...-accept",
     "suggestionId": "0192b2d0-7f1d-7abc-8d2c-123456789010",
     "itemId": "0192b2d0-7f1d-7abc-8d2c-123456789011",
-    "eventType": "SHOWN",
+    "eventType": "ACCEPTED",
     "status": "RECORDED",
-    "eventId": "0192b2d0-7f1d-7abc-8d2c-123456789015",
-    "recordedAt": "2026-10-13T08:00:02Z"
+    "eventId": "0192b2d0-7f1d-7abc-8d2c-123456789016",
+    "recordedAt": "2026-10-13T08:00:03Z"
   },
   "meta": {
-    "requestId": "req_01J...",
-    "correlationId": "cor_01J..."
+    "requestId": "req_0192b2d0-7f1d-7abc-8d2c-123456789001",
+    "correlationId": "cor_0192b2d0-7f1d-7abc-8d2c-123456789002",
+    "timestamp": "2026-10-13T08:00:03Z"
   }
 }
 ```
 
-Trường `eventType` là `SHOWN` hoặc `ACCEPTED`; các lần thử lại trùng lặp sẽ trả về ID sự kiện ban đầu.
+---
 
 ## 5. Schema quản trị luật kết hợp (Rule governance schemas)
 
-### 5.1 Tạo bản nháp luật (Create draft rule)
+### 5.1 Danh sách luật gợi ý (List Recommendation Rules)
+
+`GET /api/v1/recommendation-rules`
+
+Truy vấn danh sách các luật gợi ý của tenant kèm phân trang con trỏ và bộ lọc trạng thái.
+
+#### Tiêu đề Yêu cầu (Headers)
+```http
+Authorization: Bearer <Cognito JWT Token>
+Accept: application/json
+X-Correlation-ID: 0192b2d0-7f1d-7abc-8d2c-123456789001
+```
+
+#### Tham số Truy vấn (Query Parameters)
+| Tham số | Kiểu | Mặc định | Mô tả |
+|---|---|:---:|---|
+| `status` | string | null | Lọc theo: `DRAFT`, `PUBLISHED`, `RETIRED` |
+| `source` | string | null | Lọc theo: `MANUAL`, `MINED_FP_GROWTH` |
+| `candidateItemId` | UUID | null | Lọc theo món được gợi ý (consequent) |
+| `limit` | integer | 20 | Số lượng bản ghi (tối đa 100) |
+| `cursor` | string | null | Con trỏ phân trang |
+
+#### Phản hồi Thành Công `200 OK`
+```json
+{
+  "data": [
+    {
+      "ruleId": "0192b2d0-7f1d-7abc-8d2c-123456789012",
+      "logicalRuleKey": "rule_chicken_coke",
+      "version": 4,
+      "status": "PUBLISHED",
+      "source": "MANUAL",
+      "antecedents": [
+        {"itemId": "0192b2d0-7f1d-7abc-8d2c-123456789020", "itemName": "Gà rán giòn cay"}
+      ],
+      "consequent": {
+        "itemId": "0192b2d0-7f1d-7abc-8d2c-123456789021",
+        "itemName": "Coca Cola lon"
+      },
+      "priority": 100,
+      "supportBps": 450,
+      "confidenceBps": 6800,
+      "liftMilli": 1420,
+      "effectiveFrom": "2026-10-13T00:00:00Z",
+      "effectiveTo": null,
+      "publishedAt": "2026-10-13T07:00:00Z",
+      "updatedAt": "2026-10-13T07:00:00Z"
+    }
+  ],
+  "meta": {
+    "limit": 20,
+    "hasMore": false,
+    "nextCursor": null,
+    "requestId": "req_0192b2d0-7f1d-7abc-8d2c-123456789001",
+    "correlationId": "cor_0192b2d0-7f1d-7abc-8d2c-123456789002",
+    "timestamp": "2026-10-13T08:00:00Z"
+  }
+}
+```
+
+---
+
+### 5.2 Tạo bản nháp luật mới (Create Draft Rule)
 
 `POST /api/v1/recommendation-rules`
 
+Tạo bản nháp luật gợi ý thủ công hoặc từ đề xuất khai phá dữ liệu.
+
+#### Tiêu đề Yêu cầu (Headers)
+```http
+Authorization: Bearer <Cognito JWT Token>
+Content-Type: application/json
+Accept: application/json
+X-Correlation-ID: 0192b2d0-7f1d-7abc-8d2c-123456789001
+Idempotency-Key: 0192b2d0-7f1d-7abc-8d2c-123456789005
+```
+
+#### Request Body Mẫu
 ```json
 {
   "source": "MANUAL",
@@ -291,7 +430,137 @@ Trường `eventType` là `SHOWN` hoặc `ACCEPTED`; các lần thử lại trù
 
 Máy chủ thẩm định định danh chuẩn tắc, không tự gợi ý chính nó, số lượng điều kiện tối đa, quyền sở hữu món của tenant, khoảng thời gian hiệu lực và giới hạn độ ưu tiên. Các chỉ số support/confidence/lift do máy chủ hoặc tác vụ ML đáng tin cậy tính toán/nhập vào; dữ liệu nhập từ Manager không thể giả mạo các chỉ số chất lượng này.
 
-### 5.2 Vòng đời luật (Rule lifecycle)
+#### Phản hồi Thành Công `201 Created`
+```json
+{
+  "data": {
+    "ruleId": "0192b2d0-7f1d-7abc-8d2c-123456789030",
+    "logicalRuleKey": "rule_manual_01J...",
+    "version": 1,
+    "status": "DRAFT",
+    "source": "MANUAL",
+    "antecedents": [
+      {"itemId": "0192b2d0-7f1d-7abc-8d2c-123456789020", "variantId": null}
+    ],
+    "consequent": {
+      "itemId": "0192b2d0-7f1d-7abc-8d2c-123456789021",
+      "variantId": null
+    },
+    "priority": 100,
+    "effectiveFrom": "2026-10-13T00:00:00Z",
+    "effectiveTo": null,
+    "createdAt": "2026-10-13T08:05:00Z",
+    "updatedAt": "2026-10-13T08:05:00Z"
+  },
+  "meta": {
+    "requestId": "req_0192b2d0-7f1d-7abc-8d2c-123456789001",
+    "correlationId": "cor_0192b2d0-7f1d-7abc-8d2c-123456789002",
+    "timestamp": "2026-10-13T08:05:00Z"
+  }
+}
+```
+
+---
+
+### 5.3 Cập nhật bản nháp luật (Update Draft Rule)
+
+`PATCH /api/v1/recommendation-rules/{ruleId}`
+
+Chỉnh sửa bản nháp luật chưa công bố. Bắt buộc kèm theo header `If-Match: "<version>"` để ngăn ngừa xung đột ghi đè.
+
+#### Tiêu đề Yêu cầu (Headers)
+```http
+Authorization: Bearer <Cognito JWT Token>
+Content-Type: application/json
+Accept: application/json
+If-Match: "1"
+X-Correlation-ID: 0192b2d0-7f1d-7abc-8d2c-123456789001
+```
+
+#### Request Body Mẫu
+```json
+{
+  "priority": 150,
+  "note": "Cập nhật ưu tiên mùa hè"
+}
+```
+
+#### Phản hồi Thành Công `200 OK`
+Trả về `RuleResponse` với `version: 2` và các trường đã được cập nhật.
+
+---
+
+### 5.4 Công bố luật gợi ý (Publish Rule)
+
+`POST /api/v1/recommendation-rules/{ruleId}/publish`
+
+Chỉ Chủ chuỗi (Owner) mới có quyền công bố luật. Sau khi công bố, luật chuyển sang trạng thái `PUBLISHED` bất biến và áp dụng vào engine gợi ý giỏ hàng.
+
+#### Tiêu đề Yêu cầu (Headers)
+```http
+Authorization: Bearer <Cognito JWT Token>
+Content-Type: application/json
+Accept: application/json
+X-Correlation-ID: 0192b2d0-7f1d-7abc-8d2c-123456789001
+Idempotency-Key: 0192b2d0-7f1d-7abc-8d2c-123456789006
+```
+
+#### Request Body Mẫu
+```json
+{
+  "expectedVersion": 2,
+  "reason": "Phê duyệt triển khai chiến dịch đồ uống kèm đồ ăn nhanh",
+  "qualityEvidenceRef": "fp_growth_run_20261012"
+}
+```
+
+#### Phản hồi Thành Công `200 OK`
+```json
+{
+  "data": {
+    "ruleId": "0192b2d0-7f1d-7abc-8d2c-123456789030",
+    "status": "PUBLISHED",
+    "version": 3,
+    "publishedAt": "2026-10-13T08:10:00Z"
+  },
+  "meta": {
+    "requestId": "req_0192b2d0-7f1d-7abc-8d2c-123456789001",
+    "correlationId": "cor_0192b2d0-7f1d-7abc-8d2c-123456789002",
+    "timestamp": "2026-10-13T08:10:00Z"
+  }
+}
+```
+
+---
+
+### 5.5 Ngừng áp dụng luật gợi ý (Retire Rule)
+
+`POST /api/v1/recommendation-rules/{ruleId}/retire`
+
+Ngừng hiệu lực của một luật đã công bố mà không xóa vật lý bản ghi lịch sử.
+
+#### Tiêu đề Yêu cầu (Headers)
+```http
+Authorization: Bearer <Cognito JWT Token>
+Content-Type: application/json
+Accept: application/json
+X-Correlation-ID: 0192b2d0-7f1d-7abc-8d2c-123456789001
+```
+
+#### Request Body Mẫu
+```json
+{
+  "expectedVersion": 3,
+  "reason": "Hết chiến dịch mùa hè"
+}
+```
+
+#### Phản hồi Thành Công `200 OK`
+Trả về `RuleResponse` với `status: "RETIRED"`.
+
+---
+
+### 5.6 Vòng đời luật (Rule lifecycle)
 
 | Trạng thái | Chuyển đổi cho phép | Tác nhân thực hiện |
 |---|---|---|
@@ -301,11 +570,67 @@ Máy chủ thẩm định định danh chuẩn tắc, không tự gợi ý chín
 
 `PublishRuleRequest` yêu cầu `reason`, `expectedVersion` và trường tùy chọn `qualityEvidenceRef`. `RetireRuleRequest` yêu cầu `reason` và `expectedVersion`. Các phiên bản đã công bố là bất biến; việc chỉnh sửa sẽ tạo ra bản nháp / phiên bản mới.
 
-### 5.3 `RuleResponse`
+---
 
-Các trường: `ruleId`, `tenantId`, `logicalRuleKey`, `version`, `status`, `source`, `antecedents[]`, `consequent`, `supportBps`, `confidenceBps`, `liftMilli`, `priority`, `effectiveFrom`, `effectiveTo`, `createdBy`, `publishedBy`, `publishedAt`, `version`, `createdAt`, `updatedAt`.
+### 5.7 Thông tin mô hình gợi ý đang hoạt động (Get Active Model)
 
-Các trường chất lượng do máy chủ/trainer sở hữu và có giá trị null đối với bản nháp cho đến khi được đánh giá. Giá trị `liftMilli=1000` tương ứng với lift `1.000`.
+`GET /api/v1/recommendation-models/active`
+
+Truy vấn thông tin kiểm toán về mô hình máy học (ALS) hoặc phiên bản tập luật đang active của tenant.
+
+#### Tiêu đề Yêu cầu (Headers)
+```http
+Authorization: Bearer <Cognito JWT Token>
+Accept: application/json
+X-Correlation-ID: 0192b2d0-7f1d-7abc-8d2c-123456789001
+```
+
+#### Phản hồi Thành Công `200 OK`
+```json
+{
+  "data": {
+    "modelFamily": "ALS",
+    "modelVersion": "als-model-v2.1",
+    "status": "ACTIVE",
+    "sourceWatermark": "order_paid:2026-10-12T17:00:00Z",
+    "metrics": {
+      "precisionAtK": "0.1850",
+      "recallAtK": "0.4210",
+      "ndcg": "0.2940"
+    },
+    "activatedAt": "2026-10-12T18:00:00Z"
+  },
+  "meta": {
+    "requestId": "req_0192b2d0-7f1d-7abc-8d2c-123456789001",
+    "correlationId": "cor_0192b2d0-7f1d-7abc-8d2c-123456789002",
+    "timestamp": "2026-10-13T08:15:00Z"
+  }
+}
+```
+
+---
+
+### 5.8 Danh sách đặc trưng khởi động nguội (P2 Cold Start Features)
+
+`GET /api/v1/cold-start-features`
+
+Truy vấn các món mới chưa có dữ liệu giao dịch cần gán đặc trưng tương đồng từ LLM (DeepSeek) để nhân viên duyệt.
+
+#### Phản hồi Thành Công `200 OK`
+Trả về danh sách các đặc trưng ứng viên kèm `candidateId`, `itemId`, `featurePayload`, `confidence`, và `reviewStatus`.
+
+---
+
+### 5.9 Phê duyệt đặc trưng khởi động nguội (P2 Approve Cold Start)
+
+`POST /api/v1/cold-start-features/{candidateId}/approve`
+
+Quản lý phê duyệt đặc trưng của món mới để đưa vào không gian vector gợi ý tương đồng.
+
+#### Phản hồi Thành Công `200 OK`
+Trả về kết quả phê duyệt với `reviewStatus: "APPROVED"`.
+
+---
 
 ## 6. Hợp đồng mô hình, huấn luyện và API nội bộ (Internal contracts)
 
@@ -856,6 +1181,262 @@ Các bảng `outbox_messages`, `inbox_events`, `idempotency_records` và `audit_
 6. Tạo các bảng khởi động nguội P2 và metadata tích hợp lưu trữ đối tượng đã mã hóa.
 7. Seed dữ liệu cấu hình mặc định về top-K / TTL / chính sách chất lượng có đánh phiên bản.
 8. Nạp bù dữ liệu (backfill) hình chiếu từ các sự kiện nguồn / ảnh chụp được lưu trữ; tuyệt đối không tự bịa đặt các sự kiện gợi ý lịch sử.
+
+### 10.4 Các kịch bản Migration Flyway (Flyway Migration Scripts)
+
+#### 10.4.1 `V1__init_recommendation_core_and_projections.sql`
+```sql
+CREATE TABLE catalog_item_projections (
+    tenant_id UUID NOT NULL,
+    item_id UUID NOT NULL,
+    variant_id UUID,
+    item_name TEXT NOT NULL,
+    category_id UUID NOT NULL,
+    price_minor BIGINT NOT NULL,
+    currency TEXT NOT NULL DEFAULT 'VND',
+    status TEXT NOT NULL CHECK (status IN ('AVAILABLE', 'HIDDEN', 'DELETED')),
+    version BIGINT NOT NULL,
+    source_watermark TEXT NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (tenant_id, item_id, variant_id)
+);
+
+CREATE INDEX idx_rec_cat_proj ON catalog_item_projections(tenant_id, status);
+
+CREATE TABLE inventory_availability_projections (
+    tenant_id UUID NOT NULL,
+    branch_id UUID NOT NULL,
+    item_id UUID NOT NULL,
+    variant_id UUID,
+    is_available BOOLEAN NOT NULL DEFAULT TRUE,
+    source_watermark TEXT NOT NULL,
+    observed_at TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (tenant_id, branch_id, item_id, variant_id)
+);
+
+CREATE INDEX idx_rec_inv_avail ON inventory_availability_projections(tenant_id, branch_id, is_available);
+```
+
+#### 10.4.2 `V2__init_association_rules.sql`
+```sql
+CREATE TABLE association_rule_sets (
+    id UUID PRIMARY KEY,
+    tenant_id UUID NOT NULL,
+    name TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('ACTIVE', 'INACTIVE')),
+    active_version INTEGER NOT NULL DEFAULT 1,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT uq_rec_ruleset_active UNIQUE (tenant_id, status) WHERE status = 'ACTIVE'
+);
+
+CREATE TABLE association_rule_versions (
+    id UUID PRIMARY KEY,
+    tenant_id UUID NOT NULL,
+    rule_set_id UUID NOT NULL REFERENCES association_rule_sets(id) ON DELETE CASCADE,
+    logical_rule_key TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    source TEXT NOT NULL CHECK (source IN ('MANUAL', 'MINED_FP_GROWTH')),
+    status TEXT NOT NULL CHECK (status IN ('DRAFT', 'PUBLISHED', 'RETIRED')),
+    priority INTEGER NOT NULL DEFAULT 100,
+    support_bps INTEGER,
+    confidence_bps INTEGER,
+    lift_milli INTEGER,
+    effective_from TIMESTAMPTZ NOT NULL,
+    effective_to TIMESTAMPTZ,
+    note TEXT,
+    created_by_user_id UUID,
+    published_by_user_id UUID,
+    published_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT uq_rec_rule_version UNIQUE (tenant_id, logical_rule_key, version)
+);
+
+CREATE TABLE rule_antecedents (
+    id UUID PRIMARY KEY,
+    tenant_id UUID NOT NULL,
+    rule_version_id UUID NOT NULL REFERENCES association_rule_versions(id) ON DELETE CASCADE,
+    item_id UUID NOT NULL,
+    variant_id UUID,
+    modifier_option_id UUID
+);
+
+CREATE TABLE rule_consequents (
+    id UUID PRIMARY KEY,
+    tenant_id UUID NOT NULL,
+    rule_version_id UUID NOT NULL REFERENCES association_rule_versions(id) ON DELETE CASCADE,
+    item_id UUID NOT NULL,
+    variant_id UUID
+);
+
+CREATE INDEX idx_rec_antecedents ON rule_antecedents(tenant_id, item_id);
+```
+
+#### 10.4.3 `V3__init_suggestion_sessions_and_interactions.sql`
+```sql
+CREATE TABLE suggestion_sessions (
+    id UUID PRIMARY KEY,
+    tenant_id UUID NOT NULL,
+    branch_id UUID NOT NULL,
+    order_id UUID NOT NULL,
+    cart_version BIGINT NOT NULL,
+    strategy TEXT NOT NULL CHECK (strategy IN ('ASSOCIATION', 'PERSONALIZED_ALS', 'ASSOCIATION_FALLBACK')),
+    fallback_reason TEXT,
+    generated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    expires_at TIMESTAMPTZ NOT NULL
+);
+
+CREATE INDEX idx_rec_session_order ON suggestion_sessions(tenant_id, order_id, cart_version);
+
+CREATE TABLE suggestion_candidates (
+    id UUID PRIMARY KEY,
+    tenant_id UUID NOT NULL,
+    suggestion_id UUID NOT NULL REFERENCES suggestion_sessions(id) ON DELETE CASCADE,
+    item_id UUID NOT NULL,
+    variant_id UUID,
+    item_name TEXT NOT NULL,
+    price_minor BIGINT NOT NULL,
+    currency TEXT NOT NULL DEFAULT 'VND',
+    rank INTEGER NOT NULL,
+    score NUMERIC(10,4) NOT NULL,
+    reason_code TEXT NOT NULL,
+    rule_version_id UUID,
+    model_version TEXT,
+    CONSTRAINT uq_rec_candidate_rank UNIQUE (tenant_id, suggestion_id, rank)
+);
+
+CREATE TABLE suggestion_interactions (
+    id UUID PRIMARY KEY,
+    tenant_id UUID NOT NULL,
+    branch_id UUID NOT NULL,
+    suggestion_id UUID NOT NULL REFERENCES suggestion_sessions(id) ON DELETE CASCADE,
+    item_id UUID NOT NULL,
+    event_type TEXT NOT NULL CHECK (event_type IN ('SHOWN', 'ACCEPTED')),
+    interaction_key TEXT NOT NULL,
+    order_id UUID NOT NULL,
+    order_line_id UUID,
+    order_version_after_add BIGINT,
+    rendered_at TIMESTAMPTZ,
+    accepted_at TIMESTAMPTZ,
+    correlation_id UUID NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT uq_rec_interaction UNIQUE (tenant_id, suggestion_id, item_id, event_type, interaction_key)
+);
+
+CREATE INDEX idx_rec_interact_created ON suggestion_interactions(tenant_id, event_type, created_at);
+```
+
+#### 10.4.4 `V4__init_ml_training_and_models.sql`
+```sql
+CREATE TABLE customer_feature_contexts (
+    id UUID PRIMARY KEY,
+    tenant_id UUID NOT NULL,
+    opaque_customer_key_hash TEXT NOT NULL,
+    eligibility TEXT NOT NULL CHECK (eligibility IN ('ELIGIBLE', 'INELIGIBLE', 'DELETED')),
+    consent_version TEXT,
+    feature_version TEXT NOT NULL,
+    source_version BIGINT NOT NULL,
+    generated_at TIMESTAMPTZ NOT NULL,
+    observed_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    tombstoned_at TIMESTAMPTZ,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT uq_rec_cust_feat UNIQUE (tenant_id, opaque_customer_key_hash)
+);
+
+CREATE TABLE paid_interaction_projections (
+    id UUID PRIMARY KEY,
+    tenant_id UUID NOT NULL,
+    event_id UUID NOT NULL,
+    order_id UUID NOT NULL,
+    opaque_customer_key_hash TEXT,
+    item_id UUID NOT NULL,
+    variant_id UUID,
+    quantity INTEGER NOT NULL,
+    occurred_at TIMESTAMPTZ NOT NULL,
+    source_version BIGINT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT uq_rec_paid_item UNIQUE (tenant_id, event_id, order_id, item_id, variant_id)
+);
+
+CREATE TABLE model_registry (
+    id UUID PRIMARY KEY,
+    tenant_id UUID NOT NULL,
+    model_family TEXT NOT NULL CHECK (model_family IN ('ALS')),
+    model_version TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('CANDIDATE', 'VALIDATING', 'ACTIVE', 'RETIRED', 'REJECTED', 'FAILED')),
+    artifact_uri TEXT NOT NULL,
+    artifact_checksum TEXT NOT NULL,
+    training_snapshot_id UUID NOT NULL,
+    feature_version TEXT NOT NULL,
+    code_version TEXT NOT NULL,
+    quality_policy_version TEXT NOT NULL,
+    registry_version BIGINT NOT NULL,
+    activated_at TIMESTAMPTZ,
+    retired_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT uq_rec_model_ver UNIQUE (tenant_id, model_version)
+);
+
+CREATE UNIQUE INDEX uq_rec_active_model ON model_registry(tenant_id, model_family) WHERE status = 'ACTIVE';
+
+CREATE TABLE model_metrics (
+    id UUID PRIMARY KEY,
+    tenant_id UUID NOT NULL,
+    model_id UUID NOT NULL REFERENCES model_registry(id) ON DELETE CASCADE,
+    metric_name TEXT NOT NULL,
+    metric_value NUMERIC(20,8) NOT NULL,
+    threshold_value NUMERIC(20,8) NOT NULL,
+    gate_status TEXT NOT NULL CHECK (gate_status IN ('PASS', 'FAIL')),
+    evaluation_window JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+#### 10.4.5 `V5__init_cold_start_and_reliability.sql`
+```sql
+CREATE TABLE cold_start_features (
+    id UUID PRIMARY KEY,
+    tenant_id UUID NOT NULL,
+    job_id UUID NOT NULL,
+    item_id UUID NOT NULL,
+    feature_payload JSONB NOT NULL,
+    confidence NUMERIC(10,8) NOT NULL,
+    provider_model TEXT NOT NULL,
+    prompt_version TEXT NOT NULL,
+    provenance_ref TEXT NOT NULL,
+    review_status TEXT NOT NULL CHECK (review_status IN ('PENDING_REVIEW', 'APPROVED', 'REJECTED')),
+    reviewed_by_user_id UUID,
+    reviewed_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT uq_rec_cold_item UNIQUE (tenant_id, item_id)
+);
+
+CREATE TABLE recommendation_outbox_events (
+    id UUID PRIMARY KEY,
+    tenant_id UUID NOT NULL,
+    aggregate_type TEXT NOT NULL,
+    aggregate_id UUID NOT NULL,
+    event_type TEXT NOT NULL,
+    event_version INTEGER NOT NULL DEFAULT 1,
+    payload JSONB NOT NULL,
+    correlation_id UUID NOT NULL,
+    status TEXT NOT NULL DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'PUBLISHED', 'FAILED')),
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    published_at TIMESTAMPTZ
+);
+
+CREATE INDEX idx_rec_outbox_pending ON recommendation_outbox_events(status, created_at) WHERE status = 'PENDING';
+
+CREATE TABLE recommendation_inbox_dedup (
+    event_id UUID PRIMARY KEY,
+    tenant_id UUID NOT NULL,
+    event_type TEXT NOT NULL,
+    processed_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+```
 
 ## 11. Ma trận kiểm thử hợp đồng (Contract test matrix)
 

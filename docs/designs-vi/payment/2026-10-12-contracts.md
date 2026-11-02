@@ -5,302 +5,558 @@
 **Phạm vi:** M — Quy trình Service Chuẩn (Standard Service Flow)  
 **Module:** Thanh toán (Payment Service)
 
-## 1. Các Quy ước Hợp đồng (Contract Conventions)
+---
 
-### 1.1 Tiếp cận API-first
+## Nguồn tài liệu và Quyền hạn Hợp đồng
 
-- Các hợp đồng REST có phiên bản thông qua tiền tố `/api/v1`, `/internal/v1` và `/callbacks/v1`.
-- Tài liệu OpenAPI là nguồn chân lý duy nhất để sinh client cho máy POS và các consumer nội bộ.
-- Tài liệu AsyncAPI và schema sự kiện là nguồn sinh hợp đồng cho các bên tiêu thụ sự kiện (event consumers).
-- Các trường dữ liệu đặc thù của VNPAY chỉ xuất hiện tại ranh giới của callback / bộ điều hợp provider adapter, tuyệt đối không xuất hiện trong các lệnh domain của Payment.
-- Các thay đổi phá vỡ tính tương thích (breaking changes) bắt buộc phải dùng phiên bản lớn (major version) mới; các trường tùy chọn mới bổ sung phải đảm bảo tương thích ngược.
+- [Tầm nhìn Payment (Vision)](./2026-10-12-vision.md)
+- [Yêu cầu Kỹ thuật Payment (Requirements)](./2026-10-12-requirements.md)
+- [Kiến trúc Kỹ thuật Payment (Architecture)](./2026-10-12-architecture.md)
+- [Hợp đồng Identity & Access](../identity-access/2026-10-12-contracts.md)
+- [Hợp đồng Order Service](../order/2026-10-12-contracts.md)
+- [Hợp đồng Nền tảng POS](../pos-platform/2026-10-12-contracts.md)
 
-### 1.2 Các Header HTTP
+Tài liệu này là hợp đồng quy chuẩn (normative contract) cho Payment Service. Việc triển khai thực tế bắt buộc phải sinh và xác thực tài liệu OpenAPI 3.1 cùng các artifact AsyncAPI/JSON Schema từ các định nghĩa này trước bản phát hành mã nguồn đầu tiên.
 
-| Header | Bắt buộc | Phạm vi (Scope) | Ý nghĩa |
-|---|---:|---|---|
-| `Authorization` | API người dùng | Cognito | `Bearer <Cognito access token>` |
-| `Authorization` | API nội bộ | Workload identity | Thông tin xác thực service / mTLS hoặc ngữ cảnh workload có chữ ký |
-| `X-Active-Branch-Id` | API người dùng theo chi nhánh | Tư cách thành viên | Chi nhánh được chọn; máy chủ bắt buộc phải xác thực tư cách thành viên |
-| `X-Correlation-Id` | Khuyến nghị | Tất cả | Tương quan API, Saga, audit, outbox và các lệnh gọi hạ nguồn |
-| `X-Causation-Id` | Có điều kiện | Callback nội bộ / sự kiện | Tham chiếu lệnh/sự kiện trực tiếp gây ra thao tác hiện tại |
-| `Idempotency-Key` | Lệnh có tác dụng phụ | Tenant + actor/workload + thao tác | Khóa thử lại; hash yêu cầu chuẩn hóa bắt buộc phải giữ nguyên |
-| `Content-Type` | API có body | REST | `application/json; charset=utf-8` |
+---
 
-Client tuyệt đối không được phép tự đưa vai trò (role), tác nhân (actor), quyền sở hữu tenant hay quyền sở hữu chi nhánh vào trong request body để thay thế ngữ cảnh xác thực.
+## 1. Các Nguyên tắc Hợp đồng (Contract Principles)
 
-### 1.3 Cấu trúc Bao bọc Thành công (Success Envelope)
+- **Tiếp cận API-first & Bounded Context:**
+  - Toàn bộ API đồng bộ công khai sử dụng chuẩn **RESTful + OpenAPI 3.1** dưới tiền tố `/api/v1/payments`.
+  - Các API giao tiếp giữa các service (Service-to-Service) và Step Functions Saga điều phối sử dụng REST dưới tiền tố `/internal/v1/payments`, bắt buộc phải có chứng chỉ Workload Identity / mTLS hoặc HMAC-signed workload token, tuyệt đối không đưa vào bảng định tuyến Gateway công khai.
+  - Các webhook/callback từ nhà cung cấp thanh toán (Provider) nằm dưới tiền tố `/callbacks/v1`.
+  - Payment Service sở hữu toàn bộ vòng đời của `payment_attempt`, mã tham chiếu provider, xác thực IPN checksum, đối soát giao dịch và hoàn tiền.
+  - Payment Service **tuyệt đối không** đọc/ghi cơ sở dữ liệu của Order hay Inventory; không tự tính toán lại thuế/chiết khấu; không tự ý hoàn tất đơn hàng (`finalize Order`); và không tự ý phát ra sự kiện `OrderPaid.v1`.
+- **Định danh & Thời gian:**
+  - Toàn bộ khóa chính và định danh thực thể (`paymentId`, `attemptId`, `callbackId`, `reconciliationRunId`, `refundId`, `outboxMessageId`) đều là chuỗi **UUID v7**.
+  - Toàn bộ dấu thời gian đều là chuỗi định dạng ISO-8601 UTC trong API (`YYYY-MM-DDTHH:mm:ssZ`) và kiểu `TIMESTAMPTZ` trong PostgreSQL. Ngày kinh doanh được tính toán theo múi giờ chi nhánh (`Asia/Ho_Chi_Minh` - ICT).
+- **Tiền tệ & Đơn vị Minor:**
+  - Tiền tệ trong P0 là VND (`currency = "VND"`).
+  - Số tiền luôn được biểu diễn dưới dạng số nguyên không âm `int64` tính theo đơn vị minor (`amountMinor`), trong đó 1 minor unit tương đương 1 VND nguyên. Nghiêm cấm tuyệt đối dùng số thực dấu phẩy động (`float`, `double`).
+  - Đối với VNPAY sandbox, giá trị `vnp_Amount` gửi từ cổng thanh toán đã bị nhân 100 (theo quy ước VNPAY minor unit). Bộ điều hợp VNPAY Adapter bắt buộc phải chia 100 để chuẩn hóa về đúng `amountMinor` VND của hệ thống trước khi kiểm tra hoặc lưu trữ.
+- **Bảo mật Đa người thuê (Multi-tenant) & Phân quyền:**
+  - Ngữ cảnh `tenantId` bắt buộc trích xuất từ token danh tính đã xác thực (Cognito JWT hoặc Service Workload Token). Payment Service không chấp nhận quyền sở hữu tenant từ request body hoặc query parameter.
+  - Header `X-Active-Branch-Id` bắt buộc đối với người dùng chi nhánh (`CASHIER`, `MANAGER`, `KITCHEN`). Chủ sở hữu (`OWNER`) có thể xem toàn tenant nhưng phải chỉ định chi nhánh khi thực hiện thao tác phạm vi chi nhánh.
+- **Tính Bất biến (Idempotency) & Máy trạng thái (State Machine):**
+  - Mọi thao tác ghi có khả năng thử lại bắt buộc phải có header `Idempotency-Key`. Khóa có phạm vi: `(tenantId, actorOrWorkloadId, operation)`.
+  - Các trạng thái kết thúc (`PAID`, `FAILED`, `EXPIRED`, `CANCELLED`) là bất biến (Terminal). Tuyệt đối không ghi đè trạng thái kết thúc khi có callback đến muộn.
+  - Khi provider báo thành công hợp lệ đến muộn sau khi attempt đã ở trạng thái kết thúc (`EXPIRED` hoặc `CANCELLED`): Payment Service chuyển bản ghi vào `late_payment_reconciliation` với trạng thái `SETTLED_LATE`, chỉ phát sự kiện `PaymentReconciliationRequired.v1`, **tuyệt đối không phát `PaymentPaid.v1`** và không phục hồi lại Order.
+- **Transactional Outbox:**
+  - Mọi sự kiện miền (domain event) được ghi đồng thời vào bảng `outbox_messages` trong cùng một giao dịch cơ sở dữ liệu với thay đổi trạng thái thanh toán. Message relay chuyển phát sự kiện sang AWS EventBridge theo cơ chế ít nhất một lần (at-least-once).
+
+---
+
+## 2. Hợp đồng HTTP Chung (Common HTTP Contract)
+
+### Các Header HTTP Chuẩn
+
+| Header | Bắt buộc | Phạm vi | Ý nghĩa và Quy ước sử dụng |
+|---|:---:|---|---|
+| `Authorization` | Bắt buộc | Public API | `Bearer <Cognito access token>`. Xác thực người dùng, phân giải quyền qua Identity Service. |
+| `Authorization` | Bắt buộc | Internal API | `Bearer <Workload Identity / mTLS token>`. Xác thực ngữ cảnh service nội bộ từ AWS Step Functions hoặc Order Service. |
+| `X-Active-Branch-Id` | Có điều kiện | Public API | Bắt buộc đối với vai trò chi nhánh (`CASHIER`, `MANAGER`). Xác thực tư cách thành viên chi nhánh hợp lệ. |
+| `X-Correlation-Id` | Khuyến nghị | Tất cả | Mã UUID v7 truy vết phân tán xuyên suốt qua API Gateway, Step Functions Saga, Payment DB, EventBridge và Provider. Tự sinh nếu thiếu. |
+| `X-Causation-Id` | Có điều kiện | Internal / Callback | Định danh của sự kiện hoặc lệnh trực tiếp gây ra thao tác hiện tại. |
+| `Idempotency-Key` | Bắt buộc | Các lệnh ghi (POST/PATCH) | Khóa duy nhất do client/Saga sinh nhằm đảm bảo an toàn khi thử lại mạng. |
+| `Content-Type` | Bắt buộc | Request có body | `application/json; charset=utf-8`. |
+
+---
+
+### Cấu trúc Bao bì Chuẩn hóa (Envelope Standards)
+
+#### 1. Phản hồi Thành công Thực thể Đơn lẻ (Single Entity Response)
 
 ```json
 {
   "data": {},
   "meta": {
-    "requestId": "req_01J...",
-    "correlationId": "cor_01J..."
+    "requestId": "req_0192b2d0-7f1d-7abc-8d2c-123456789001",
+    "correlationId": "0192b2d0-7f1d-7abc-8d2c-123456789002"
   }
 }
 ```
 
-### 1.4 Cấu trúc Bao bọc Lỗi (Error Envelope)
-
-```json
-{
-  "error": {
-    "code": "provider_amount_mismatch",
-    "message": "Số tiền từ nhà cung cấp không khớp với lượt thử thanh toán",
-    "details": [
-      {
-        "field": "amountMinor",
-        "code": "amount_mismatch",
-        "message": "Số tiền từ nhà cung cấp không được chấp nhận"
-      }
-    ],
-    "requestId": "req_01J...",
-    "correlationId": "cor_01J..."
-  }
-}
-```
-
-Các quy tắc:
-
-- Thông báo `message` tuyệt đối không chứa câu lệnh SQL, JWT, bí mật nhà cung cấp, chữ ký thô, raw callback hay PII không cần thiết.
-- Tài nguyên chéo tenant/chi nhánh không tồn tại trong phạm vi được ủy quyền sẽ trả về mã `404`, không làm lộ sự tồn tại của tài nguyên.
-- Chi tiết xác thực (`details`) chỉ trả về tên trường và mã lỗi an toàn.
-
-### 1.5 Bảng Mã Lỗi và Mã Trạng thái HTTP
-
-| HTTP | Mã lỗi | Ý nghĩa | Có thể thử lại (Retryable) |
-|---:|---|---|---:|
-| `200` | — | Đọc thành công hoặc lệnh thanh toán tiền mặt đã hoàn tất | Không |
-| `202` | `accepted` | Khởi tạo VNPAY hoặc lệnh đối soát đã đưa vào hàng đợi, chưa kết thúc | Có (truy vấn trạng thái) |
-| `400` | `validation_error` | Yêu cầu sai định dạng, sai schema hoặc chứa trường không hỗ trợ | Không |
-| `401` | `unauthorized` | Thiếu, không hợp lệ hoặc hết hạn thông tin xác thực | Sau khi làm mới token |
-| `403` | `forbidden` | Vai trò, phạm vi tenant hoặc chi nhánh không đủ quyền | Không |
-| `404` | `not_found` | Tài nguyên không tồn tại trong phạm vi được ủy quyền | Không |
-| `409` | `idempotency_conflict` | Cùng idempotency key nhưng hash yêu cầu bị thay đổi | Không |
-| `409` | `payment_already_pending` | Đã tồn tại một lượt thử VNPAY đang pending còn hoạt động | Không (trả về payment hiện tại) |
-| `409` | `payment_already_terminal` | Attempt đã ở trạng thái kết thúc và lệnh gửi đến bị mâu thuẫn | Không |
-| `409` | `payment_reconciliation_required` | Tác dụng phụ cần nhân viên vận hành đối soát thủ công | Không tự động thử lại |
-| `409` | `split_tender_exceeds_order_total` | Phân bổ tiền ở P1 vượt quá tổng số tiền phải trả | Không |
-| `422` | `invalid_cash_amount` | Số tiền mặt khách đưa nhỏ hơn số tiền phải trả | Không |
-| `422` | `provider_mapping_mismatch` | Ánh xạ giữa provider, đơn hàng hoặc payment bị sai lệch | Không |
-| `422` | `provider_amount_mismatch` | Số tiền từ provider không khớp với hệ thống | Không |
-| `422` | `invalid_provider_signature` | Checksum hoặc chữ ký điện tử của provider không hợp lệ | Theo chính sách provider |
-| `429` | `rate_limited` | Vượt quá giới hạn tốc độ tại Gateway, service hoặc provider | Thử lại có lùi thời gian |
-| `503` | `provider_unavailable` | Provider không khả dụng hoặc timeout, chưa thể kết luận thất bại | Có |
-| `503` | `service_unavailable` | Phụ thuộc nội bộ của Payment tạm thời không khả dụng | Có |
-
-### 1.6 Tính Bất Biến (Idempotency)
-
-- Bắt buộc phải có header `Idempotency-Key` cho các lệnh khởi tạo thanh toán, lệnh hủy/hết hạn, lệnh chạy đối soát và hoàn tiền ở P1.
-- Phạm vi khóa: `(tenantId, actorOrWorkloadId, operation)`. Đối với Saga, khóa tác vụ chứa `(tenantId, orderId, checkoutAttemptId, taskName)`.
-- Lưu trữ hash yêu cầu chuẩn hóa, phản hồi/trạng thái gốc và thời gian hết hạn.
-- Cùng khóa + cùng hash: Trả lại kết quả gốc đã lưu trước đó.
-- Cùng khóa + khác hash: Trả về mã lỗi `409 idempotency_conflict`.
-- Ràng buộc duy nhất tại cơ sở dữ liệu và khóa giao dịch là lớp bảo vệ cuối cùng; không phụ thuộc vào bộ nhớ đệm ram.
-
-### 1.7 Phân Trang và Bộ Lọc (Pagination/Filtering)
-
-Danh sách lịch sử và đối soát ở P1 sử dụng phân trang theo con trỏ (cursor pagination):
-
-```text
-GET /api/v1/payments?limit=20&cursor=<opaque>&status=PAID&method=VNPAY_QR
-```
-
-- Tham số `limit` mặc định là `20`, tối đa là `100`.
-- Sắp xếp ổn định theo `(createdAt DESC, id DESC)`.
-- Chuỗi con trỏ (cursor) là dạng mờ (opaque), client không được tự ý sửa.
-- Các mệnh đề phạm vi và bộ lọc trong danh sách trắng được áp dụng trước khi phân trang.
-
-Phản hồi:
+#### 2. Phản hồi Danh sách Phân trang theo Con trỏ (Cursor-based Paginated Response)
 
 ```json
 {
   "data": [],
   "meta": {
     "hasMore": true,
-    "nextCursor": "eyJjcmVhdGVkQXQiOi...",
-    "requestId": "req_01J...",
-    "correlationId": "cor_01J..."
+    "nextCursor": "ZXlKallYUmxabVZrUVhRaU9pSXdNVEt5WWpKa01DMDNaelFrTF...",
+    "limit": 20,
+    "requestId": "req_0192b2d0-7f1d-7abc-8d2c-123456789003",
+    "correlationId": "0192b2d0-7f1d-7abc-8d2c-123456789002"
   }
 }
 ```
 
-Tuyệt đối không lưu cache trạng thái hoặc phản hồi đọc của P0. Mô hình đọc và báo cáo ở P1 chỉ lưu cache khi có timestamp độ tươi mới và chính sách vô hiệu hóa rõ ràng.
-
-## 2. Danh Mục Các Endpoint
-
-| Phương thức | Đường dẫn | Phân quyền / Phạm vi | Yêu cầu | Phản hồi | Mã trạng thái |
-|---|---|---|---|---|---|
-| `POST` | `/internal/v1/orders/{orderId}/payments` | Workload identity của Order/Saga | `InitiatePaymentRequest` | `PaymentResponse` | `200` tiền mặt, `202` VNPAY, `409`, `422`, `503` |
-| `GET` | `/api/v1/payments/{paymentId}` | Cognito + phạm vi tenant/chi nhánh | — | `PaymentResponse` | `200`, `403`, `404` |
-| `GET` | `/api/v1/payments` | Manager/Owner + phạm vi | query cursor/bộ lọc | `PaymentPage` | `200`, `403`, `422` |
-| `GET` | `/callbacks/v1/vnpay/ipn` | Ranh giới API Gateway / Provider | Query parameters từ VNPAY | `VnpayIpnResponse` | `200` tương thích provider |
-| `POST` | `/internal/v1/payments/reconciliation/run` | Workload identity của Scheduler / Vận hành | `ReconciliationRunRequest` | `ReconciliationRunResponse` | `202`, `409`, `503` |
-| `GET` | `/api/v1/reconciliations/{reconciliationId}` | Manager/Owner/Vận hành | — | `ReconciliationResponse` | `200`, `403`, `404` |
-| `POST` | `/api/v1/payments/{paymentId}/refunds` | Manager/Owner + phạm vi | `CreateRefundRequest` | `RefundResponse` | `201/202`, `403`, `409`, `422` (P1) |
-| `GET` | `/api/v1/refunds/{refundId}` | Manager/Owner + phạm vi | — | `RefundResponse` | `200`, `403`, `404` (P1) |
-
-### 2.1 Khởi tạo Thanh toán (Initiate Payment)
-
-`POST /internal/v1/orders/{orderId}/payments`
-
-Các trường đáng tin cậy `tenantId`, `branchId`, `actor/workload` và quyền sở hữu đơn hàng bắt buộc phải đến từ xác thực service hoặc ngữ cảnh có chữ ký. Các trường trong request body không phải là nguồn chân lý độc lập.
-
-Yêu cầu (Request):
+#### 3. Phản hồi Lỗi Chuẩn hóa (Standard Error Envelope)
 
 ```json
 {
-  "sagaId": "0192b2d0-7f1d-7abc-8d2c-123456789012",
-  "checkoutAttemptId": "0192b2d0-7f1d-7abc-8d2c-123456789013",
-  "paymentMethod": "CASH",
-  "amountDueMinor": 125000,
-  "currency": "VND",
-  "amountReceivedMinor": 150000,
-  "orderSnapshotVersion": 7,
-  "providerOrderRef": null,
-  "returnUrl": null,
-  "correlationId": "0192b2d0-7f1d-7abc-8d2c-123456789014"
+  "error": {
+    "code": "invalid_cash_amount",
+    "message": "Số tiền mặt khách đưa nhỏ hơn tổng số tiền cần thanh toán của đơn hàng",
+    "details": [
+      {
+        "field": "cashReceivedMinor",
+        "code": "insufficient_amount",
+        "message": "Số tiền nhận (50000 VND) nhỏ hơn số tiền cần thu (68000 VND)"
+      }
+    ],
+    "requestId": "req_0192b2d0-7f1d-7abc-8d2c-123456789004",
+    "correlationId": "0192b2d0-7f1d-7abc-8d2c-123456789002"
+  }
 }
 ```
 
-Quy tắc các trường:
+---
 
-| Trường | Bắt buộc | Quy tắc |
-|---|---:|---|
-| `sagaId` | có | Tham chiếu phiên thực thi của AWS Step Functions |
-| `checkoutAttemptId` | có | Tham chiếu attempt bất biến do Order sở hữu |
-| `paymentMethod` | có | `CASH` hoặc `VNPAY_QR` trong P0 |
-| `amountDueMinor` | có | Số nguyên không âm, phải bằng đúng snapshot Order đáng tin cậy |
-| `currency` | có | `VND` trong P0 |
-| `amountReceivedMinor` | Chỉ cho CASH | Số nguyên ≥ `amountDueMinor`; vắng mặt đối với VNPAY |
-| `orderSnapshotVersion` | có | Phiên bản snapshot được Order/Saga sử dụng |
-| `providerOrderRef` | Chỉ cho VNPAY | Mã tham chiếu merchant ổn định, do Payment sinh/xác thực |
-| `returnUrl` | Chỉ cho VNPAY | URL trong danh sách trắng; không dùng làm tín hiệu xác thực |
-| `correlationId` | có | Ngữ cảnh truy vết lan truyền |
+### Bảng Mã Lỗi và Mã Trạng thái HTTP
 
-Header `Idempotency-Key` được truyền trên HTTP header, không lặp lại trong body.
+| HTTP Status | Mã lỗi (`error.code`) | Ý nghĩa nghiệp vụ | Khả năng Thử lại (Retryable) |
+|:---:|---|---|:---:|
+| `200 OK` | — | Thanh toán tiền mặt thành công ngay lập tức hoặc truy vấn dữ liệu thành công. | Không |
+| `201 Created` | — | Tạo mới bản ghi hoàn tiền hoặc phân bổ thanh toán thành công. | Không |
+| `202 Accepted` | `accepted` | Khởi tạo VNPAY QR thành công (chờ thanh toán IPN) hoặc lệnh đối soát đã đưa vào hàng đợi. | Có (truy vấn trạng thái) |
+| `400 Bad Request` | `validation_error` | Request sai định dạng, thiếu trường bắt buộc hoặc vi phạm schema. | Không |
+| `401 Unauthorized` | `unauthorized` | Token xác thực thiếu, hết hạn hoặc không hợp lệ. | Có (sau khi refresh token) |
+| `403 Forbidden` | `forbidden` | Người dùng hoặc service không có thẩm quyền truy cập tài nguyên. | Không |
+| `404 Not Found` | `not_found` | Tài nguyên không tồn tại trong phạm vi tenant/chi nhánh được ủy quyền. | Không |
+| `409 Conflict` | `idempotency_conflict` | Cùng `Idempotency-Key` nhưng hash payload yêu cầu bị thay đổi. | Không |
+| `409 Conflict` | `payment_already_pending` | Đang tồn tại một lượt thử VNPAY QR còn hiệu lực cho attempt này. | Có (dùng lại QR payload hiện tại) |
+| `409 Conflict` | `payment_already_terminal` | Payment attempt đã ở trạng thái kết thúc (`PAID`, `FAILED`, `EXPIRED`, `CANCELLED`). | Không |
+| `409 Conflict` | `payment_version_conflict` | Phiên bản snapshot đơn hàng hoặc ETag không khớp với dữ liệu máy chủ. | Không |
+| `422 Unprocessable` | `invalid_cash_amount` | Tiền mặt khách đưa nhỏ hơn tổng tiền đơn hàng cần thanh toán. | Không (nhập lại tiền) |
+| `422 Unprocessable` | `provider_amount_mismatch` | Số tiền từ cổng VNPAY không khớp với số tiền đăng ký của payment attempt. | Không |
+| `422 Unprocessable` | `invalid_provider_signature` | Sai chữ ký số HMAC-SHA512 checksum từ VNPAY callback. | Không |
+| `422 Unprocessable` | `refund_amount_exceeded` | Số tiền yêu cầu hoàn vượt quá số dư khả dụng có thể hoàn của thanh toán. | Không |
+| `429 Too Many Requests`| `rate_limited` | Vượt quá giới hạn tần suất yêu cầu tại API Gateway hoặc adapter provider. | Có (lùi thời gian Exponential Backoff) |
+| `503 Unavailable` | `provider_unavailable` | Cổng thanh toán VNPAY Sandbox bị lỗi mạng hoặc timeout, chưa rõ trạng thái. | Có (thử lại hoặc đưa vào đối soát) |
+| `503 Unavailable` | `service_unavailable` | Cơ sở dữ liệu hoặc phụ thuộc nội bộ tạm thời gián đoạn. | Có |
 
-Phản hồi thành công cho Tiền mặt (`200`):
+---
+
+## 3. Danh Mục Các Endpoint
+
+| Phương thức | Đường dẫn API | Phân loại | Thẩm quyền / Phạm vi | Ý nghĩa nghiệp vụ |
+|---|---|:---:|---|---|
+| `POST` | `/internal/v1/orders/{orderId}/payments` | Internal | Workload Identity (Step Functions / Order) | Khởi tạo thanh toán cho đơn hàng (Tiền mặt hoặc VNPAY QR). |
+| `POST` | `/internal/v1/payments/{paymentId}/cancel` | Internal | Workload Identity (Step Functions Saga) | Lệnh bồi hoàn/hủy payment pending khi Saga gặp lỗi downstream. |
+| `POST` | `/internal/v1/payments/{paymentId}/refund` | Internal | Workload Identity (Step Functions Saga) | Lệnh bồi hoàn hoàn tiền tự động khi commit tồn kho thất bại hoàn toàn. |
+| `GET` | `/api/v1/payments/{paymentId}` | Public | `payment:read` (Cognito User) | Xem chi tiết giao dịch thanh toán và trạng thái hiện tại. |
+| `GET` | `/api/v1/payments` | Public | `payment:read` (`MANAGER`, `OWNER`) | Tra cứu danh sách lịch sử thanh toán theo chi nhánh/tenant (phân trang cursor). |
+| `GET` | `/callbacks/v1/vnpay/ipn` | Callback | Provider Boundary (VNPAY Gateway IPN) | Webhook nhận thông báo kết quả giao dịch ngầm (Server-to-Server) từ VNPAY. |
+| `GET` | `/callbacks/v1/vnpay/return` | Callback | Public / Client Browser Redirect | Endpoint nhận chuyển hướng trình duyệt của khách hàng sau khi thanh toán VNPAY. |
+| `POST` | `/internal/v1/payments/reconciliation/run` | Internal | Workload Identity (EventBridge Scheduler / Ops) | Kích hoạt phiên đối soát giao dịch pending quá hạn với VNPAY. |
+| `GET` | `/api/v1/reconciliations/{reconciliationId}` | Public | `payment:manage` (`MANAGER`, `OWNER`) | Xem kết quả chi tiết của một phiên đối soát giao dịch. |
+| `POST` | `/api/v1/payments/{paymentId}/refunds` | Public (P1) | `payment:refund` (`MANAGER`, `OWNER`) | Yêu cầu hoàn tiền một phần hoặc toàn phần cho giao dịch đã thanh toán. |
+| `GET` | `/api/v1/refunds/{refundId}` | Public (P1) | `payment:read` (`MANAGER`, `OWNER`) | Xem chi tiết trạng thái phiếu hoàn tiền. |
+| `POST` | `/api/v1/payments/split` | Public (P1) | `order:checkout` (`CASHIER`, `MANAGER`) | Phân bổ thanh toán đa phương thức (Split Tender: kết hợp Tiền mặt + VNPAY QR). |
+
+---
+
+## 4. Hợp đồng Chi tiết Từng Endpoint
+
+### 4.1 Các API Nội bộ Điều phối Saga (Internal Saga APIs)
+
+#### `POST /internal/v1/orders/{orderId}/payments`
+Được gọi đồng bộ bởi AWS Step Functions Checkout Saga để khởi tạo thanh toán. Tuân thủ nguyên tắc: thông tin tenant, branch và quyền sở hữu đơn hàng được bảo chứng qua Workload Context; payload truyền snapshot tiền tệ bất biến từ Order.
+
+- **Thẩm quyền:** Workload Identity / mTLS của AWS Step Functions hoặc Order Service với quyền `payment:initiate`.
+- **Tiêu đề Yêu cầu (Request Headers):**
+  - `Authorization: Bearer <workload-token>` (Bắt buộc)
+  - `Idempotency-Key: <unique-saga-task-key>` (Bắt buộc)
+  - `X-Correlation-Id: <uuid>` (Bắt buộc)
+  - `Content-Type: application/json; charset=utf-8` (Bắt buộc)
+- **Tham số Đường dẫn (Path Parameters):**
+  - `orderId` (UUID, Bắt buộc): Định danh đơn hàng cần thanh toán.
+- **Dữ liệu Gửi lên (Request Body):**
+
+```json
+{
+  "tenantId": "0192b2d0-7f1d-7abc-8d2c-123456789012",
+  "branchId": "0192b2d0-7f23-7abc-8d2c-123456789012",
+  "sagaId": "0192b2d0-7f33-7abc-8d2c-123456789012",
+  "checkoutAttemptId": "0192b2d0-7f32-7abc-8d2c-123456789012",
+  "orderNumber": "A03-000127",
+  "paymentMethod": "CASH",
+  "amountDueMinor": 68000,
+  "currency": "VND",
+  "cashReceivedMinor": 100000,
+  "orderSnapshotVersion": 6,
+  "returnUrl": null,
+  "clientIp": "192.168.1.50"
+}
+```
+
+*Hoặc đối với phương thức VNPAY QR:*
+
+```json
+{
+  "tenantId": "0192b2d0-7f1d-7abc-8d2c-123456789012",
+  "branchId": "0192b2d0-7f23-7abc-8d2c-123456789012",
+  "sagaId": "0192b2d0-7f33-7abc-8d2c-123456789012",
+  "checkoutAttemptId": "0192b2d0-7f32-7abc-8d2c-123456789012",
+  "orderNumber": "A03-000127",
+  "paymentMethod": "VNPAY_QR",
+  "amountDueMinor": 68000,
+  "currency": "VND",
+  "cashReceivedMinor": null,
+  "orderSnapshotVersion": 6,
+  "returnUrl": "https://pos.coffeechain.com/checkout-result",
+  "clientIp": "192.168.1.50"
+}
+```
+
+*Quy cách kiểm tra (Validation Rules):*
+- `tenantId` & `branchId`: Bắt buộc, khớp với ngữ cảnh token xác thực.
+- `sagaId` & `checkoutAttemptId`: Bắt buộc, định danh UUID v7 bất biến của phiên thanh toán.
+- `paymentMethod`: Enum `CASH` hoặc `VNPAY_QR`.
+- `amountDueMinor`: Số nguyên `BIGINT > 0`, bắt buộc khớp chính xác với snapshot tổng tiền của Order.
+- `cashReceivedMinor`: Bắt buộc khi `paymentMethod = CASH` và phải `>= amountDueMinor`; bắt buộc `null` khi `paymentMethod = VNPAY_QR`.
+- `returnUrl`: Bắt buộc khi `paymentMethod = VNPAY_QR` (phải thuộc danh sách URL được phép); bắt buộc `null` khi `paymentMethod = CASH`.
+
+- **Phản hồi Thành công đối với Tiền mặt (`200 OK` — Hoàn tất ngay lập tức):**
 
 ```json
 {
   "data": {
-    "paymentId": "0192b2d0-7f1d-7abc-8d2c-123456789015",
-    "orderId": "0192b2d0-7f1d-7abc-8d2c-123456789016",
-    "checkoutAttemptId": "0192b2d0-7f1d-7abc-8d2c-123456789013",
-    "sagaId": "0192b2d0-7f1d-7abc-8d2c-123456789012",
+    "paymentId": "0192b2d0-7f34-7abc-8d2c-123456789012",
+    "orderId": "0192b2d0-7f30-7abc-8d2c-123456789012",
+    "checkoutAttemptId": "0192b2d0-7f32-7abc-8d2c-123456789012",
+    "sagaId": "0192b2d0-7f33-7abc-8d2c-123456789012",
     "paymentMethod": "CASH",
-    "paymentStatus": "PAID",
-    "amountDueMinor": 125000,
-    "amountReceivedMinor": 150000,
-    "cashChangeMinor": 25000,
+    "status": "PAID",
+    "amountDueMinor": 68000,
+    "amountReceivedMinor": 100000,
+    "cashChangeMinor": 32000,
     "currency": "VND",
     "provider": null,
     "providerOrderRef": null,
     "providerTransactionId": null,
     "qrPayload": null,
     "expiresAt": null,
-    "paidAt": "2026-10-12T07:00:00Z",
+    "paidAt": "2026-10-12T09:15:30Z",
     "reconciliationRequired": false,
     "lateSettlementStatus": null
   },
   "meta": {
-    "requestId": "req_01J...",
-    "correlationId": "cor_01J..."
+    "requestId": "req_0192b2d0-7f34-7abc-8d2c-123456789001",
+    "correlationId": "0192b2d0-7f1d-7abc-8d2c-123456789002"
   }
 }
 ```
 
-Phản hồi khởi tạo cho VNPAY QR (`202`):
+- **Phản hồi Thành công đối với VNPAY QR (`202 Accepted` — Chờ thanh toán qua IPN):**
 
 ```json
 {
   "data": {
-    "paymentId": "0192b2d0-7f1d-7abc-8d2c-123456789017",
-    "orderId": "0192b2d0-7f1d-7abc-8d2c-123456789016",
-    "checkoutAttemptId": "0192b2d0-7f1d-7abc-8d2c-123456789013",
-    "sagaId": "0192b2d0-7f1d-7abc-8d2c-123456789012",
+    "paymentId": "0192b2d0-7f34-7abc-8d2c-123456789012",
+    "orderId": "0192b2d0-7f30-7abc-8d2c-123456789012",
+    "checkoutAttemptId": "0192b2d0-7f32-7abc-8d2c-123456789012",
+    "sagaId": "0192b2d0-7f33-7abc-8d2c-123456789012",
     "paymentMethod": "VNPAY_QR",
-    "paymentStatus": "PENDING",
-    "amountDueMinor": 125000,
+    "status": "PENDING",
+    "amountDueMinor": 68000,
+    "amountReceivedMinor": null,
+    "cashChangeMinor": null,
     "currency": "VND",
     "provider": "VNPAY",
-    "providerOrderRef": "POS-20261012-000123-A1",
+    "providerOrderRef": "POS-20261012-000127-A1",
     "providerTransactionId": null,
-    "qrPayload": "https://sandbox.vnpayment.vn/paymentv2/vpcpay.html?...",
-    "expiresAt": "2026-10-12T07:15:00Z",
+    "qrPayload": "00020101021238540010A000000727012400069704220110123456789053037045405680005802VN6304ABCD",
+    "paymentUrl": "https://sandbox.vnpayment.vn/paymentv2/vpcpay.html?vnp_Amount=6800000&vnp_Command=pay&vnp_CreateDate=20261012091530&vnp_CurrCode=VND&vnp_IpAddr=192.168.1.50&vnp_Locale=vn&vnp_OrderInfo=Thanh+toan+don+hang+A03-000127&vnp_OrderType=other&vnp_ReturnUrl=https%3A%2F%2Fpos.coffeechain.com%2Fcheckout-result&vnp_TmnCode=COFFEETMN&vnp_TxnRef=POS-20261012-000127-A1&vnp_Version=2.1.0&vnp_SecureHash=3e4f...",
+    "expiresAt": "2026-10-12T09:30:30Z",
     "paidAt": null,
     "reconciliationRequired": false,
     "lateSettlementStatus": null
   },
   "meta": {
-    "requestId": "req_01J...",
-    "correlationId": "cor_01J..."
+    "requestId": "req_0192b2d0-7f34-7abc-8d2c-123456789002",
+    "correlationId": "0192b2d0-7f1d-7abc-8d2c-123456789002"
   }
 }
 ```
 
-### 2.2 Đọc Chi tiết Thanh toán (Read Payment)
+- **Mã lỗi khả dĩ:**
+  - `400 Bad Request` (`validation_error`): Request body sai định dạng.
+  - `401 Unauthorized` (`unauthorized`): Thiếu hoặc sai workload token.
+  - `409 Conflict` (`idempotency_conflict`): Trùng khóa nhưng payload thay đổi.
+  - `409 Conflict` (`payment_already_pending`): Đã có VNPAY attempt đang active. Trả về thông tin QR hiện tại để POS quét tiếp.
+  - `422 Unprocessable` (`invalid_cash_amount`): Khách đưa thiếu tiền mặt.
+  - `503 Service Unavailable` (`provider_unavailable`): Cổng VNPAY sandbox không phản hồi khi sinh QR code.
 
-`GET /api/v1/payments/{paymentId}`
+---
 
-- Bắt buộc phải có Cognito JWT và kiểm tra phạm vi tenant/chi nhánh phía máy chủ.
-- Trả về trạng thái hiện tại, các số tiền bất biến, mã tham chiếu provider, thời gian hết hạn, cờ đối soát và tóm tắt chuyển trạng thái an toàn.
-- Tuyệt đối không trả về raw callback, secret, chuỗi checksum thô hoặc stack trace nội bộ.
-- Payment đã ở trạng thái kết thúc `EXPIRED/CANCELLED` có thể mang `lateSettlementStatus=SETTLED_LATE` nếu bản ghi đối soát tồn tại; không thay đổi `paymentStatus`.
+#### `POST /internal/v1/payments/{paymentId}/cancel`
+Lệnh bồi hoàn (Compensation Step) được AWS Step Functions Checkout Saga kích hoạt khi Saga gặp lỗi ở bước tiếp theo (ví dụ: giữ chỗ nguyên vật liệu trong Inventory bị thất bại hoặc hết thời gian chờ checkout).
 
-### 2.3 Lịch sử Thanh toán (Payment History)
+- **Thẩm quyền:** Workload Identity của AWS Step Functions.
+- **Tiêu đề Yêu cầu (Request Headers):**
+  - `Authorization: Bearer <workload-token>` (Bắt buộc)
+  - `Idempotency-Key: <unique-saga-task-key>` (Bắt buộc)
+  - `X-Correlation-Id: <uuid>` (Bắt buộc)
+  - `Content-Type: application/json; charset=utf-8` (Bắt buộc)
+- **Tham số Đường dẫn (Path Parameters):**
+  - `paymentId` (UUID, Bắt buộc): Định danh giao dịch thanh toán.
+- **Dữ liệu Gửi lên (Request Body):**
 
-`GET /api/v1/payments`
+```json
+{
+  "reasonCode": "INVENTORY_RESERVATION_FAILED",
+  "reasonDescription": "Không đủ nguyên vật liệu sữa đặc tại chi nhánh để hoàn tất đơn",
+  "cancelledAt": "2026-10-12T09:16:00Z"
+}
+```
 
-Các bộ lọc nằm trong danh sách trắng:
+- **Phản hồi Thành công (`200 OK`):**
 
-- `cursor`, `limit`;
-- `from`, `to` theo múi giờ nghiệp vụ của chi nhánh;
-- `branchId` nếu vai trò Owner hoặc phạm vi được phân công cho phép;
-- `orderId`, `paymentId`, `providerTransactionId`;
-- `paymentMethod`, `paymentStatus`, `cashierId`;
-- `reconciliationRequired`, `refundStatus`.
+```json
+{
+  "data": {
+    "paymentId": "0192b2d0-7f34-7abc-8d2c-123456789012",
+    "status": "CANCELLED",
+    "cancelledAt": "2026-10-12T09:16:00Z",
+    "reasonCode": "INVENTORY_RESERVATION_FAILED"
+  },
+  "meta": {
+    "requestId": "req_0192b2d0-7f34-7abc-8d2c-123456789003",
+    "correlationId": "0192b2d0-7f1d-7abc-8d2c-123456789002"
+  }
+}
+```
 
-Quản lý (Manager) chỉ được đọc trong phạm vi chi nhánh. Chủ sở hữu (Owner) có thể đọc toàn tenant và bắt buộc phải chọn chi nhánh khi endpoint/chính sách yêu cầu góc nhìn chi nhánh cụ thể.
+*Quy tắc trạng thái:*
+- Nếu payment đang ở trạng thái `PENDING`: Chuyển sang `CANCELLED`, vô hiệu hóa QR code, phát sự kiện `PaymentCancelled.v1`.
+- Nếu payment đã ở trạng thái kết thúc `CANCELLED` trước đó: Xử lý No-op, trả về `200 OK` với dữ liệu ban đầu.
+- Nếu payment đã ở trạng thái `PAID` (tiền đã trừ hoặc tiền mặt đã nhận): Không thể hủy đơn giản; endpoint trả về mã lỗi `409 payment_already_paid`, yêu cầu Saga chuyển sang nhánh gọi `POST /internal/v1/payments/{paymentId}/refund`.
 
-### 2.4 Webhook VNPAY IPN Callback
+---
 
-`GET /callbacks/v1/vnpay/ipn`
+#### `POST /internal/v1/payments/{paymentId}/refund`
+Lệnh bồi hoàn nâng cao trong Saga (Saga Compensation) được kích hoạt khi tiền đã được xác nhận thanh toán (`PAID`), nhưng bước commit tồn kho hoặc bước finalize Order gặp sự cố kỹ thuật nghiêm trọng không thể phục hồi.
 
-Hợp đồng bên ngoài của VNPAY sử dụng query string dạng `vnp_*`; API Gateway bắt buộc phải bảo toàn query thô / dữ liệu chuẩn hóa để adapter xác thực checksum. Callback domain đã chuẩn hóa tuyệt đối không để lộ tên trường của provider.
+- **Thẩm quyền:** Workload Identity của AWS Step Functions.
+- **Tiêu đề Yêu cầu (Request Headers):** `Authorization`, `Idempotency-Key`, `X-Correlation-Id`, `Content-Type`.
+- **Dữ liệu Gửi lên (Request Body):**
 
-Các trường của provider:
+```json
+{
+  "refundAmountMinor": 68000,
+  "currency": "VND",
+  "reason": "SAGA_EXECUTION_FAILURE_DOWNSTREAM",
+  "correlationId": "0192b2d0-7f1d-7abc-8d2c-123456789002"
+}
+```
 
-| Trường của Provider | Bắt buộc | Ý nghĩa đã chuẩn hóa |
-|---|---:|---|
-| `vnp_TmnCode` | có | Mã định danh terminal của merchant |
-| `vnp_Amount` | có | Số tiền provider gửi (nhân 100); adapter chuẩn hóa về minor unit VND |
-| `vnp_BankCode` | có | Mã ngân hàng / ví thanh toán |
-| `vnp_BankTranNo` | không | Mã giao dịch phía ngân hàng |
-| `vnp_CardType` | không | Loại thanh toán; có thể bao gồm QR |
-| `vnp_PayDate` | không | Thời gian thanh toán phía provider, định dạng GMT+7 |
-| `vnp_OrderInfo` | có | Mô tả thông tin đơn hàng |
-| `vnp_TransactionNo` | có | Mã giao dịch phía VNPAY |
-| `vnp_ResponseCode` | có | Mã phản hồi kết quả giao dịch của VNPAY |
-| `vnp_TransactionStatus` | có | Trạng thái giao dịch của VNPAY |
-| `vnp_TxnRef` | có | Mã tham chiếu đơn hàng / payment của merchant |
-| `vnp_SecureHashType` | không | Chỉ báo thuật toán băm cấu hình |
-| `vnp_SecureHash` | có | Chuỗi checksum kiểm tra toàn vẹn |
+- **Phản hồi Thành công (`200 OK` / `202 Accepted`):** Trả về chi tiết phiếu hoàn tiền khẩn cấp và phát sự kiện `PaymentRefunded.v1`.
 
-Quy trình xử lý IPN:
+---
 
-1. Xác thực định dạng / kích thước query và thu thập metadata thô.
-2. Xác thực `vnp_SecureHash` trước khi thực hiện bất kỳ thao tác DB hay nghiệp vụ nào.
-3. Phân giải `vnp_TxnRef` ra payment attempt tương ứng và xác thực ánh xạ tenant/chi nhánh/provider.
-4. Chuyển đổi `vnp_Amount / 100` theo hợp đồng provider và so sánh chính xác với số tiền minor unit VND.
-5. Kiểm tra `vnp_ResponseCode` và `vnp_TransactionStatus`.
-6. Khử trùng lặp dựa trên khóa sự kiện provider / mã giao dịch provider và hash payload.
-7. Chỉ áp dụng các bước chuyển trạng thái được phép; xung đột với trạng thái kết thúc sẽ chuyển thành bản ghi đối soát / no-op.
-8. Trả về phản hồi JSON tương thích với nhà cung cấp VNPAY.
+### 4.2 Các API Công khai cho Người dùng & Quản lý (Public REST APIs)
 
-Phản hồi:
+#### `GET /api/v1/payments/{paymentId}`
+Truy vấn chi tiết trạng thái của một giao dịch thanh toán. Máy POS thăm dò (polling) endpoint này nếu không nhận được sự kiện real-time hoặc sau khi khách hàng quét mã VNPAY QR.
+
+- **Thẩm quyền:** Quyền `payment:read` (`CASHIER`, `MANAGER`, `OWNER`).
+- **Tiêu đề Yêu cầu (Request Headers):**
+  - `Authorization: Bearer <cognito-token>` (Bắt buộc)
+  - `X-Active-Branch-Id: <uuid>` (Bắt buộc với vai trò chi nhánh)
+  - `X-Correlation-Id: <uuid>` (Tùy chọn)
+- **Tham số Đường dẫn (Path Parameters):**
+  - `paymentId` (UUID, Bắt buộc): Định danh giao dịch thanh toán.
+- **Phản hồi Thành công (`200 OK`):**
+
+```json
+{
+  "data": {
+    "id": "0192b2d0-7f34-7abc-8d2c-123456789012",
+    "tenantId": "0192b2d0-7f1d-7abc-8d2c-123456789012",
+    "branchId": "0192b2d0-7f23-7abc-8d2c-123456789012",
+    "orderId": "0192b2d0-7f30-7abc-8d2c-123456789012",
+    "checkoutAttemptId": "0192b2d0-7f32-7abc-8d2c-123456789012",
+    "paymentMethod": "VNPAY_QR",
+    "status": "PAID",
+    "amountDueMinor": 68000,
+    "amountReceivedMinor": null,
+    "cashChangeMinor": null,
+    "currency": "VND",
+    "provider": "VNPAY",
+    "providerOrderRef": "POS-20261012-000127-A1",
+    "providerTransactionId": "14569823",
+    "qrPayload": "00020101021238540010A00000072701240006970422...",
+    "expiresAt": "2026-10-12T09:30:30Z",
+    "paidAt": "2026-10-12T09:18:45Z",
+    "reconciliationRequired": false,
+    "lateSettlementStatus": null,
+    "stateTransitions": [
+      {
+        "fromStatus": null,
+        "toStatus": "PENDING",
+        "reasonCode": "INITIALIZE_VNPAY_QR",
+        "occurredAt": "2026-10-12T09:15:30Z"
+      },
+      {
+        "fromStatus": "PENDING",
+        "toStatus": "PAID",
+        "reasonCode": "VNPAY_IPN_VERIFIED_SUCCESS",
+        "occurredAt": "2026-10-12T09:18:45Z"
+      }
+    ],
+    "createdAt": "2026-10-12T09:15:30Z",
+    "updatedAt": "2026-10-12T09:18:45Z"
+  },
+  "meta": {
+    "requestId": "req_0192b2d0-7f34-7abc-8d2c-123456789005",
+    "correlationId": "0192b2d0-7f1d-7abc-8d2c-123456789002"
+  }
+}
+```
+
+- **Mã lỗi khả dĩ:** `401 Unauthorized`, `403 Forbidden`, `404 Not Found` (không tìm thấy hoặc không thuộc chi nhánh của người gọi).
+
+---
+
+#### `GET /api/v1/payments`
+Tra cứu danh sách lịch sử thanh toán theo chi nhánh hoặc toàn tenant. Sử dụng cơ chế phân trang theo con trỏ (Cursor Pagination) nhằm đảm bảo hiệu năng cao khi dữ liệu giao dịch lớn.
+
+- **Thẩm quyền:** Quyền `payment:read` (`MANAGER`, `OWNER`).
+- **Tiêu đề Yêu cầu (Request Headers):**
+  - `Authorization: Bearer <cognito-token>` (Bắt buộc)
+  - `X-Active-Branch-Id: <uuid>` (Bắt buộc với Manager)
+  - `X-Correlation-Id: <uuid>` (Tùy chọn)
+- **Tham số Truy vấn (Query Parameters):**
+  - `limit` (integer, Mặc định: `20`, Tối đa: `100`): Số bản ghi trên mỗi trang.
+  - `cursor` (string, Tùy chọn): Con trỏ phân trang mã hóa base64 từ lần đọc trước.
+  - `branchId` (UUID, Tùy chọn): Lọc theo chi nhánh (chỉ dành cho Owner).
+  - `status` (string, Tùy chọn): `PENDING`, `PAID`, `FAILED`, `EXPIRED`, `CANCELLED`.
+  - `paymentMethod` (string, Tùy chọn): `CASH`, `VNPAY_QR`.
+  - `orderId` (UUID, Tùy chọn): Lọc theo đơn hàng.
+  - `reconciliationRequired` (boolean, Tùy chọn): Lọc các giao dịch có cờ bất thường cần đối soát.
+  - `from` & `to` (ISO-8601 UTC, Tùy chọn): Khoảng thời gian tạo giao dịch.
+- **Phản hồi Thành công (`200 OK`):**
+
+```json
+{
+  "data": [
+    {
+      "id": "0192b2d0-7f34-7abc-8d2c-123456789012",
+      "orderId": "0192b2d0-7f30-7abc-8d2c-123456789012",
+      "branchId": "0192b2d0-7f23-7abc-8d2c-123456789012",
+      "paymentMethod": "CASH",
+      "status": "PAID",
+      "amountDueMinor": 68000,
+      "amountReceivedMinor": 100000,
+      "cashChangeMinor": 32000,
+      "currency": "VND",
+      "paidAt": "2026-10-12T09:15:30Z",
+      "reconciliationRequired": false,
+      "createdAt": "2026-10-12T09:15:30Z"
+    }
+  ],
+  "meta": {
+    "hasMore": false,
+    "nextCursor": null,
+    "limit": 20,
+    "requestId": "req_0192b2d0-7f34-7abc-8d2c-123456789006",
+    "correlationId": "0192b2d0-7f1d-7abc-8d2c-123456789002"
+  }
+}
+```
+
+---
+
+#### `GET /api/v1/reconciliations/{reconciliationId}`
+Tra cứu chi tiết kết quả của một phiên chạy đối soát tự động hoặc do nhân viên vận hành kích hoạt.
+
+- **Thẩm quyền:** Quyền `payment:manage` (`MANAGER`, `OWNER`).
+- **Tiêu đề Yêu cầu (Request Headers):** `Authorization`, `X-Active-Branch-Id`, `X-Correlation-Id`.
+- **Tham số Đường dẫn (Path Parameters):**
+  - `reconciliationId` (UUID, Bắt buộc): Định danh phiên đối soát.
+- **Phản hồi Thành công (`200 OK`):**
+
+```json
+{
+  "data": {
+    "id": "0192b2d0-7f1d-7abc-8d2c-123456789021",
+    "tenantId": "0192b2d0-7f1d-7abc-8d2c-123456789012",
+    "status": "COMPLETED",
+    "reason": "PENDING_TIMEOUT_SCAN",
+    "requestedByType": "SCHEDULER",
+    "totalItems": 3,
+    "processedItems": 3,
+    "resolvedCount": 2,
+    "mismatchCount": 1,
+    "items": [
+      {
+        "paymentId": "0192b2d0-7f34-7abc-8d2c-123456789012",
+        "provider": "VNPAY",
+        "providerReference": "POS-20261012-000127-A1",
+        "localStatusBefore": "PENDING",
+        "providerStatus": "SUCCESS",
+        "result": "PAID",
+        "operatorStatus": "RESOLVED",
+        "errorCode": null
+      },
+      {
+        "paymentId": "0192b2d0-7f34-7abc-8d2c-123456789099",
+        "provider": "VNPAY",
+        "providerReference": "POS-20261012-000099-A1",
+        "localStatusBefore": "EXPIRED",
+        "providerStatus": "SUCCESS",
+        "result": "SETTLED_LATE",
+        "operatorStatus": "OPEN",
+        "errorCode": "LATE_SETTLEMENT_AFTER_EXPIRY"
+      }
+    ],
+    "requestedAt": "2026-10-12T10:00:00Z",
+    "completedAt": "2026-10-12T10:00:05Z"
+  },
+  "meta": {
+    "requestId": "req_0192b2d0-7f34-7abc-8d2c-123456789007",
+    "correlationId": "0192b2d0-7f1d-7abc-8d2c-123456789002"
+  }
+}
+```
+
+---
+
+### 4.3 Webhook Nhà cung cấp VNPAY (Provider Boundary)
+
+#### `GET /callbacks/v1/vnpay/ipn`
+Endpoint tiếp nhận thông báo kết quả thanh toán tức thời (Instant Payment Notification - IPN) gửi từ máy chủ VNPAY tới API Gateway.
+
+- **Giao thức & Ranh giới:** HTTP `GET` công khai tại API Gateway; API Gateway bảo toàn nguyên vẹn raw query parameters và chuyển tiếp tới VNPAY IPN Handler.
+- **Bảo mật & Xác thực Chữ ký (Mandatory Checksum Verification):**
+  1. Trích xuất toàn bộ tham số bắt đầu bằng `vnp_*`.
+  2. Tách riêng `vnp_SecureHash` và `vnp_SecureHashType` (nếu có).
+  3. Sắp xếp các tham số còn lại theo thứ tự bảng chữ cái ASCII (a-z) của tên khóa (Key).
+  4. Nối các cặp `key=value` bằng ký tự `&` sau khi đã URL-encode theo chuẩn RFC 3986 (khoảng trắng thành `%20` hoặc `+` theo quy chuẩn VNPAY).
+  5. Tính toán mã băm HMAC-SHA512 với `vnp_HashSecret` lấy từ AWS Secrets Manager.
+  6. So sánh bằng hàm so sánh an toàn thời gian cố định (Constant-time string comparison) với `vnp_SecureHash`. Nếu không khớp, lập tức ghi log an ninh và trả về mã lỗi VNPAY `RspCode: 97`.
+- **Tham số Truy vấn (Query Parameters từ VNPAY):**
+
+| Tham số | Bắt buộc | Mô tả & Chuẩn hóa |
+|---|:---:|---|
+| `vnp_TmnCode` | Có | Mã định danh thiết bị / website của merchant do VNPAY cấp (ví dụ: `COFFEETMN`). |
+| `vnp_Amount` | Có | Số tiền thanh toán nhân 100 (ví dụ: `6800000` tương đương `68000 VND`). |
+| `vnp_BankCode` | Có | Ngân hàng thanh toán (ví dụ: `NCB`, `VCB`, `VIETINBANK`). |
+| `vnp_BankTranNo`| Không | Mã giao dịch phía ngân hàng. |
+| `vnp_CardType` | Không | Loại thẻ / hình thức thanh toán (ví dụ: `QRCODE`). |
+| `vnp_PayDate` | Có | Thời gian thanh toán định dạng `yyyyMMddHHmmss` theo giờ GMT+7. |
+| `vnp_OrderInfo` | Có | Nội dung mô tả đơn hàng không dấu. |
+| `vnp_TransactionNo`| Có | Mã số giao dịch ghi nhận trên hệ thống máy chủ VNPAY (ví dụ: `14569823`). |
+| `vnp_ResponseCode` | Có | Mã phản hồi kết quả: `"00"` là thành công. |
+| `vnp_TransactionStatus`| Có | Trạng thái giao dịch: `"00"` là thành công. |
+| `vnp_TxnRef` | Có | Mã tham chiếu merchant (`providerOrderRef`, ví dụ: `POS-20261012-000127-A1`). |
+| `vnp_SecureHash`| Có | Chuỗi kiểm tra toàn vẹn băm HMAC-SHA512. |
+
+- **Phản hồi Chuẩn hóa Trả về cho VNPAY:**
+  - VNPAY yêu cầu phản hồi theo định dạng JSON với mã HTTP `200 OK` chứa hai trường `RspCode` và `Message`.
 
 ```json
 {
@@ -309,420 +565,679 @@ Phản hồi:
 }
 ```
 
-Hợp đồng VNPAY sử dụng `RspCode=00`/`02` cho cập nhật được chấp nhận và các mã lỗi khác cho trường hợp không hợp lệ / cần thử lại. Việc ánh xạ chi tiết nằm hoàn toàn trong VNPAY adapter; lỗi nội bộ hệ thống không bao giờ được đưa vào trường `Message`.
+- **Bảng Ánh xạ Mã Phản hồi IPN cho VNPAY:**
 
-### 2.5 Lượt Chạy Đối soát (Reconciliation Run)
+| Tình huống xử lý nội bộ | `RspCode` | `Message` | Hành vi hệ thống |
+|---|:---:|---|---|
+| Xác thực hợp lệ, chuyển trạng thái `PAID` thành công | `"00"` | `"Confirm Success"` | Giao dịch hoàn tất, phát sự kiện `PaymentPaid.v1`. |
+| Giao dịch đã được xác nhận `PAID` trước đó (Trùng lặp IPN) | `"02"` | `"Order already confirmed"` | Xử lý No-op; không tạo tác dụng phụ lần hai. |
+| Không tìm thấy payment attempt tương ứng với `vnp_TxnRef` | `"01"` | `"Order not found"` | Ghi log cảnh báo; không tạo giao dịch mới. |
+| Số tiền `vnp_Amount / 100` không khớp với `amountDueMinor` | `"04"` | `"Invalid amount"` | Đánh dấu `reconciliation_required = true`, tạo alert. |
+| Sai chữ ký checksum `vnp_SecureHash` | `"97"` | `"Invalid Checksum"` | Ghi log vi phạm an ninh, từ chối xử lý. |
+| Giao dịch VNPAY báo thất bại (`vnp_ResponseCode != "00"`) | `"00"` | `"Confirm Success"` | Chuyển trạng thái `FAILED`, phát sự kiện `PaymentFailed.v1`. |
+| Giao dịch thành công đến sau khi attempt đã `EXPIRED`/`CANCELLED` | `"00"` | `"Confirm Success"` | Ghi nhận `late_payment_reconciliation(SETTLED_LATE)`, phát `PaymentReconciliationRequired.v1`. Tuyệt đối không chuyển sang `PAID`. |
 
-`POST /internal/v1/payments/reconciliation/run`
+---
 
-Yêu cầu (Request):
+#### `GET /callbacks/v1/vnpay/return`
+Endpoint tiếp nhận chuyển hướng trình duyệt (Customer Return URL) sau khi khách hàng hoàn tất giao diện thanh toán VNPAY sandbox trên điện thoại hoặc trình duyệt POS.
+
+- **Mục đích:** Hiển thị giao diện kết quả thân thiện cho người dùng cuối (Frontend UI); **không bao giờ** dùng làm căn cứ quyết định hoàn tất đơn hàng (IPN mới là nguồn chân lý tài chính).
+- **Quy trình:**
+  1. Xác thực chữ ký `vnp_SecureHash`.
+  2. Tra cứu trạng thái thanh toán hiện tại từ Payment DB.
+  3. Chuyển hướng người dùng về màn hình hoàn tất đơn hàng trên POS frontend với trạng thái:
+     - `success`: Nếu Payment đã nhận được IPN và chuyển sang `PAID`.
+     - `pending`: Nếu IPN chưa tới; frontend hiển thị màn hình chờ và tự động polling endpoint `GET /api/v1/payments/{paymentId}`.
+     - `failed`: Nếu mã phản hồi VNPAY là thất bại hoặc giao dịch bị hủy bởi người dùng.
+
+---
+
+### 4.4 Các API Giai đoạn P1 & P2 (Feature-Gated & Mở rộng)
+
+#### `POST /api/v1/payments/{paymentId}/refunds` (Giai đoạn P1)
+Yêu cầu hoàn trả một phần hoặc toàn bộ số tiền đã thanh toán của giao dịch.
+
+- **Thẩm quyền:** Quyền `payment:refund` (`MANAGER`, `OWNER`).
+- **Tiêu đề Yêu cầu (Request Headers):**
+  - `Authorization: Bearer <cognito-token>` (Bắt buộc)
+  - `X-Active-Branch-Id: <uuid>` (Bắt buộc)
+  - `Idempotency-Key: <unique-key>` (Bắt buộc)
+  - `X-Correlation-Id: <uuid>` (Khuyến nghị)
+  - `Content-Type: application/json; charset=utf-8` (Bắt buộc)
+- **Tham số Đường dẫn (Path Parameters):**
+  - `paymentId` (UUID, Bắt buộc): Định danh giao dịch gốc đã thanh toán.
+- **Dữ liệu Gửi lên (Request Body):**
 
 ```json
 {
-  "paymentIds": [],
-  "providerTransactionIds": [],
-  "reason": "PENDING_TIMEOUT_SCAN",
-  "maxItems": 100,
-  "correlationId": "0192b2d0-7f1d-7abc-8d2c-123456789020"
+  "amountMinor": 34000,
+  "currency": "VND",
+  "reason": "CUSTOMER_RETURN_ITEM",
+  "reasonNote": "Khách trả lại 1 ly Cà phê sữa do nhầm món"
 }
 ```
 
-- Mảng mục tiêu rỗng có nghĩa là bộ lập lịch tự động chọn các mục đủ điều kiện trong phạm vi workload.
-- `maxItems` tối đa là `1000`.
-- Phản hồi mã `202` có nghĩa là lượt chạy đã được chấp nhận và đưa vào hàng đợi, không đồng nghĩa với việc trạng thái payment đã được giải quyết xong.
-- Mã lỗi `409` chỉ dành cho lệnh bị trùng lặp / xung đột hoặc đang có một lượt chạy đang hoạt động, không dùng cho trường hợp provider trả về trạng thái chưa rõ.
+*Quy cách kiểm tra:*
+- Payment gốc bắt buộc phải ở trạng thái `PAID`.
+- `amountMinor`: Số nguyên `> 0` và `<= số dư khả dụng có thể hoàn` (`amountDueMinor - tổng các lần hoàn thành công trước đó`).
+- Đối với thanh toán qua VNPAY, adapter sẽ kích hoạt lệnh gọi API `refund` sang máy chủ VNPAY theo hợp đồng querydr & refund.
 
-Phản hồi:
+- **Phản hồi Thành công (`201 Created` đối với Tiền mặt hoặc `202 Accepted` đối với VNPAY):**
 
 ```json
 {
   "data": {
-    "reconciliationRunId": "0192b2d0-7f1d-7abc-8d2c-123456789021",
-    "status": "QUEUED",
-    "acceptedCount": 12
+    "refundId": "0192b2d0-7f34-7abc-8d2c-123456789088",
+    "paymentId": "0192b2d0-7f34-7abc-8d2c-123456789012",
+    "orderId": "0192b2d0-7f30-7abc-8d2c-123456789012",
+    "amountMinor": 34000,
+    "currency": "VND",
+    "status": "COMPLETED",
+    "reason": "CUSTOMER_RETURN_ITEM",
+    "providerRefundRef": null,
+    "requestedBy": "0192b2d0-7f11-7abc-8d2c-123456789012",
+    "processedAt": "2026-10-12T09:40:00Z",
+    "createdAt": "2026-10-12T09:40:00Z"
   },
   "meta": {
-    "requestId": "req_01J...",
-    "correlationId": "cor_01J..."
+    "requestId": "req_0192b2d0-7f34-7abc-8d2c-123456789008",
+    "correlationId": "0192b2d0-7f1d-7abc-8d2c-123456789002"
   }
 }
 ```
 
-### 2.6 Hoàn tiền P1 (Refund)
+- **Mã lỗi khả dĩ:** `403 Forbidden`, `404 Not Found`, `409 payment_not_paid`, `422 refund_amount_exceeded`.
 
-`POST /api/v1/payments/{paymentId}/refunds`
+---
 
-Yêu cầu (Request):
+#### `GET /api/v1/refunds/{refundId}` (Giai đoạn P1)
+Tra cứu trạng thái của phiếu hoàn tiền.
+
+- **Thẩm quyền:** Quyền `payment:read` (`MANAGER`, `OWNER`).
+- **Phản hồi Thành công (`200 OK`):** Trả về `RefundResponse` tương tự như trên.
+
+---
+
+#### `POST /api/v1/payments/split` (Giai đoạn P1)
+Thanh toán đa phương thức (Split Tender): Cho phép khách hàng thanh toán một đơn hàng bằng sự kết hợp của nhiều hình thức (ví dụ: một phần trả bằng Tiền mặt, phần còn lại quét mã VNPAY QR).
+
+- **Thẩm quyền:** Quyền `order:checkout` (`CASHIER`, `MANAGER`).
+- **Dữ liệu Gửi lên (Request Body):**
 
 ```json
 {
-  "amountMinor": 50000,
-  "reason": "CUSTOMER_REQUEST",
-  "correlationId": "0192b2d0-7f1d-7abc-8d2c-123456789022"
+  "orderId": "0192b2d0-7f30-7abc-8d2c-123456789012",
+  "totalDueMinor": 100000,
+  "currency": "VND",
+  "allocations": [
+    {
+      "allocationId": "alloc-1",
+      "method": "CASH",
+      "amountMinor": 50000,
+      "cashReceivedMinor": 50000
+    },
+    {
+      "allocationId": "alloc-2",
+      "method": "VNPAY_QR",
+      "amountMinor": 50000,
+      "returnUrl": "https://pos.coffeechain.com/checkout-result"
+    }
+  ]
 }
 ```
 
-- Yêu cầu phạm vi Manager/Owner và header `Idempotency-Key`.
-- Payment bắt buộc phải ở trạng thái `PAID`.
-- `amountMinor` phải là số dương và không vượt quá số dư có thể hoàn lại.
-- Bản ghi hoàn tiền độc lập với payment attempt gốc ban đầu.
-- Yêu cầu hoàn tiền sang VNPAY được gửi bởi adapter dưới dạng POST đặc thù của provider; phản hồi từ provider được chuẩn hóa về trạng thái hoàn tiền nội bộ.
+*Quy tắc:* Tổng `amountMinor` của toàn bộ các phần phân bổ bắt buộc phải bằng chính xác `totalDueMinor`. Các attempt con được quản lý độc lập thông qua bảng `payment_allocations`.
 
-## 3. Hợp đồng Trạng thái và Lệnh (State & Command Contracts)
+---
 
-### 3.1 Trạng thái Payment Attempt
+## 5. Hợp đồng Máy Trạng Thái (State Machine Contract)
+
+### 5.1 Sơ đồ Chuyển đổi Trạng thái
 
 ```text
-PENDING
- ├─ cashValidated              → PAID
- ├─ verifiedProviderSuccess    → PAID
- ├─ providerDefinitiveFailure  → FAILED
- ├─ providerExpiry/localClose  → EXPIRED
- └─ authorizedCancel           → CANCELLED
+       [ Khởi tạo thanh toán ]
+                 │
+                 ▼
+             ┌─────────┐
+             │ PENDING │
+             └────┬────┘
+                  │
+     ┌────────────┼──────────────────────────┬────────────────────────┐
+     │ (Tiền mặt đủ /                      │ (Hết hạn pending       │ (Hủy từ POS /
+     │  VNPAY IPN hợp lệ)                  │  hoặc timeout quét)    │  Saga bồi hoàn)
+     ▼                                     ▼                        ▼
+┌─────────┐                           ┌─────────┐              ┌───────────┐
+│  PAID   │ (Terminal)                │ EXPIRED │ (Terminal)   │ CANCELLED │ (Terminal)
+└─────────┘                           └────┬────┘              └─────┬─────┘
+     ▲                                     │                         │
+     │                                     │                         │
+     │ (Provider khẳng định                │ (VNPAY báo thành công   │ (VNPAY báo thành công
+     │  thành công khi còn pending)        │  sau khi đã hết hạn)    │  sau khi đã hủy)
+     │                                     ▼                         ▼
+┌─────────┐                           ┌────────────────────────────────────────┐
+│  FAILED │ (Terminal)                │      LATE_PAYMENT_RECONCILIATION       │
+└─────────┘                           │        (status: SETTLED_LATE)          │
+ (Provider báo                        │                                        │
+  thất bại xác thực)                  │ * Chỉ phát PaymentReconciliationRequired│
+                                      │ * TUYỆT ĐỐI KHÔNG phát PaymentPaid     │
+                                      │ * TUYỆT ĐỐI KHÔNG làm sống lại Order   │
+                                      └────────────────────────────────────────┘
 ```
 
-Các quy tắc:
+### 5.2 Các Quy tắc Bất biến của Máy Trạng thái (Invariants)
 
-- `PAID`, `FAILED`, `EXPIRED`, `CANCELLED` là các trạng thái kết thúc (terminal).
-- Trùng lặp cùng trạng thái là thao tác No-op trả lại kết quả trước đó.
-- Callback xung đột đến sau khi attempt đã kết thúc không được ghi đè trạng thái.
-- Provider báo thành công hợp lệ sau khi attempt đã kết thúc sẽ tạo bản ghi `late_payment_reconciliation(SETTLED_LATE)` và chỉ phát duy nhất sự kiện `PaymentReconciliationRequired`.
-- Trạng thái provider chưa xác định sẽ giữ nguyên `PENDING` kèm cờ đối soát cho đến khi có kết luận rõ ràng hoặc nhân viên vận hành can thiệp xử lý.
+1. **Bất biến Trạng thái Kết thúc:** Các trạng thái `PAID`, `FAILED`, `EXPIRED`, `CANCELLED` là trạng thái kết thúc (Terminal). Mọi lệnh hoặc callback gửi đến sau khi attempt đã ở trạng thái kết thúc đều không được phép ghi đè trạng thái của `payment_attempts`.
+2. **Quy tắc Xử lý Trùng lặp (Idempotent No-op):** Nếu nhận được callback hoặc lệnh trùng khớp với trạng thái hiện tại (ví dụ: nhận thêm IPN thành công cho một attempt đã `PAID`), hệ thống xử lý No-op và trả về phản hồi thành công ban đầu.
+3. **Quy tắc Quyết toán Muộn (Late Settlement Invariant):**
+   - Khi nhà cung cấp VNPAY gửi IPN báo thành công hoặc đối soát xác nhận giao dịch đã trừ tiền thành công, nhưng attempt nội bộ đã chuyển sang `EXPIRED` hoặc `CANCELLED`:
+   - Hệ thống **tuyệt đối không** chuyển trạng thái attempt về `PAID`.
+   - Hệ thống ghi một bản ghi mới vào bảng `late_payment_reconciliation` với trạng thái `settlement_status = "SETTLED_LATE"`.
+   - Hệ thống chỉ phát ra sự kiện `PaymentReconciliationRequired.v1` để nhân viên vận hành xử lý thủ công (liên hệ khách hàng chuyển khoản lại hoặc tạo đơn mới).
+   - Hệ thống **tuyệt đối không phát sự kiện `PaymentPaid.v1`**, không phát `OrderPaid.v1` và không kích hoạt commit tồn kho Inventory.
+4. **Quy tắc Trạng thái Chưa xác định (Indeterminate State):**
+   - Nếu gọi sang VNPAY bị timeout hoặc mạng gián đoạn, payment attempt vẫn giữ nguyên trạng thái `PENDING`, đánh dấu `reconciliation_required = true` và đưa vào hàng đợi đối soát tự động của worker.
 
-### 3.2 Cổng Nhà Cung cấp Chuẩn Hóa (Normalized Provider Port)
+---
 
-```text
-createDynamicQr(CreateQrCommand) -> ProviderQrCreated
-verifyCallback(RawProviderCallback) -> VerifiedProviderCallback | InvalidCallback
-queryStatus(QueryProviderStatusCommand) -> ProviderStatusResult
-refund(RefundProviderCommand) -> ProviderRefundResult       # P1
-```
+## 6. Hợp đồng Sự kiện Tích hợp (Integration Event Contracts)
 
-Kết quả callback đã chuẩn hóa chứa các trường:
+Các sự kiện miền của Payment Service tuân thủ cấu trúc bao bì (Envelope) chuẩn hóa của nền tảng POS. Cơ chế chuyển phát đảm bảo ít nhất một lần (at-least-once); các consumer khử trùng lặp dựa trên `eventId`.
 
-| Trường | Quy tắc |
-|---|---|
-| `provider` | `VNPAY` |
-| `providerOrderRef` | Ánh xạ tới duy nhất một payment attempt |
-| `providerTransactionId` | Duy nhất trong phạm vi provider/tenant khi tồn tại |
-| `amountMinor` | Số nguyên minor unit VND chính xác sau khi adapter đã chuẩn hóa |
-| `providerStatus` | Trạng thái trung lập: `SUCCESS`, `FAILED`, `EXPIRED`, `UNKNOWN` |
-| `signatureValid` | Bắt buộc phải là `true` trước khi xử lý domain |
-| `providerOccurredAt` | Dấu thời gian gốc từ phía provider nếu có |
-| `payloadHash` | Chuỗi băm digest của raw payload chuẩn hóa |
-| `providerEventKey` | Khóa khử trùng lặp ổn định |
-
-## 4. Hợp đồng Sự kiện (Event Contracts)
-
-### 4.1 Cấu trúc Bao bọc Sự kiện (Event Envelope)
-
-Các trường truyền tải chuẩn sử dụng `eventType` + `eventVersion`; ký hiệu tài liệu viết tắt `PaymentPaid.v1` có nghĩa là `eventType=PaymentPaid`, `eventVersion=1`.
+### 6.1 Cấu trúc Bao bì Sự kiện Chuẩn (Event Envelope)
 
 ```json
 {
-  "eventId": "0192b2d0-7f1d-7abc-8d2c-123456789023",
+  "eventId": "0192b2d0-7f34-7abc-8d2c-123456789099",
   "eventType": "PaymentPaid",
   "eventVersion": 1,
-  "occurredAt": "2026-10-12T07:00:00Z",
-  "tenantId": "0192b2d0-7f1d-7abc-8d2c-123456789024",
-  "branchId": "0192b2d0-7f1d-7abc-8d2c-123456789025",
+  "occurredAt": "2026-10-12T09:18:45Z",
+  "tenantId": "0192b2d0-7f1d-7abc-8d2c-123456789012",
+  "branchId": "0192b2d0-7f23-7abc-8d2c-123456789012",
   "aggregateType": "Payment",
-  "aggregateId": "0192b2d0-7f1d-7abc-8d2c-123456789015",
-  "correlationId": "0192b2d0-7f1d-7abc-8d2c-123456789014",
-  "causationId": "0192b2d0-7f1d-7abc-8d2c-123456789026",
+  "aggregateId": "0192b2d0-7f34-7abc-8d2c-123456789012",
+  "correlationId": "0192b2d0-7f1d-7abc-8d2c-123456789002",
+  "causationId": "0192b2d0-7f34-7abc-8d2c-123456789005",
   "producer": "payment-service",
   "payload": {}
 }
 ```
 
-Các quy tắc bao bọc:
+---
 
-- `eventId` là duy nhất toàn cầu; đóng vai trò là khóa khử trùng lặp cho consumer.
-- `eventType`/`eventVersion` là bất biến sau khi xuất bản.
-- `tenantId` là bắt buộc; `branchId` là bắt buộc đối với payment có phạm vi chi nhánh.
-- Consumer chỉ xác nhận hoàn tất (ack) sau khi giao dịch cục bộ đã commit thành công.
-- Phiên bản sự kiện không xác định sẽ được cách ly vào hàng đợi DLQ, không tự diễn giải thành phiên bản cũ hơn.
-- Phân phát sự kiện tuân theo nguyên tắc ít nhất một lần (at-least-once).
+### 6.2 Chi tiết Schemas Từng Sự Kiện
 
-### 4.2 Danh Mục Các Sự Kiện của Payment
+#### 1. `PaymentInitiated.v1`
+Phát ra khi một lượt thử thanh toán mới được khởi tạo thành công (tiền mặt hoặc sinh mã VNPAY QR).
 
-| Sự kiện | Bên phát → Bên nhận | Quy tắc payload |
-|---|---|---|
-| `PaymentInitiated.v1` | Payment → Saga, Audit | `paymentId`, `orderId`, `checkoutAttemptId`, `method`, `amountMinor`, `currency`, `expiresAt` có thể null đối với CASH |
-| `PaymentPaid.v1` | Payment → Saga, Audit | `paymentId`, `orderId`, `method`, `amountMinor`, `currency`, `paidAt`; các trường provider có thể null cho CASH; tiền nhận/tiền thừa là tùy chọn. Saga sau đó gọi lệnh commit tồn kho. |
-| `PaymentFailed.v1` | Payment → Saga, Order, Audit | `paymentId`, `orderId`, `reasonCode`, `retryable`, `failedAt` |
-| `PaymentExpired.v1` | Payment → Saga, Order, Audit | `paymentId`, `orderId`, `expiredAt`, `reasonCode` |
-| `PaymentCancelled.v1` | Payment → Saga, Order, Audit | `paymentId`, `orderId`, `cancelledAt`, `reasonCode`, loại/ID tác nhân |
-| `PaymentReconciliationRequired.v1` | Payment → Saga, Order, Audit, Vận hành | `paymentId`, `orderId`, `reconciliationId`, `reasonCode`, `settlementStatus`, `amountMinor`, `occurredAt` |
+```json
+{
+  "paymentId": "0192b2d0-7f34-7abc-8d2c-123456789012",
+  "orderId": "0192b2d0-7f30-7abc-8d2c-123456789012",
+  "checkoutAttemptId": "0192b2d0-7f32-7abc-8d2c-123456789012",
+  "sagaId": "0192b2d0-7f33-7abc-8d2c-123456789012",
+  "paymentMethod": "VNPAY_QR",
+  "amountDueMinor": 68000,
+  "currency": "VND",
+  "provider": "VNPAY",
+  "providerOrderRef": "POS-20261012-000127-A1",
+  "expiresAt": "2026-10-12T09:30:30Z",
+  "initiatedAt": "2026-10-12T09:15:30Z"
+}
+```
 
-Sự kiện `PaymentReconciliationRequired.v1` mang `settlementStatus=SETTLED_LATE` không phải là sự thật đơn hàng đã thanh toán. Nó tuyệt đối không được kích hoạt commit tồn kho, tích điểm Loyalty, ghi nhận doanh thu Reporting hay phát ra `OrderPaid.v1`.
+---
 
-Sự kiện `OrderPaid.v1` vẫn là sự kiện do Order Service sở hữu và chỉ được phát ra sau khi thanh toán thành công, commit tồn kho hoàn tất và Order đã hoàn tất chính thức.
+#### 2. `PaymentPaid.v1`
+Phát ra khi thanh toán được xác nhận thành công (tiền mặt đã nhận đủ hoặc VNPAY IPN checksum hợp lệ). Sự kiện này được AWS Step Functions Saga lắng nghe để kích hoạt bước commit tồn kho trong Inventory Service.
 
-### 4.3 Định Tuyến và Thử Lại (Routing/Retry)
+```json
+{
+  "paymentId": "0192b2d0-7f34-7abc-8d2c-123456789012",
+  "orderId": "0192b2d0-7f30-7abc-8d2c-123456789012",
+  "checkoutAttemptId": "0192b2d0-7f32-7abc-8d2c-123456789012",
+  "sagaId": "0192b2d0-7f33-7abc-8d2c-123456789012",
+  "paymentMethod": "VNPAY_QR",
+  "amountPaidMinor": 68000,
+  "currency": "VND",
+  "amountReceivedMinor": null,
+  "cashChangeMinor": null,
+  "provider": "VNPAY",
+  "providerTransactionId": "14569823",
+  "paidAt": "2026-10-12T09:18:45Z"
+}
+```
 
-| Tuyến sự kiện | Consumer | Cơ chế Thử lại / DLQ |
-|---|---|---|
-| `PaymentPaid`, `PaymentFailed`, `PaymentExpired`, `PaymentCancelled` | Callback của Saga/Order | Thử lại có giới hạn, sau đó đưa vào DLQ `pos-saga-events` |
-| Toàn bộ sự kiện của Payment | Audit Service | Thử lại bền bỉ / DLQ |
-| `PaymentReconciliationRequired` | Bộ phận Vận hành / Đối soát | Phát cảnh báo + đưa vào hàng đợi thủ công; phát lại đòi hỏi ủy quyền |
+---
 
-## 5. Hợp đồng Dữ liệu (Data Contracts)
+#### 3. `PaymentFailed.v1`
+Phát ra khi thanh toán thất bại dứt khoát (VNPAY báo lỗi giao dịch hoặc khách hủy giao dịch trên cổng thanh toán).
 
-### 5.1 Quy ước Cơ sở Dữ liệu Chung
+```json
+{
+  "paymentId": "0192b2d0-7f34-7abc-8d2c-123456789012",
+  "orderId": "0192b2d0-7f30-7abc-8d2c-123456789012",
+  "checkoutAttemptId": "0192b2d0-7f32-7abc-8d2c-123456789012",
+  "reasonCode": "PROVIDER_DECLINED",
+  "reasonMessage": "Giao dịch không thành công do thẻ/tài khoản của quý khách không đủ số dư",
+  "retryable": false,
+  "failedAt": "2026-10-12T09:17:10Z"
+}
+```
 
-- Sử dụng các kiểu dữ liệu PostgreSQL: `UUID`, `TEXT`, `BIGINT`, `INTEGER`, `BOOLEAN`, `JSONB`, `TIMESTAMPTZ`.
-- Toàn bộ UUID đều là định danh UUID v7.
-- Số tiền là số nguyên `BIGINT` đơn vị minor unit (đồng); VNPAY adapter chia tỷ lệ 100 trước khi lưu DB.
-- Toàn bộ dấu thời gian đều là chuẩn UTC `TIMESTAMPTZ`.
-- Ngày nghiệp vụ được tính toán dựa trên múi giờ IANA của chi nhánh; múi giờ trình duyệt không bao giờ là nguồn thẩm quyền.
-- Mọi file migration bắt buộc phải có `COMMENT ON COLUMN` mô tả rõ ràng mục đích của từng cột mới.
-- Dữ liệu raw payload nhạy cảm được mã hóa/thu giảm; bí mật và chuỗi ký thô tuyệt đối không được ghi log.
+---
 
-### 5.2 Bảng `payment_attempts`
+#### 4. `PaymentExpired.v1`
+Phát ra khi lượt thử thanh toán VNPAY QR vượt quá thời gian hiệu lực (`expiresAt`) mà chưa nhận được tín hiệu thanh toán thành công.
 
-| Cột | Kiểu | Ràng buộc | Mô tả / Chú thích |
-|---|---|---|---|
-| `id` | UUID | Khóa chính (PK) | Định danh nội bộ của payment attempt. |
-| `tenant_id` | UUID | NOT NULL, indexed | Phạm vi tenant sở hữu. |
-| `branch_id` | UUID | NOT NULL, indexed | Chi nhánh nơi Order/payment được tạo. |
-| `order_id` | UUID | NOT NULL, indexed | Tham chiếu Order mờ; không tạo FK chéo service. |
-| `checkout_attempt_id` | UUID | NOT NULL, indexed | Tham chiếu attempt checkout bất biến của Order. |
-| `saga_id` | UUID | NOT NULL, indexed | Tham chiếu phiên thực thi Step Functions/Saga. |
-| `method` | TEXT | CHECK `CASH`/`VNPAY_QR` | Phương thức thanh toán. |
-| `status` | TEXT | CHECK state enum | `PENDING`, `PAID`, `FAILED`, `EXPIRED`, `CANCELLED`. |
-| `amount_due_minor` | BIGINT | NOT NULL, CHECK >= 0 | Số tiền kỳ vọng bất biến từ snapshot Order đáng tin cậy. |
-| `amount_received_minor` | BIGINT | NULL, CHECK >= 0 | Số tiền mặt khách đưa; null đối với phương thức khác tiền mặt. |
-| `cash_change_minor` | BIGINT | NULL, CHECK >= 0 | Tiền thừa do hệ thống tính; null đối với phương thức khác tiền mặt. |
-| `currency` | TEXT | NOT NULL, CHECK `VND` P0 | Đơn vị tiền tệ của thanh toán. |
-| `provider` | TEXT | NULL | Tên nhà cung cấp bên ngoài; null đối với CASH. |
-| `provider_order_ref` | TEXT | NULL | Mã tham chiếu merchant gửi sang nhà cung cấp. |
-| `provider_transaction_id` | TEXT | NULL | Mã tham chiếu quyết toán của nhà cung cấp; duy nhất theo tenant/provider khi tồn tại. |
-| `qr_payload` | TEXT | NULL, bảo vệ khi lưu | Chuỗi payload dynamic QR/chuyển hướng trả về máy POS; không phải secret. |
-| `expires_at` | TIMESTAMPTZ | NULL | Thời gian hết hạn pending; null đối với CASH đồng bộ. |
-| `paid_at` | TIMESTAMPTZ | NULL | Thời điểm attempt chuyển trạng thái sang `PAID`. |
-| `failure_code` | TEXT | NULL | Mã lỗi thất bại đã chuẩn hóa an toàn. |
-| `failure_reason_safe` | TEXT | NULL | Lý do thất bại an toàn cho nhân viên vận hành, đã làm sạch. |
-| `reconciliation_required` | BOOLEAN | NOT NULL DEFAULT false | Đánh dấu sự sai lệch chưa được giải quyết giữa provider và hệ thống nội bộ. |
-| `created_by_type` | TEXT | NOT NULL | Loại tác nhân: Người dùng, Saga, Scheduler hoặc Provider. |
-| `created_by_id` | UUID | NULL | Mã định danh tác nhân/workload khi khả dụng. |
-| `created_at` | TIMESTAMPTZ | NOT NULL | Thời điểm tạo bản ghi theo chuẩn UTC. |
-| `updated_at` | TIMESTAMPTZ | NOT NULL | Thời điểm cập nhật tập hợp gần nhất theo chuẩn UTC. |
+```json
+{
+  "paymentId": "0192b2d0-7f34-7abc-8d2c-123456789012",
+  "orderId": "0192b2d0-7f30-7abc-8d2c-123456789012",
+  "checkoutAttemptId": "0192b2d0-7f32-7abc-8d2c-123456789012",
+  "reasonCode": "PENDING_TIMEOUT",
+  "expiredAt": "2026-10-12T09:30:30Z"
+}
+```
 
-### 5.3 Bảng `payment_state_transitions`
+---
 
-| Cột | Kiểu | Ràng buộc | Mô tả / Chú thích |
-|---|---|---|---|
-| `id` | UUID | Khóa chính (PK) | Định danh bản ghi chuyển trạng thái (chỉ nối thêm). |
-| `tenant_id` | UUID | NOT NULL, indexed | Phạm vi tenant. |
-| `branch_id` | UUID | NOT NULL, indexed | Phạm vi chi nhánh. |
-| `payment_id` | UUID | NOT NULL, indexed | Tham chiếu payment attempt cục bộ. |
-| `from_status` | TEXT | NULL | Trạng thái trước; null khi mới tạo bản ghi đầu tiên. |
-| `to_status` | TEXT | NOT NULL | Trạng thái kết quả sau khi chuyển đổi. |
-| `reason_code` | TEXT | NOT NULL | Mã lý do chuyển đổi trạng thái đã chuẩn hóa. |
-| `actor_type` | TEXT | NOT NULL | Loại tác nhân: Người dùng, Service, Provider hoặc Worker. |
-| `actor_id` | UUID | NULL | Mã định danh tác nhân / workload. |
-| `correlation_id` | UUID | NOT NULL | Mã tương quan truy vết phân tán. |
-| `causation_id` | UUID | NULL | Lệnh hoặc sự kiện trực tiếp gây ra bước chuyển đổi. |
-| `occurred_at` | TIMESTAMPTZ | NOT NULL | Thời điểm nghiệp vụ xảy ra chuyển trạng thái (UTC). |
-| `created_at` | TIMESTAMPTZ | NOT NULL | Thời điểm lưu bản ghi vào DB (UTC). |
+#### 5. `PaymentCancelled.v1`
+Phát ra khi payment attempt đang pending bị hủy bởi nhân viên thu ngân hoặc bởi lệnh bồi hoàn từ Step Functions Saga.
 
-### 5.4 Bảng `provider_callbacks`
+```json
+{
+  "paymentId": "0192b2d0-7f34-7abc-8d2c-123456789012",
+  "orderId": "0192b2d0-7f30-7abc-8d2c-123456789012",
+  "checkoutAttemptId": "0192b2d0-7f32-7abc-8d2c-123456789012",
+  "cancelledBy": "0192b2d0-7f11-7abc-8d2c-123456789012",
+  "reasonCode": "CASHIER_ABORTED",
+  "cancelledAt": "2026-10-12T09:20:00Z"
+}
+```
 
-| Cột | Kiểu | Ràng buộc | Mô tả / Chú thích |
-|---|---|---|---|
-| `id` | UUID | Khóa chính (PK) | Định danh bản ghi callback từ nhà cung cấp. |
-| `tenant_id` | UUID | NULL cho đến khi ánh xạ | Tenant được phân giải từ ánh xạ payment đáng tin cậy. |
-| `branch_id` | UUID | NULL cho đến khi ánh xạ | Chi nhánh được phân giải từ ánh xạ payment đáng tin cậy. |
-| `payment_id` | UUID | NULL cho đến khi ánh xạ | Payment attempt cục bộ khớp được; null nếu tham chiếu không xác định. |
-| `provider` | TEXT | NOT NULL | Tên nhà cung cấp, trong P0 là `VNPAY`. |
-| `provider_event_key` | TEXT | NOT NULL | Khóa sự kiện ổn định dùng để khử trùng lặp callback. |
-| `provider_transaction_id` | TEXT | NULL | Mã định danh giao dịch phía nhà cung cấp. |
-| `payload_hash` | TEXT | NOT NULL | Chuỗi băm digest của raw callback payload chuẩn hóa. |
-| `signature_valid` | BOOLEAN | NOT NULL | Kết quả xác thực chữ ký điện tử / checksum. |
-| `provider_response_code` | TEXT | NULL | Mã phản hồi thô từ provider, bản sao chuẩn hóa an toàn. |
-| `provider_transaction_status` | TEXT | NULL | Trạng thái giao dịch thô từ provider, bản sao chuẩn hóa an toàn. |
-| `raw_payload_encrypted` | JSONB | NULL | Raw payload đã mã hóa/thu giảm trong thời gian lưu trữ. |
-| `processing_result` | TEXT | NOT NULL | Kết quả xử lý: `ACCEPTED`, `DUPLICATE`, `REJECTED`, `RECONCILIATION_REQUIRED`. |
-| `rejection_reason_code` | TEXT | NULL | Mã lý do an toàn cho callback không hợp lệ / sai lệch. |
-| `received_at` | TIMESTAMPTZ | NOT NULL | Thời điểm API Gateway nhận callback (UTC). |
-| `provider_occurred_at` | TIMESTAMPTZ | NULL | Thời gian nghiệp vụ do provider báo cáo (chuẩn hóa về UTC). |
-| `processed_at` | TIMESTAMPTZ | NULL | Thời điểm hoàn tất xử lý nghiệp vụ. |
+---
 
-Callback có chữ ký sai có thể được lưu trữ tại đây làm bằng chứng an ninh nhưng tuyệt đối không được tạo bản ghi idempotency nghiệp vụ hay làm thay đổi trạng thái payment.
+#### 6. `PaymentReconciliationRequired.v1`
+Phát ra khi phát hiện sai lệch bất thường tài chính (ví dụ: sai số tiền, sai mã hash, hoặc tiền báo về sau khi attempt đã hết hạn/hủy `SETTLED_LATE`). Sự kiện này đưa vào hàng đợi cảnh báo cho nhân viên vận hành và kiểm toán.
 
-### 5.5 Bảng `reconciliation_runs` và `reconciliation_items`
+```json
+{
+  "paymentId": "0192b2d0-7f34-7abc-8d2c-123456789012",
+  "orderId": "0192b2d0-7f30-7abc-8d2c-123456789012",
+  "checkoutAttemptId": "0192b2d0-7f32-7abc-8d2c-123456789012",
+  "reconciliationId": "0192b2d0-7f1d-7abc-8d2c-123456789021",
+  "reasonCode": "SETTLED_LATE",
+  "settlementStatus": "SETTLED_LATE",
+  "amountMinor": 68000,
+  "currency": "VND",
+  "provider": "VNPAY",
+  "providerTransactionId": "14569823",
+  "occurredAt": "2026-10-12T09:35:00Z"
+}
+```
 
-#### Bảng `reconciliation_runs`
+---
 
-| Cột | Kiểu | Ràng buộc | Mô tả / Chú thích |
-|---|---|---|---|
-| `id` | UUID | Khóa chính (PK) | Định danh của lượt chạy đối soát. |
-| `tenant_id` | UUID | NOT NULL, indexed | Phạm vi tenant của lượt chạy. |
-| `requested_by_type` | TEXT | NOT NULL | Loại tác nhân yêu cầu: Scheduler, Worker hoặc Vận hành. |
-| `requested_by_id` | UUID | NULL | Mã định danh workload hoặc nhân viên vận hành. |
-| `reason` | TEXT | NOT NULL | Lý do kích hoạt lượt chạy đối soát. |
-| `status` | TEXT | NOT NULL | Trạng thái: `QUEUED`, `RUNNING`, `COMPLETED`, `PARTIAL`, `FAILED`. |
-| `requested_at` | TIMESTAMPTZ | NOT NULL | Thời điểm yêu cầu chạy đối soát (UTC). |
-| `started_at` | TIMESTAMPTZ | NULL | Thời điểm worker bắt đầu thực thi. |
-| `completed_at` | TIMESTAMPTZ | NULL | Thời điểm worker hoàn tất xử lý. |
-| `correlation_id` | UUID | NOT NULL | Mã tương quan truy vết của lượt chạy. |
+## 7. Hợp đồng Cơ sở Dữ liệu & Flyway Migrations (Database Contracts)
 
-#### Bảng `reconciliation_items`
+Payment Service sở hữu một cơ sở dữ liệu PostgreSQL độc lập (`pos_payment`). Dưới đây là mã DDL đầy đủ, chi tiết cho 6 bản migration Flyway tuần tự:
 
-| Cột | Kiểu | Ràng buộc | Mô tả / Chú thích |
-|---|---|---|---|
-| `id` | UUID | Khóa chính (PK) | Định danh của từng mục đối soát cụ thể. |
-| `run_id` | UUID | NOT NULL, indexed | Thuộc lượt chạy đối soát cha nào. |
-| `payment_id` | UUID | NULL | Tham chiếu payment attempt cục bộ. |
-| `provider` | TEXT | NOT NULL | Tên nhà cung cấp được tra cứu. |
-| `provider_reference` | TEXT | NOT NULL | Mã tham chiếu đơn hàng/giao dịch được tra cứu. |
-| `local_status_before` | TEXT | NOT NULL | Trạng thái payment nội bộ trước khi tra cứu. |
-| `provider_status` | TEXT | NULL | Kết quả trạng thái chuẩn hóa từ phía provider. |
-| `result` | TEXT | NOT NULL | Kết luận: `PAID`, `FAILED`, `EXPIRED`, `UNKNOWN`, `SETTLED_LATE`, `ERROR`. |
-| `attempt_count` | INTEGER | NOT NULL DEFAULT 0 | Số lần đã thực hiện truy vấn provider. |
-| `next_retry_at` | TIMESTAMPTZ | NULL | Thời điểm đủ điều kiện thử lại tiếp theo. |
-| `lease_owner` | TEXT | NULL | Định danh worker đang giữ quyền khóa lease. |
-| `lease_expires_at` | TIMESTAMPTZ | NULL | Thời điểm hết hạn của khóa lease. |
-| `error_code` | TEXT | NULL | Mã lỗi an toàn từ provider hoặc quá trình xử lý. |
-| `operator_status` | TEXT | NOT NULL | Trạng thái xử lý: `UNASSIGNED`, `OPEN`, `UNDER_REVIEW`, `RESOLVED`. |
-| `created_at` | TIMESTAMPTZ | NOT NULL | Thời điểm tạo mục đối soát. |
-| `updated_at` | TIMESTAMPTZ | NOT NULL | Thời điểm cập nhật mục đối soát gần nhất. |
+### `V1__initial_payment_schema.sql`
+Thiết lập các bảng cốt lõi quản lý phiên thử thanh toán, lịch sử chuyển trạng thái và nhật ký callback từ nhà cung cấp.
 
-### 5.6 Bảng `late_payment_reconciliation`
+```sql
+-- V1__initial_payment_schema.sql
+-- Module: Payment Service
+-- Bounded Context: Payment & Provider Integrations
 
-| Cột | Kiểu | Ràng buộc | Mô tả / Chú thích |
-|---|---|---|---|
-| `id` | UUID | Khóa chính (PK) | Định danh bản ghi đối soát thanh toán muộn. |
-| `tenant_id` | UUID | NOT NULL, indexed | Phạm vi tenant. |
-| `branch_id` | UUID | NOT NULL, indexed | Phạm vi chi nhánh. |
-| `payment_id` | UUID | NOT NULL, indexed | Tham chiếu payment attempt đã ở trạng thái kết thúc. |
-| `order_id` | UUID | NOT NULL | Tham chiếu Order mờ. |
-| `checkout_attempt_id` | UUID | NOT NULL | Tham chiếu checkout attempt gốc. |
-| `provider` | TEXT | NOT NULL | Nhà cung cấp báo cáo quyết toán muộn. |
-| `provider_order_ref` | TEXT | NOT NULL | Mã tham chiếu merchant phía provider. |
-| `provider_transaction_id` | TEXT | NOT NULL | Mã giao dịch quyết toán muộn từ provider. |
-| `amount_minor` | BIGINT | NOT NULL | Số tiền quyết toán muộn do provider báo cáo. |
-| `currency` | TEXT | NOT NULL | Đơn vị tiền tệ quyết toán. |
-| `settlement_status` | TEXT | NOT NULL | Giá trị P0: `SETTLED_LATE`; tuyệt đối không có nghĩa là Order đã thanh toán. |
-| `status` | TEXT | NOT NULL | Trạng thái xử lý: `OPEN`, `UNDER_REVIEW`, `RECOVERED`, `REFUNDED`, `CLOSED`. |
-| `reason_code` | TEXT | NOT NULL | Lý do quyết toán đến sau khi attempt đã kết thúc. |
-| `operator_id` | UUID | NULL | Nhân viên vận hành được phân công xử lý. |
-| `resolution_note_safe` | TEXT | NULL | Ghi chú xử lý an toàn của nhân viên vận hành. |
-| `resolved_at` | TIMESTAMPTZ | NULL | Thời điểm giải quyết xong ngoại lệ (UTC). |
-| `created_at` | TIMESTAMPTZ | NOT NULL | Thời điểm tạo bản ghi ngoại lệ. |
-| `updated_at` | TIMESTAMPTZ | NOT NULL | Thời điểm cập nhật bản ghi ngoại lệ gần nhất. |
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
-### 5.7 Bảng `idempotency_records`
+-- Bảng 1: payment_attempts - Quản lý các lượt thử thanh toán
+CREATE TABLE payment_attempts (
+    id UUID PRIMARY KEY,
+    tenant_id UUID NOT NULL,
+    branch_id UUID NOT NULL,
+    order_id UUID NOT NULL,
+    checkout_attempt_id UUID NOT NULL,
+    saga_id UUID NOT NULL,
+    method TEXT NOT NULL,
+    status TEXT NOT NULL,
+    amount_due_minor BIGINT NOT NULL,
+    amount_received_minor BIGINT NULL,
+    cash_change_minor BIGINT NULL,
+    currency TEXT NOT NULL DEFAULT 'VND',
+    provider TEXT NULL,
+    provider_order_ref TEXT NULL,
+    provider_transaction_id TEXT NULL,
+    qr_payload TEXT NULL,
+    expires_at TIMESTAMPTZ NULL,
+    paid_at TIMESTAMPTZ NULL,
+    failure_code TEXT NULL,
+    failure_reason_safe TEXT NULL,
+    reconciliation_required BOOLEAN NOT NULL DEFAULT FALSE,
+    created_by_type TEXT NOT NULL,
+    created_by_id UUID NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
 
-| Cột | Kiểu | Ràng buộc | Mô tả / Chú thích |
-|---|---|---|---|
-| `id` | UUID | Khóa chính (PK) | Định danh bản ghi idempotency. |
-| `tenant_id` | UUID | NOT NULL, indexed | Phạm vi tenant. |
-| `actor_scope` | TEXT | NOT NULL | Phạm vi workload của người dùng hoặc service. |
-| `operation` | TEXT | NOT NULL | Tên thao tác lệnh nghiệp vụ. |
-| `idempotency_key` | TEXT | NOT NULL | Khóa thử lại do bên gọi cung cấp. |
-| `request_hash` | TEXT | NOT NULL | Fingerprint chuẩn hóa của request body/param. |
-| `response_status` | INTEGER | NOT NULL | Mã trạng thái HTTP kết quả ban đầu. |
-| `response_reference` | UUID | NULL | Mã payment/refund/run được trả về bởi lệnh ban đầu. |
-| `response_body_redacted` | JSONB | NOT NULL | Body phản hồi an toàn có thể phát lại trực tiếp. |
-| `expires_at` | TIMESTAMPTZ | NOT NULL | Thời điểm hết hạn lưu giữ idempotency. |
-| `created_at` | TIMESTAMPTZ | NOT NULL | Thời điểm tạo bản ghi idempotency. |
+    CONSTRAINT ck_payment_method CHECK (method IN ('CASH', 'VNPAY_QR')),
+    CONSTRAINT ck_payment_status CHECK (status IN ('PENDING', 'PAID', 'FAILED', 'EXPIRED', 'CANCELLED')),
+    CONSTRAINT ck_payment_amount_due CHECK (amount_due_minor >= 0),
+    CONSTRAINT ck_payment_amount_received CHECK (amount_received_minor IS NULL OR amount_received_minor >= 0),
+    CONSTRAINT ck_payment_cash_change CHECK (cash_change_minor IS NULL OR cash_change_minor >= 0),
+    CONSTRAINT ck_payment_currency CHECK (currency = 'VND'),
+    CONSTRAINT ck_payment_created_by_type CHECK (created_by_type IN ('USER', 'SAGA', 'SCHEDULER', 'PROVIDER'))
+);
 
-### 5.8 Bảng `outbox_messages`
+-- Bảng 2: payment_state_transitions - Nhật ký chuyển đổi trạng thái (Append-only)
+CREATE TABLE payment_state_transitions (
+    id UUID PRIMARY KEY,
+    tenant_id UUID NOT NULL,
+    branch_id UUID NOT NULL,
+    payment_id UUID NOT NULL REFERENCES payment_attempts(id) ON DELETE RESTRICT,
+    from_status TEXT NULL,
+    to_status TEXT NOT NULL,
+    reason_code TEXT NOT NULL,
+    actor_type TEXT NOT NULL,
+    actor_id UUID NULL,
+    correlation_id UUID NOT NULL,
+    causation_id UUID NULL,
+    occurred_at TIMESTAMPTZ NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
 
-| Cột | Kiểu | Ràng buộc | Mô tả / Chú thích |
-|---|---|---|---|
-| `id` | UUID | Khóa chính (PK) | Định danh sự kiện outbox và khóa khử trùng lặp của consumer. |
-| `tenant_id` | UUID | NOT NULL | Phạm vi tenant trong envelope sự kiện. |
-| `branch_id` | UUID | NOT NULL | Phạm vi chi nhánh trong envelope sự kiện. |
-| `aggregate_type` | TEXT | NOT NULL | Loại tập hợp, trong P0 là `Payment`. |
-| `aggregate_id` | UUID | NOT NULL | Định danh của tập hợp Payment. |
-| `event_type` | TEXT | NOT NULL | Tên kiểu sự kiện (không có hậu tố phiên bản). |
-| `event_version` | INTEGER | NOT NULL | Phiên bản schema sự kiện bất biến. |
-| `payload` | JSONB | NOT NULL | Envelope và payload sự kiện có phiên bản, không chứa bí mật. |
-| `occurred_at` | TIMESTAMPTZ | NOT NULL | Thời điểm nghiệp vụ sự kiện phát sinh. |
-| `publish_status` | TEXT | NOT NULL | Trạng thái xuất bản: `PENDING`, `PUBLISHED`, `DLQ`. |
-| `attempt_count` | INTEGER | NOT NULL DEFAULT 0 | Số lần đã thực hiện xuất bản sang broker. |
-| `next_attempt_at` | TIMESTAMPTZ | NULL | Thời điểm đủ điều kiện thử lại xuất bản tiếp theo. |
-| `last_error_safe` | TEXT | NULL | Lỗi xuất bản gần nhất đã được làm sạch thông tin. |
-| `created_at` | TIMESTAMPTZ | NOT NULL | Thời điểm tạo bản ghi outbox. |
+    CONSTRAINT ck_transition_to_status CHECK (to_status IN ('PENDING', 'PAID', 'FAILED', 'EXPIRED', 'CANCELLED')),
+    CONSTRAINT ck_transition_actor_type CHECK (actor_type IN ('USER', 'SERVICE', 'PROVIDER', 'WORKER'))
+);
 
-### 5.9 Các Bảng P1: `payment_allocations` và `refunds`
+-- Bảng 3: provider_callbacks - Lưu vết dữ liệu callback từ cổng thanh toán
+CREATE TABLE provider_callbacks (
+    id UUID PRIMARY KEY,
+    tenant_id UUID NULL,
+    branch_id UUID NULL,
+    payment_id UUID NULL REFERENCES payment_attempts(id) ON DELETE SET NULL,
+    provider TEXT NOT NULL,
+    provider_event_key TEXT NOT NULL,
+    provider_transaction_id TEXT NULL,
+    payload_hash TEXT NOT NULL,
+    signature_valid BOOLEAN NOT NULL,
+    provider_response_code TEXT NULL,
+    provider_transaction_status TEXT NULL,
+    raw_payload_encrypted JSONB NULL,
+    processing_result TEXT NOT NULL,
+    rejection_reason_code TEXT NULL,
+    received_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    provider_occurred_at TIMESTAMPTZ NULL,
+    processed_at TIMESTAMPTZ NULL,
 
-Bảng `payment_allocations` ghi nhận việc phân bổ thanh toán cho từng phương thức trong một Order; bảng `refunds` ghi nhận giao dịch hoàn tiền một phần/toàn bộ độc lập với payment attempt gốc.
+    CONSTRAINT ck_callback_processing_result CHECK (processing_result IN ('ACCEPTED', 'DUPLICATE', 'REJECTED', 'RECONCILIATION_REQUIRED'))
+);
+```
 
-| Bảng | Các cột bắt buộc và chú thích |
-|---|---|
-| `payment_allocations` | `id` UUID; phạm vi `tenant_id`/`branch_id`; `order_id`; `payment_id`; `amount_minor`; `currency`; `status`; `idempotency_key`; `created_at`; `updated_at`. Phân bổ không được phép làm tổng tiền phân bổ vượt quá số tiền phải trả bất biến của Order. |
-| `refunds` | `id` UUID; phạm vi `tenant_id`/`branch_id`; `payment_id`; `amount_minor`; `currency`; `reason`; `status`; `provider`; `provider_ref`; `requested_by`; `processed_at`; `idempotency_key`; `created_at`; `updated_at`. Tổng số tiền hoàn thành công không được vượt quá số dư khả dụng có thể hoàn tiền. |
+---
 
-## 6. Các Ràng Buộc và Chỉ Mục (Constraints & Indexes)
+### `V2__reconciliation_and_late_settlement.sql`
+Thiết lập bảng quản lý các phiên chạy đối soát, danh sách các mục kiểm tra và bảng ghi nhận ngoại lệ quyết toán muộn (`SETTLED_LATE`).
 
-| Tên ràng buộc / Chỉ mục | Các cột / Điều kiện | Mục đích sử dụng |
-|---|---|---|
-| `uq_payment_idempotency` | `tenant_id, actor_scope, operation, idempotency_key` | Đảm bảo duy nhất một kết quả phát lại cho mỗi khóa lệnh |
-| `uq_provider_transaction` | `tenant_id, provider, provider_transaction_id` khi khác null | Ngăn chặn việc quyết toán trùng lặp từ provider trong phạm vi |
-| `uq_provider_callback_key` | `provider, provider_event_key` | Khử trùng lặp callback từ phía nhà cung cấp |
-| `uq_active_vnpay_attempt` | `checkout_attempt_id` với điều kiện method `VNPAY_QR` và status `PENDING` | Chỉ duy nhất một attempt QR active; attempt cũ được đánh giá hết hạn và chuyển trạng thái nguyên tử trước khi tạo attempt mới |
-| `idx_payment_scope_time` | `tenant_id, branch_id, created_at DESC` | Truy vấn lịch sử theo chi nhánh và tenant |
-| `idx_payment_pending_expiry` | `tenant_id, status, expires_at` | Quét đối soát các payment pending đã quá hạn |
-| `idx_payment_reconciliation_retry` | `tenant_id, reconciliation_required, next_retry_at` | Lựa chọn các mục cần đưa vào hàng đợi thử lại đối soát |
-| `idx_callback_provider_time` | `provider, received_at DESC` | Lịch sử và vận hành tra cứu callback |
-| `idx_outbox_publish` | `publish_status, next_attempt_at, created_at` | Tiến trình polling của outbox publisher |
-| `idx_reconciliation_operator` | `tenant_id, branch_id, operator_status, updated_at DESC` | Hàng đợi tác vụ cho nhân viên vận hành |
+```sql
+-- V2__reconciliation_and_late_settlement.sql
 
-Việc đánh giá hết hạn (expiry) được thực hiện bên trong giao dịch khởi tạo / đối soát. Một yêu cầu phát hiện attempt `PENDING` đã quá hạn bắt buộc phải chuyển trạng thái attempt cũ sang `EXPIRED` dưới cùng một khóa trước khi tạo attempt mới; chỉ mục duy nhất trong database tuyệt đối không sử dụng mệnh đề điều kiện không bất biến `expires_at > now()`.
+-- Bảng 4: reconciliation_runs - Phiên chạy đối soát
+CREATE TABLE reconciliation_runs (
+    id UUID PRIMARY KEY,
+    tenant_id UUID NOT NULL,
+    requested_by_type TEXT NOT NULL,
+    requested_by_id UUID NULL,
+    reason TEXT NOT NULL,
+    status TEXT NOT NULL,
+    requested_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    started_at TIMESTAMPTZ NULL,
+    completed_at TIMESTAMPTZ NULL,
+    correlation_id UUID NOT NULL,
 
-## 7. Hợp đồng Xử lý Dữ liệu và An Toàn Bảo Mật
+    CONSTRAINT ck_recon_run_requested_by CHECK (requested_by_type IN ('SCHEDULER', 'WORKER', 'OPERATOR')),
+    CONSTRAINT ck_recon_run_status CHECK (status IN ('QUEUED', 'RUNNING', 'COMPLETED', 'PARTIAL', 'FAILED'))
+);
 
-- Phân quyền API người dùng: Cognito JWT + quyết định tư cách thành viên và quyền hạn hiện tại từ Identity Service.
-- Phân quyền API nội bộ: Workload identity / mTLS hoặc ngữ cảnh workload có chữ ký; client công khai không thể gọi `/internal/v1`.
-- Các phương thức repository bắt buộc phải có phạm vi tenant; phạm vi chi nhánh là bắt buộc trừ khi bên gọi có quyền Owner hoặc vận hành toàn tenant.
-- Trường `vnp_SecureHash` bắt buộc phải được xác thực thành công trước khi thực hiện ánh xạ provider hoặc tra cứu nghiệp vụ.
-- Raw callback payload có thể được lưu trữ dưới dạng mã hóa trong 90 ngày; metadata chuẩn hóa, chuỗi băm và bằng chứng quyết toán tuân theo chính sách lưu giữ hồ sơ tài chính.
-- Sổ cái thanh toán / hoàn tiền / đối soát và bằng chứng audit/bảo mật có thời gian lưu giữ cơ sở là 7 năm, tuân thủ theo quy định pháp luật và chính sách của tenant.
-- Tuyệt đối không log dữ liệu thẻ thô, khóa bí mật, JWT, chuỗi ký thô hay PII khách hàng không cần thiết.
-- Bản ghi audit log bao gồm: Loại/ID tác nhân, hành động, lý do, tài nguyên, tenant/chi nhánh, correlation ID, kết quả và các dấu thời gian.
+-- Bảng 5: reconciliation_items - Từng mục giao dịch cần đối soát
+CREATE TABLE reconciliation_items (
+    id UUID PRIMARY KEY,
+    run_id UUID NOT NULL REFERENCES reconciliation_runs(id) ON DELETE CASCADE,
+    payment_id UUID NULL REFERENCES payment_attempts(id) ON DELETE SET NULL,
+    provider TEXT NOT NULL,
+    provider_reference TEXT NOT NULL,
+    local_status_before TEXT NOT NULL,
+    provider_status TEXT NULL,
+    result TEXT NOT NULL,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    next_retry_at TIMESTAMPTZ NULL,
+    lease_owner TEXT NULL,
+    lease_expires_at TIMESTAMPTZ NULL,
+    error_code TEXT NULL,
+    operator_status TEXT NOT NULL DEFAULT 'UNASSIGNED',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
 
-## 8. Các Sửa Đổi Bắt Buộc Đối với Hợp đồng Cha
+    CONSTRAINT ck_recon_item_result CHECK (result IN ('PAID', 'FAILED', 'EXPIRED', 'UNKNOWN', 'SETTLED_LATE', 'ERROR')),
+    CONSTRAINT ck_recon_item_operator_status CHECK (operator_status IN ('UNASSIGNED', 'OPEN', 'UNDER_REVIEW', 'RESOLVED'))
+);
 
-Các thay đổi sau đây bắt buộc phải được cập nhật vào tài liệu `docs/designs/pos-platform/2026-10-12-contracts.md` trước khi triển khai:
+-- Bảng 6: late_payment_reconciliation - Bằng chứng tài chính quyết toán muộn
+CREATE TABLE late_payment_reconciliation (
+    id UUID PRIMARY KEY,
+    tenant_id UUID NOT NULL,
+    branch_id UUID NOT NULL,
+    payment_id UUID NOT NULL REFERENCES payment_attempts(id) ON DELETE RESTRICT,
+    order_id UUID NOT NULL,
+    checkout_attempt_id UUID NOT NULL,
+    provider TEXT NOT NULL,
+    provider_order_ref TEXT NOT NULL,
+    provider_transaction_id TEXT NOT NULL,
+    amount_minor BIGINT NOT NULL,
+    currency TEXT NOT NULL DEFAULT 'VND',
+    settlement_status TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'OPEN',
+    reason_code TEXT NOT NULL,
+    operator_id UUID NULL,
+    resolution_note_safe TEXT NULL,
+    resolved_at TIMESTAMPTZ NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
 
-1. Đổi endpoint VNPAY IPN từ `POST` sang `GET /callbacks/v1/vnpay/ipn`; dữ liệu gửi lên là query parameters và phản hồi trả về tương thích với provider `{RspCode, Message}`.
-2. Đánh dấu trường `PaymentInitiated.expiresAt` có thể mang giá trị null đối với phương thức CASH đồng bộ.
-3. Đánh dấu các trường `PaymentPaid.provider` và `providerTransactionId` có thể mang giá trị null đối với CASH.
-4. Bổ sung các trường `paymentMethod`, `amountReceivedMinor` và `cashChangeMinor` vào payload sự kiện `PaymentPaid` khi áp dụng.
-5. Bổ sung sự kiện `PaymentReconciliationRequired.v1` với các trường `reconciliationId`, `reasonCode` và `settlementStatus`.
-6. Định nghĩa quyết toán muộn `SETTLED_LATE` là bằng chứng đối soát, tuyệt đối không phát `PaymentPaid` hay `OrderPaid`.
-7. Phạm vi hóa chỉ mục `uq_provider_transaction` theo tenant/provider và cho phép các tham chiếu provider mang giá trị null.
-8. Cập nhật request/response khởi tạo Payment với `sagaId`, `checkoutAttemptId`, thông tin VNPAY QR/hết hạn, cờ đối soát và tiền thừa tiền mặt.
-9. Bổ sung các hợp đồng `GET /api/v1/payments`, chi tiết đối soát và hợp đồng hoàn tiền P1.
-10. Bổ sung các dữ liệu mẫu kiểm thử hợp đồng cho checksum không hợp lệ, sai số tiền/đơn hàng, IPN trùng lặp / sai thứ tự / đến muộn, phản hồi tiền mặt và phản hồi thử lại VNPAY.
+    CONSTRAINT ck_late_recon_amount CHECK (amount_minor > 0),
+    CONSTRAINT ck_late_recon_settlement CHECK (settlement_status = 'SETTLED_LATE'),
+    CONSTRAINT ck_late_recon_status CHECK (status IN ('OPEN', 'UNDER_REVIEW', 'RECOVERED', 'REFUNDED', 'CLOSED'))
+);
+```
 
-## 9. Ma trận Kiểm thử Hợp đồng (Contract Test Matrix)
+---
 
-| Kịch bản kiểm thử | Kết quả hợp đồng kỳ vọng |
-|---|---|
-| Tiền mặt đưa vừa đúng số tiền | Trả về `200`, `PAID`, tiền thừa `0`, phát đúng một `PaymentPaid` |
-| Tiền mặt khách đưa thừa tiền | Trả về `200`, tính đúng tiền thừa số nguyên, phát đúng một `PaymentPaid` |
-| Tiền mặt khách đưa thiếu tiền | Trả về `422 invalid_cash_amount`, không đổi trạng thái, không phát sự kiện |
-| Gửi trùng lặp yêu cầu tiền mặt | Trả về phản hồi ban đầu, không tạo dòng mới, không phát sự kiện lặp |
-| Khởi tạo VNPAY đồng thời | Chỉ tạo duy nhất một `PENDING` active, trả về cùng thông tin QR/payment |
-| Checksum IPN không hợp lệ | Trả về phản hồi không hợp lệ tương thích provider, không đổi trạng thái, không phát sự kiện |
-| Chữ ký hợp lệ nhưng sai số tiền | Không chuyển `PAID`, lưu callback từ chối / bản ghi đối soát |
-| IPN báo thành công hợp lệ | Chuyển `PENDING → PAID`, phát ra đúng một `PaymentPaid` |
-| IPN hợp lệ bị gửi trùng lặp | Trả về kết quả tương thích provider, không tạo tác dụng phụ lần hai |
-| Callback đến sai thứ tự | Không ghi đè trạng thái kết thúc, lưu bằng chứng callback/audit |
-| Thành công đến sau khi kết thúc | Ghi nhận `SETTLED_LATE`, chỉ phát sự kiện đối soát, không phục hồi lại Order |
-| Provider bị timeout | Giữ nguyên `PENDING` + gắn cờ đối soát, không báo thất bại giả mạo |
-| Đối soát thành công khi pending | Chuyển `PAID`, phát ra đúng một `PaymentPaid` |
-| Đối soát trạng thái chưa rõ | Giữ nguyên trạng thái, thử lại lùi số mũ, đưa vào hàng đợi thủ công |
-| Đọc dữ liệu chéo tenant/chi nhánh | Trả về mã `404`/`403` mà không làm rò rỉ sự tồn tại của tài nguyên |
-| Cùng idempotency key nhưng khác hash | Trả về mã lỗi `409 idempotency_conflict` |
-| Hoàn tiền P1 vượt quá số dư | Trả về mã lỗi `409/422`, không tạo tác dụng phụ hoàn tiền |
+### `V3__idempotency_and_outbox.sql`
+Thiết lập bảng lưu trữ tính bất biến (Idempotency) và bảng hàng đợi sự kiện Transactional Outbox.
 
-## 10. Tài Liệu Tham Khảo Bên Ngoài
+```sql
+-- V3__idempotency_and_outbox.sql
 
-- [Tích hợp VNPAY PAY — URL thanh toán và IPN](https://sandbox.vnpayment.vn/apis/docs/thanh-toan-pay/pay.html): URL thanh toán sandbox, các trường query VNPAY, quy tắc sắp xếp tính checksum, GET IPN, ngữ nghĩa phản hồi và hành vi gửi lại.
-- [API VNPAY querydr / refund](https://sandbox.vnpayment.vn/apis/docs/truy-van-hoan-tien/querydr%26refund.html): API tra cứu trạng thái giao dịch, hợp đồng checksum và payload/phản hồi API hoàn tiền.
+-- Bảng 7: idempotency_records - Kiểm soát trùng lặp yêu cầu ghi
+CREATE TABLE idempotency_records (
+    id UUID PRIMARY KEY,
+    tenant_id UUID NOT NULL,
+    actor_scope TEXT NOT NULL,
+    operation TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    request_hash TEXT NOT NULL,
+    response_status INTEGER NOT NULL,
+    response_reference UUID NULL,
+    response_body_redacted JSONB NOT NULL,
+    expires_at TIMESTAMPTZ NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Bảng 8: outbox_messages - Hàng đợi sự kiện xuất bản Transactional Outbox
+CREATE TABLE outbox_messages (
+    id UUID PRIMARY KEY,
+    tenant_id UUID NOT NULL,
+    branch_id UUID NOT NULL,
+    aggregate_type TEXT NOT NULL DEFAULT 'Payment',
+    aggregate_id UUID NOT NULL,
+    event_type TEXT NOT NULL,
+    event_version INTEGER NOT NULL,
+    payload JSONB NOT NULL,
+    occurred_at TIMESTAMPTZ NOT NULL,
+    publish_status TEXT NOT NULL DEFAULT 'PENDING',
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at TIMESTAMPTZ NULL,
+    last_error_safe TEXT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    CONSTRAINT ck_outbox_publish_status CHECK (publish_status IN ('PENDING', 'PUBLISHED', 'DLQ'))
+);
+```
+
+---
+
+### `V4__payment_p1_allocations_and_refunds.sql`
+Bổ sung bảng phân bổ thanh toán đa phương thức (Split Tender) và bảng hoàn tiền (Refunds) cho giai đoạn P1.
+
+```sql
+-- V4__payment_p1_allocations_and_refunds.sql
+
+-- Bảng 9: payment_allocations - Phân bổ thanh toán đa phương thức (P1)
+CREATE TABLE payment_allocations (
+    id UUID PRIMARY KEY,
+    tenant_id UUID NOT NULL,
+    branch_id UUID NOT NULL,
+    order_id UUID NOT NULL,
+    payment_id UUID NOT NULL REFERENCES payment_attempts(id) ON DELETE RESTRICT,
+    amount_minor BIGINT NOT NULL,
+    currency TEXT NOT NULL DEFAULT 'VND',
+    status TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    CONSTRAINT ck_allocation_amount CHECK (amount_minor > 0),
+    CONSTRAINT ck_allocation_status CHECK (status IN ('PENDING', 'COMPLETED', 'FAILED', 'CANCELLED'))
+);
+
+-- Bảng 10: refunds - Phiếu hoàn tiền (P1)
+CREATE TABLE refunds (
+    id UUID PRIMARY KEY,
+    tenant_id UUID NOT NULL,
+    branch_id UUID NOT NULL,
+    payment_id UUID NOT NULL REFERENCES payment_attempts(id) ON DELETE RESTRICT,
+    amount_minor BIGINT NOT NULL,
+    currency TEXT NOT NULL DEFAULT 'VND',
+    reason TEXT NOT NULL,
+    status TEXT NOT NULL,
+    provider TEXT NULL,
+    provider_refund_ref TEXT NULL,
+    requested_by UUID NOT NULL,
+    processed_at TIMESTAMPTZ NULL,
+    idempotency_key TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    CONSTRAINT ck_refund_amount CHECK (amount_minor > 0),
+    CONSTRAINT ck_refund_status CHECK (status IN ('PENDING', 'COMPLETED', 'FAILED', 'REJECTED'))
+);
+```
+
+---
+
+### `V5__payment_indexes_and_constraints.sql`
+Thiết lập các ràng buộc duy nhất (Unique Constraints) và chỉ mục (Indexes) tối ưu hóa truy vấn và bảo vệ toàn vẹn tài chính.
+
+```sql
+-- V5__payment_indexes_and_constraints.sql
+
+-- 1. Ràng buộc duy nhất Idempotency
+ALTER TABLE idempotency_records
+    ADD CONSTRAINT uq_payment_idempotency UNIQUE (tenant_id, actor_scope, operation, idempotency_key);
+
+-- 2. Ngăn trùng lặp mã giao dịch phía provider trong cùng một tenant
+CREATE UNIQUE INDEX uq_provider_transaction 
+    ON payment_attempts (tenant_id, provider, provider_transaction_id) 
+    WHERE provider_transaction_id IS NOT NULL;
+
+-- 3. Khử trùng lặp callback từ provider
+ALTER TABLE provider_callbacks
+    ADD CONSTRAINT uq_provider_callback_key UNIQUE (provider, provider_event_key);
+
+-- 4. Bất biến duy nhất một VNPAY attempt đang PENDING cho mỗi checkout attempt
+CREATE UNIQUE INDEX uq_active_vnpay_attempt
+    ON payment_attempts (checkout_attempt_id)
+    WHERE method = 'VNPAY_QR' AND status = 'PENDING';
+
+-- 5. Chỉ mục truy vấn lịch sử theo chi nhánh và thời gian
+CREATE INDEX idx_payment_scope_time ON payment_attempts (tenant_id, branch_id, created_at DESC);
+CREATE INDEX idx_payment_order_lookup ON payment_attempts (tenant_id, order_id);
+
+-- 6. Chỉ mục phục vụ quét đối soát các giao dịch pending quá hạn
+CREATE INDEX idx_payment_pending_expiry ON payment_attempts (tenant_id, status, expires_at)
+    WHERE status = 'PENDING';
+
+-- 7. Chỉ mục cho worker thử lại đối soát
+CREATE INDEX idx_payment_reconciliation_retry ON reconciliation_items (operator_status, next_retry_at)
+    WHERE operator_status != 'RESOLVED';
+
+-- 8. Chỉ mục tra cứu callback của provider theo thời gian
+CREATE INDEX idx_callback_provider_time ON provider_callbacks (provider, received_at DESC);
+
+-- 9. Chỉ mục phục vụ tiến trình polling xuất bản outbox
+CREATE INDEX idx_outbox_publish ON outbox_messages (publish_status, next_attempt_at, created_at)
+    WHERE publish_status = 'PENDING';
+
+-- 10. Chỉ mục danh sách công việc của nhân viên vận hành đối soát
+CREATE INDEX idx_reconciliation_operator ON late_payment_reconciliation (tenant_id, branch_id, status, updated_at DESC);
+```
+
+---
+
+### `V6__payment_comments_and_security.sql`
+Thêm ghi chú (COMMENT ON COLUMN) mô tả chi tiết từng cột nghiệp vụ và kích hoạt chính sách bảo vệ dữ liệu.
+
+```sql
+-- V6__payment_comments_and_security.sql
+
+COMMENT ON TABLE payment_attempts IS 'Bảng lưu trữ các lượt thử thanh toán cho đơn hàng (Tiền mặt hoặc VNPAY QR).';
+COMMENT ON COLUMN payment_attempts.amount_due_minor IS 'Số tiền cần thu bất biến từ snapshot của Order, tính theo đơn vị minor unit VND (đồng).';
+COMMENT ON COLUMN payment_attempts.amount_received_minor IS 'Số tiền mặt khách đưa (chỉ dùng cho CASH), tính theo đơn vị minor VND.';
+COMMENT ON COLUMN payment_attempts.cash_change_minor IS 'Số tiền thừa trả lại khách (amount_received_minor - amount_due_minor).';
+COMMENT ON COLUMN payment_attempts.provider_order_ref IS 'Mã tham chiếu đơn hàng gửi sang cổng thanh toán VNPAY (vnp_TxnRef).';
+COMMENT ON COLUMN payment_attempts.reconciliation_required IS 'Cờ đánh dấu giao dịch có sự sai lệch cần đối soát lại với phía provider.';
+
+COMMENT ON TABLE late_payment_reconciliation IS 'Bằng chứng tài chính ghi nhận các khoản thanh toán thành công từ VNPAY đến sau khi attempt đã kết thúc.';
+COMMENT ON COLUMN late_payment_reconciliation.settlement_status IS 'Giá trị cố định SETTLED_LATE; tuyệt đối không làm sống lại Order đã hủy.';
+
+COMMENT ON TABLE outbox_messages IS 'Hàng đợi xuất bản sự kiện theo mẫu Transactional Outbox Pattern nhằm đảm bảo tính nhất quán.';
+```
+
+---
+
+## 8. Ma Trận Kiểm Thử Hợp Đồng (Contract Test Matrix)
+
+Các kịch bản dưới đây bắt buộc phải được kiểm thử tự động (Contract / Integration Testing) trước khi release:
+
+| Mã kiểm thử | Kịch bản kiểm thử | Dữ liệu đầu vào | Kết quả hợp đồng kỳ vọng |
+|:---:|---|---|---|
+| `TC-PAY-01` | Tiền mặt đưa vừa đúng tiền | `amountDueMinor = 68000`, `cashReceivedMinor = 68000` | Trả về `200 OK`, `status = PAID`, `cashChangeMinor = 0`, phát đúng 1 sự kiện `PaymentPaid.v1`. |
+| `TC-PAY-02` | Tiền mặt đưa thừa tiền | `amountDueMinor = 68000`, `cashReceivedMinor = 100000` | Trả về `200 OK`, `status = PAID`, `cashChangeMinor = 32000`, phát đúng 1 sự kiện `PaymentPaid.v1`. |
+| `TC-PAY-03` | Tiền mặt đưa thiếu tiền | `amountDueMinor = 68000`, `cashReceivedMinor = 50000` | Trả về `422 invalid_cash_amount`, không lưu DB, không chuyển trạng thái, không phát sự kiện. |
+| `TC-PAY-04` | Gửi lặp lại yêu cầu tiền mặt | Cùng `Idempotency-Key` và cùng hash request | Trả về kết quả `200 OK` đã lưu ban đầu, không tạo dòng mới trong DB, không phát lặp sự kiện. |
+| `TC-PAY-05` | Khởi tạo VNPAY QR đồng thời | 2 request cùng `checkoutAttemptId` đến đồng thời | Chỉ duy nhất 1 attempt `PENDING` được tạo; request thứ hai nhận `409 payment_already_pending` kèm thông tin QR hiện tại. |
+| `TC-PAY-06` | VNPAY IPN sai Checksum | `vnp_SecureHash` giả mạo hoặc sai secret key | Trả về `{"RspCode": "97", "Message": "Invalid Checksum"}`, lưu callback thất bại, không chuyển trạng thái. |
+| `TC-PAY-07` | VNPAY IPN sai số tiền | `vnp_Amount = 5000000` trong khi đơn là `6800000` | Trả về `{"RspCode": "04", "Message": "Invalid amount"}`, không chuyển `PAID`, đánh dấu `reconciliation_required = true`. |
+| `TC-PAY-08` | VNPAY IPN hợp lệ | Checksum đúng, `vnp_ResponseCode = "00"`, đúng số tiền | Trả về `{"RspCode": "00", "Message": "Confirm Success"}`, chuyển `PENDING -> PAID`, phát ra đúng 1 `PaymentPaid.v1`. |
+| `TC-PAY-09` | VNPAY IPN gửi trùng lặp | Gửi lại IPN hợp lệ lần thứ hai sau khi đã `PAID` | Trả về `{"RspCode": "02", "Message": "Order already confirmed"}`, xử lý No-op, không phát lặp sự kiện. |
+| `TC-PAY-10` | IPN đến sau khi đã hết hạn | IPN báo thành công nhưng attempt đã chuyển `EXPIRED` | Trả về `RspCode: "00"`, ghi nhận `late_payment_reconciliation(SETTLED_LATE)`, phát `PaymentReconciliationRequired.v1`. Tuyệt đối không chuyển sang `PAID`. |
+| `TC-PAY-11` | Cổng VNPAY bị timeout khi gọi | Worker đối soát tra cứu provider gặp lỗi mạng | Giữ nguyên `PENDING`, lùi thời gian thử lại số mũ `next_retry_at`, không tự ý báo thất bại giả mạo. |
+| `TC-PAY-12` | Yêu cầu hoàn tiền vượt số dư (P1) | `amountMinor = 100000` trong khi đơn chỉ thanh toán `68000` | Trả về mã lỗi `422 refund_amount_exceeded`, từ chối yêu cầu hoàn tiền. |
+| `TC-PAY-13` | Đọc dữ liệu chéo tenant | Truy vấn `paymentId` của tenant khác | Trả về mã lỗi `404 Not Found` (không làm lộ sự tồn tại của dữ liệu chéo tenant). |
+
+---
+
+## 9. Tài Liệu Tham Khảo Kỹ Thuật
+
+- [Tài liệu Tích hợp VNPAY Sandbox PAY](https://sandbox.vnpayment.vn/apis/docs/thanh-toan-pay/pay.html): Đặc tả chi tiết URL cổng thanh toán, danh sách tham số `vnp_*`, thuật toán tính chuỗi băm HMAC-SHA512 checksum và định dạng phản hồi IPN.
+- [Tài liệu API Tra Cứu và Hoàn Tiền VNPAY](https://sandbox.vnpayment.vn/apis/docs/truy-van-hoan-tien/querydr%26refund.html): Đặc tả API `querydr` phục vụ đối soát giao dịch và API `refund` cho hoàn tiền.

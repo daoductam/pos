@@ -997,8 +997,75 @@ Gỡ liên kết (detach) nhóm modifier khỏi món ăn. Thao tác này không 
 
 ### 4. Các Endpoint Giai đoạn P1 (Feature-Gated)
 
-#### `GET /api/v1/catalog/combos` & `POST /api/v1/catalog/combos`
-Quản lý combo món ăn với mức giá cố định (`fixedPrice`). Combo bao gồm danh sách các thành phần (`components`), mỗi thành phần trỏ tới một `itemId` và `variantId` bắt buộc. Bất biến: Thành phần combo không được phép chứa một combo khác.
+Các endpoint dưới đây được bảo vệ bằng cờ tính năng (Feature Flag) P1. Chúng được định nghĩa đầy đủ để đảm bảo tính tương thích kiến trúc khi mở rộng sang combo, giá chi nhánh và tag phân loại.
+
+#### `GET /api/v1/catalog/combos`
+Lấy danh sách các combo món ăn trong tenant.
+
+- **Thẩm quyền:** Quyền `catalog:read`.
+- **Tiêu đề Yêu cầu (Request Headers):**
+  - `Authorization: Bearer <token>` (Bắt buộc)
+  - `X-Active-Branch-Id: <uuid>` (Bắt buộc với Cashier/Kitchen)
+  - `X-Correlation-Id: <uuid>` (Tùy chọn)
+- **Tham số Truy vấn (Query Parameters):**
+  - `page` (integer, Mặc định: `1`): Số trang.
+  - `limit` (integer, Mặc định: `20`, Tối đa: `100`): Kích thước trang.
+  - `status` (string, Tùy chọn): `ACTIVE`, `INACTIVE`, `ARCHIVED`.
+  - `q` (string, Tùy chọn): Tìm kiếm theo tên combo.
+- **Phản hồi Thành công (`200 OK`):**
+
+```json
+{
+  "data": [
+    {
+      "id": "0192b2d0-7f90-7abc-8d2c-123456789012",
+      "tenantId": "0192b2d0-7f1d-7abc-8d2c-123456789012",
+      "name": "Combo Ăn Sáng Tiết Kiệm",
+      "description": "Bánh mì kẹp thịt + Cà phê sữa đá",
+      "fixedPrice": { "amountMinor": 45000, "currency": "VND" },
+      "status": "ACTIVE",
+      "components": [
+        {
+          "catalogItemId": "0192b2d0-7f1e-7abc-8d2c-123456789012",
+          "itemName": "Cà phê sữa",
+          "variantId": "0192b2d0-7f20-7abc-8d2c-123456789012",
+          "variantName": "STANDARD",
+          "modifierOptionIds": []
+        }
+      ],
+      "catalogVersion": 19,
+      "version": 1,
+      "createdAt": "2026-10-12T09:30:00Z",
+      "updatedAt": "2026-10-12T09:30:00Z"
+    }
+  ],
+  "meta": {
+    "pagination": {
+      "page": 1,
+      "limit": 20,
+      "total": 1,
+      "totalPages": 1
+    },
+    "requestId": "req_01J...",
+    "correlationId": "cor_01J..."
+  }
+}
+```
+
+- **Mã lỗi khả dĩ:** `401 Unauthorized`, `403 Forbidden`, `422 Unprocessable Entity`.
+
+---
+
+#### `POST /api/v1/catalog/combos`
+Tạo mới một combo với mức giá cố định (`fixedPrice`).
+
+- **Thẩm quyền:** Quyền `catalog:manage` (`OWNER`, `MANAGER`).
+- **Tiêu đề Yêu cầu (Request Headers):**
+  - `Authorization: Bearer <token>` (Bắt buộc)
+  - `Idempotency-Key: <unique-key>` (Bắt buộc)
+  - `X-Correlation-Id: <uuid>` (Khuyến nghị)
+  - `Content-Type: application/json; charset=utf-8` (Bắt buộc)
+- **Dữ liệu Gửi lên (Request Body):**
 
 ```json
 {
@@ -1015,14 +1082,77 @@ Quản lý combo món ăn với mức giá cố định (`fixedPrice`). Combo ba
 }
 ```
 
-- **Phản hồi:** `200 OK` (GET) hoặc `201 Created` (POST) kèm `ComboResponse`.
+*Quy cách kiểm tra (Validation):*
+- `name`: 1–200 ký tự Unicode, bắt buộc.
+- `fixedPrice.amountMinor`: Số nguyên `>= 0`, đơn vị tiền tệ bắt buộc `"VND"`.
+- `components`: Mảng từ 2 đến 10 món thành phần. Mỗi thành phần trỏ tới `catalogItemId` và `variantId` hợp lệ thuộc cùng tenant. Bất biến: Thành phần combo không được phép là một combo khác.
+
+- **Phản hồi Thành công (`201 Created`):** Trả về `ComboResponse`.
+- **Mã lỗi khả dĩ:** `403 Forbidden`, `409 duplicate_request`, `422 validation_error`.
+
+---
+
+#### `GET /api/v1/catalog/combos/{comboId}`
+Xem chi tiết một combo cụ thể.
+
+- **Thẩm quyền:** Quyền `catalog:read`.
+- **Tiêu đề Yêu cầu (Request Headers):** `Authorization`, `X-Correlation-Id`.
+- **Tham số Đường dẫn (Path Parameters):** `comboId` (UUID, Bắt buộc).
+- **Phản hồi Thành công (`200 OK`):** Trả về `ComboResponse`.
+- **Mã lỗi khả dĩ:** `401 Unauthorized`, `403 Forbidden`, `404 Not Found`.
+
+---
+
+#### `PATCH /api/v1/catalog/combos/{comboId}`
+Cập nhật tên, mô tả, giá cố định hoặc các thành phần của combo.
+
+- **Thẩm quyền:** Quyền `catalog:manage`.
+- **Tiêu đề Yêu cầu (Request Headers):**
+  - `Authorization: Bearer <token>` (Bắt buộc)
+  - `If-Match: "combo-v1"` (Bắt buộc)
+  - `Idempotency-Key: <unique-key>` (Bắt buộc)
+  - `X-Correlation-Id: <uuid>` (Khuyến nghị)
+  - `Content-Type: application/json; charset=utf-8` (Bắt buộc)
+- **Tham số Đường dẫn (Path Parameters):** `comboId` (UUID, Bắt buộc).
+- **Dữ liệu Gửi lên (Request Body):**
+
+```json
+{
+  "name": "Combo Ăn Sáng Đặc Biệt",
+  "fixedPrice": { "amountMinor": 49000, "currency": "VND" }
+}
+```
+
+- **Phản hồi Thành công (`200 OK`):** Trả về `ComboResponse` với version mới.
+- **Mã lỗi khả dĩ:** `403 Forbidden`, `404 Not Found`, `409 catalog_version_conflict`, `422 validation_error`.
+
+---
+
+#### `POST /api/v1/catalog/combos/{comboId}/state`
+Đổi trạng thái của combo (`ACTIVE`, `INACTIVE`, `ARCHIVED`).
+
+- **Thẩm quyền:** Quyền `catalog:manage`.
+- **Tiêu đề Yêu cầu (Request Headers):** `Authorization`, `If-Match: "combo-v2"`, `Idempotency-Key`, `X-Correlation-Id`, `Content-Type`.
+- **Tham số Đường dẫn (Path Parameters):** `comboId` (UUID, Bắt buộc).
+- **Dữ liệu Gửi lên (Request Body):** `{ "status": "INACTIVE", "reason": "Tạm dừng chương trình combo" }`.
+- **Phản hồi Thành công (`200 OK`):** Trả về `ComboResponse`.
+- **Mã lỗi khả dĩ:** `403 Forbidden`, `404 Not Found`, `409 catalog_version_conflict`.
 
 ---
 
 #### `PUT /api/v1/catalog/branches/{branchId}/variants/{variantId}/price`
-Thiết lập ghi đè giá biến thể theo từng chi nhánh cụ thể (Branch Price Override).
+Thiết lập hoặc cập nhật mức giá ghi đè theo chi nhánh cho một biến thể món ăn (Branch Price Override).
 
 - **Thẩm quyền:** Quyền `catalog:manage` tại chi nhánh đó.
+- **Tiêu đề Yêu cầu (Request Headers):**
+  - `Authorization: Bearer <token>` (Bắt buộc)
+  - `X-Active-Branch-Id: <uuid>` (Bắt buộc - phải khớp với `branchId` trên URL)
+  - `Idempotency-Key: <unique-key>` (Bắt buộc)
+  - `X-Correlation-Id: <uuid>` (Khuyến nghị)
+  - `Content-Type: application/json; charset=utf-8` (Bắt buộc)
+- **Tham số Đường dẫn (Path Parameters):**
+  - `branchId` (UUID, Bắt buộc)
+  - `variantId` (UUID, Bắt buộc)
 - **Dữ liệu Gửi lên (Request Body):**
 
 ```json
@@ -1031,30 +1161,121 @@ Thiết lập ghi đè giá biến thể theo từng chi nhánh cụ thể (Bran
 }
 ```
 
-- **Phản hồi:** `200 OK` kèm `BranchVariantPriceResponse`.
+*Quy cách kiểm tra:* `price.amountMinor` là số nguyên `>= 0`, đơn vị `"VND"`. Biến thể và chi nhánh phải thuộc cùng tenant.
+
+- **Phản hồi Thành công (`200 OK`):**
+
+```json
+{
+  "data": {
+    "tenantId": "0192b2d0-7f1d-7abc-8d2c-123456789012",
+    "branchId": "0192b2d0-7f23-7abc-8d2c-123456789012",
+    "variantId": "0192b2d0-7f20-7abc-8d2c-123456789012",
+    "price": { "amountMinor": 32000, "currency": "VND" },
+    "createdAt": "2026-10-12T09:40:00Z",
+    "updatedAt": "2026-10-12T09:40:00Z"
+  },
+  "meta": {
+    "requestId": "req_01J...",
+    "correlationId": "cor_01J..."
+  }
+}
+```
+
+- **Mã lỗi khả dĩ:** `403 Forbidden`, `404 Not Found`, `422 validation_error`.
 
 ---
 
 #### `DELETE /api/v1/catalog/branches/{branchId}/variants/{variantId}/price`
-Xóa bản ghi đè giá chi nhánh. Sau khi xóa, giá của biến thể tại chi nhánh sẽ tự động quay về mức giá cơ sở toàn tenant.
+Xóa bản ghi đè giá chi nhánh. Sau khi xóa, giá của biến thể tại chi nhánh đó sẽ tự động quay trở về mức giá cơ sở toàn tenant.
 
-- **Phản hồi:** `204 No Content`.
+- **Thẩm quyền:** Quyền `catalog:manage` tại chi nhánh đó.
+- **Tiêu đề Yêu cầu (Request Headers):**
+  - `Authorization: Bearer <token>` (Bắt buộc)
+  - `X-Active-Branch-Id: <uuid>` (Bắt buộc)
+  - `Idempotency-Key: <unique-key>` (Bắt buộc)
+  - `X-Correlation-Id: <uuid>` (Khuyến nghị)
+- **Tham số Đường dẫn (Path Parameters):**
+  - `branchId` (UUID, Bắt buộc)
+  - `variantId` (UUID, Bắt buộc)
+- **Phản hồi Thành công (`204 No Content`):** Không có body.
+- **Mã lỗi khả dĩ:** `403 Forbidden`, `404 Not Found`.
 
 ---
 
-#### `GET /api/v1/catalog/tags` & `POST /api/v1/catalog/tags`
-Quản lý danh mục Tag phân loại chuẩn hóa (phục vụ bộ lọc món và thuật toán gợi ý Recommendation / AI).
+#### `GET /api/v1/catalog/tags`
+Lấy danh sách các nhãn phân loại (Tags) trong tenant.
 
-- **Dữ liệu tạo Tag (`POST`):** `{ "name": "Best Seller", "slug": "best-seller" }`.
-- **Phản hồi:** `201 Created` kèm `TagResponse`.
+- **Thẩm quyền:** Quyền `catalog:read`.
+- **Tiêu đề Yêu cầu (Request Headers):** `Authorization`, `X-Correlation-Id`.
+- **Phản hồi Thành công (`200 OK`):**
+
+```json
+{
+  "data": [
+    {
+      "id": "0192b2d0-7f80-7abc-8d2c-123456789012",
+      "tenantId": "0192b2d0-7f1d-7abc-8d2c-123456789012",
+      "name": "Món Bán Chạy",
+      "slug": "best-seller",
+      "createdAt": "2026-10-12T08:00:00Z"
+    }
+  ],
+  "meta": {
+    "requestId": "req_01J...",
+    "correlationId": "cor_01J..."
+  }
+}
+```
+
+---
+
+#### `POST /api/v1/catalog/tags`
+Tạo mới một nhãn phân loại trong tenant.
+
+- **Thẩm quyền:** Quyền `catalog:manage`.
+- **Tiêu đề Yêu cầu (Request Headers):** `Authorization`, `Idempotency-Key`, `X-Correlation-Id`, `Content-Type`.
+- **Dữ liệu Gửi lên (Request Body):**
+
+```json
+{
+  "name": "Món Mới Ra Mắt",
+  "slug": "new-arrival"
+}
+```
+
+*Quy cách kiểm tra:* `name` từ 1–100 ký tự; `slug` từ 1–100 ký tự chữ thường và gạch nối (`^[a-z0-9-]+$`), duy nhất trong tenant.
+
+- **Phản hồi Thành công (`201 Created`):** Trả về `TagResponse`.
+- **Mã lỗi khả dĩ:** `403 Forbidden`, `409 conflict` (trùng slug), `422 validation_error`.
 
 ---
 
 #### `PUT /api/v1/catalog/items/{itemId}/tags`
 Thay thế toàn bộ tập hợp Tag được gán cho món ăn một cách nguyên tử.
 
-- **Dữ liệu Gửi lên (Request Body):** `{ "tagIds": ["0192b2d0-7f80-7abc-8d2c-123456789012"] }`.
-- **Phản hồi:** `200 OK`.
+- **Thẩm quyền:** Quyền `catalog:manage`.
+- **Tiêu đề Yêu cầu (Request Headers):**
+  - `Authorization: Bearer <token>` (Bắt buộc)
+  - `If-Match: "item-v6"` (Bắt buộc - ETag của món ăn)
+  - `Idempotency-Key: <unique-key>` (Bắt buộc)
+  - `X-Correlation-Id: <uuid>` (Khuyến nghị)
+  - `Content-Type: application/json; charset=utf-8` (Bắt buộc)
+- **Tham số Đường dẫn (Path Parameters):** `itemId` (UUID, Bắt buộc).
+- **Dữ liệu Gửi lên (Request Body):**
+
+```json
+{
+  "tagIds": [
+    "0192b2d0-7f80-7abc-8d2c-123456789012"
+  ]
+}
+```
+
+*Quy cách kiểm tra:* Toàn bộ `tagIds` phải tồn tại và thuộc cùng một tenant.
+
+- **Phản hồi Thành công (`200 OK`):** Trả về `CatalogItemResponse` với danh sách tag cập nhật.
+- **Mã lỗi khả dĩ:** `403 Forbidden`, `404 Not Found`, `409 catalog_version_conflict`, `422 foreign_resource`.
 
 ---
 

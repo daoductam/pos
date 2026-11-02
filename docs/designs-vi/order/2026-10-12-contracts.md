@@ -619,14 +619,285 @@ Lấy danh sách lịch sử các lượt checkout attempt của đơn hàng.
 
 ---
 
-#### `GET /api/v1/orders/{orderId}/checkout-attempts/{attemptId}`
-Xem chi tiết một lượt checkout attempt cụ thể (bao gồm trạng thái Saga, mã lỗi, và kết quả bù trừ).
+### 5. Các Endpoint Giai đoạn P1 & P2 (Feature-Gated & Tương lai)
 
-- **Thẩm quyền:** Quyền `order:read`.
-- **Tham số Đường dẫn (Path Parameters):**
-  - `orderId` (UUID, Bắt buộc)
-  - `attemptId` (UUID, Bắt buộc)
-- **Phản hồi Thành công (`200 OK`):** Trả về `CheckoutAttemptResponse`.
+Các endpoint dưới đây được bảo vệ bằng cờ tính năng (Feature Flag). Chúng được đặc tả đầy đủ hợp đồng để đảm bảo tính sẵn sàng khi hệ thống mở rộng sang sơ đồ bàn, phiếu in bếp KDS và gọi món QR tại bàn.
+
+#### `POST /api/v1/orders/{orderId}/hold`
+Tạm giữ một đơn hàng nháp đang phục vụ để giải phóng màn hình POS tiếp nhận đơn khác (ví dụ: khách đang gọi món nhưng chờ bạn đi cùng đến thêm).
+
+- **Thẩm quyền:** Quyền `order:edit`.
+- **Tiêu đề Yêu cầu (Request Headers):**
+  - `Authorization: Bearer <token>` (Bắt buộc)
+  - `If-Match: "order-v7"` (Bắt buộc)
+  - `Idempotency-Key: <unique-key>` (Bắt buộc)
+  - `X-Active-Branch-Id: <uuid>` (Bắt buộc)
+  - `X-Correlation-Id: <uuid>` (Khuyến nghị)
+  - `Content-Type: application/json; charset=utf-8` (Bắt buộc)
+- **Tham số Đường dẫn (Path Parameters):** `orderId` (UUID, Bắt buộc).
+- **Dữ liệu Gửi lên (Request Body):**
+
+```json
+{
+  "reason": "Khách đợi thêm người, giữ bàn và món đã gọi"
+}
+```
+
+*Quy cách kiểm tra:* `reason` từ 1 đến 500 ký tự. Chỉ áp dụng cho đơn đang ở trạng thái `DRAFT`.
+
+- **Phản hồi Thành công (`200 OK`):** Trả về `OrderResponse` với `status: "HELD"` và version tăng thêm 1.
+- **Mã lỗi khả dĩ:** `403 Forbidden`, `404 Not Found`, `409 order_not_editable`, `409 order_version_conflict`.
+
+---
+
+#### `POST /api/v1/orders/{orderId}/resume`
+Mở lại một đơn hàng đang bị tạm giữ (`HELD -> DRAFT`) để tiếp tục chỉnh sửa hoặc tiến hành thanh toán.
+
+- **Thẩm quyền:** Quyền `order:edit`.
+- **Tiêu đề Yêu cầu (Request Headers):**
+  - `Authorization: Bearer <token>` (Bắt buộc)
+  - `If-Match: "order-v8"` (Bắt buộc)
+  - `Idempotency-Key: <unique-key>` (Bắt buộc)
+  - `X-Active-Branch-Id: <uuid>` (Bắt buộc)
+  - `X-Correlation-Id: <uuid>` (Khuyến nghị)
+- **Tham số Đường dẫn (Path Parameters):** `orderId` (UUID, Bắt buộc).
+- **Phản hồi Thành công (`200 OK`):** Trả về `OrderResponse` với `status: "DRAFT"`.
+- **Mã lỗi khả dĩ:** `403 Forbidden`, `404 Not Found`, `409 conflict` (đơn không ở trạng thái `HELD`).
+
+---
+
+#### `POST /api/v1/orders/{orderId}/splits`
+Tách hóa đơn (Split Bill) / tách một số dòng món từ đơn hiện tại sang một đơn hàng nháp mới độc lập.
+
+- **Thẩm quyền:** Quyền `order:edit`.
+- **Tiêu đề Yêu cầu (Request Headers):**
+  - `Authorization: Bearer <token>` (Bắt buộc)
+  - `If-Match: "order-v8"` (Bắt buộc)
+  - `Idempotency-Key: <unique-key>` (Bắt buộc)
+  - `X-Active-Branch-Id: <uuid>` (Bắt buộc)
+  - `X-Correlation-Id: <uuid>` (Khuyến nghị)
+  - `Content-Type: application/json; charset=utf-8` (Bắt buộc)
+- **Tham số Đường dẫn (Path Parameters):** `orderId` (UUID, Bắt buộc).
+- **Dữ liệu Gửi lên (Request Body):**
+
+```json
+{
+  "targetLines": [
+    {
+      "orderLineId": "0192b2d0-7f31-7abc-8d2c-123456789012",
+      "quantity": 1
+    }
+  ],
+  "newOrderServiceMode": "TABLE",
+  "newOrderTableReference": "A03-B"
+}
+```
+
+*Quy cách kiểm tra:* `quantity` tách phải nhỏ hơn hoặc bằng số lượng hiện có của dòng món. Các dòng được tách sang đơn mới sẽ giữ nguyên toàn bộ snapshot món, biến thể và giá gốc.
+
+- **Phản hồi Thành công (`201 Created`):**
+
+```json
+{
+  "data": {
+    "originalOrder": {
+      "id": "0192b2d0-7f30-7abc-8d2c-123456789012",
+      "grandTotalMinor": 34000,
+      "version": 9
+    },
+    "newOrder": {
+      "id": "0192b2d0-7fa0-7abc-8d2c-123456789012",
+      "orderNumber": "A03B-000128",
+      "status": "DRAFT",
+      "grandTotalMinor": 34000,
+      "version": 1
+    }
+  },
+  "meta": {
+    "requestId": "req_01J...",
+    "correlationId": "cor_01J..."
+  }
+}
+```
+
+- **Mã lỗi khả dĩ:** `403 Forbidden`, `404 Not Found`, `409 order_not_editable`, `422 validation_error`.
+
+---
+
+#### `POST /api/v1/orders/merge`
+Gộp hai hoặc nhiều đơn hàng nháp đang mở thuộc cùng một bàn thành một đơn hàng duy nhất trước khi thanh toán.
+
+- **Thẩm quyền:** Quyền `order:edit`.
+- **Tiêu đề Yêu cầu (Request Headers):**
+  - `Authorization: Bearer <token>` (Bắt buộc)
+  - `Idempotency-Key: <unique-key>` (Bắt buộc)
+  - `X-Active-Branch-Id: <uuid>` (Bắt buộc)
+  - `X-Correlation-Id: <uuid>` (Khuyến nghị)
+  - `Content-Type: application/json; charset=utf-8` (Bắt buộc)
+- **Dữ liệu Gửi lên (Request Body):**
+
+```json
+{
+  "sourceOrderIds": [
+    "0192b2d0-7fa0-7abc-8d2c-123456789012"
+  ],
+  "targetOrderId": "0192b2d0-7f30-7abc-8d2c-123456789012"
+}
+```
+
+*Quy tắc:* Toàn bộ các đơn phải ở trạng thái `DRAFT` và cùng thuộc chi nhánh của người gọi. Các đơn nguồn (`sourceOrderIds`) sau khi gộp sẽ tự động chuyển sang `CANCELLED` với lý do `MERGED_INTO_<targetOrderId>`.
+
+- **Phản hồi Thành công (`200 OK`):** Trả về `OrderResponse` của đơn đích sau khi đã gộp toàn bộ dòng món và tính lại tổng tiền.
+- **Mã lỗi khả dĩ:** `403 Forbidden`, `404 Not Found`, `409 order_not_editable`, `422 validation_error`.
+
+---
+
+#### `GET /api/v1/branches/{branchId}/tables`
+Lấy danh sách sơ đồ bàn và trạng thái phục vụ hiện tại tại chi nhánh (bàn trống, bàn đang có khách, đơn nháp liên kết).
+
+- **Thẩm quyền:** Quyền `order:read` tại chi nhánh.
+- **Tiêu đề Yêu cầu (Request Headers):**
+  - `Authorization: Bearer <token>` (Bắt buộc)
+  - `X-Active-Branch-Id: <uuid>` (Bắt buộc)
+  - `X-Correlation-Id: <uuid>` (Tùy chọn)
+- **Tham số Đường dẫn (Path Parameters):** `branchId` (UUID, Bắt buộc).
+- **Phản hồi Thành công (`200 OK`):**
+
+```json
+{
+  "data": [
+    {
+      "tableReference": "A03",
+      "zone": "Tầng 1 - Trong nhà",
+      "status": "OCCUPIED",
+      "activeOrderId": "0192b2d0-7f30-7abc-8d2c-123456789012",
+      "orderNumber": "A03-000127",
+      "occupiedSince": "2026-10-12T09:00:00Z"
+    },
+    {
+      "tableReference": "A04",
+      "zone": "Tầng 1 - Trong nhà",
+      "status": "VACANT",
+      "activeOrderId": null,
+      "orderNumber": null,
+      "occupiedSince": null
+    }
+  ],
+  "meta": {
+    "requestId": "req_01J...",
+    "correlationId": "cor_01J..."
+  }
+}
+```
+
+- **Mã lỗi khả dĩ:** `401 Unauthorized`, `403 Forbidden`, `404 Not Found`.
+
+---
+
+#### `POST /api/v1/orders/{orderId}/kitchen-tickets`
+Gửi phiếu chế biến món ăn bền bỉ xuống hệ thống màn hình nhà bếp (KDS).
+
+- **Thẩm quyền:** Quyền `order:edit`.
+- **Tiêu đề Yêu cầu (Request Headers):**
+  - `Authorization: Bearer <token>` (Bắt buộc)
+  - `If-Match: "order-v9"` (Bắt buộc)
+  - `Idempotency-Key: <unique-key>` (Bắt buộc)
+  - `X-Active-Branch-Id: <uuid>` (Bắt buộc)
+  - `X-Correlation-Id: <uuid>` (Khuyến nghị)
+  - `Content-Type: application/json; charset=utf-8` (Bắt buộc)
+- **Tham số Đường dẫn (Path Parameters):** `orderId` (UUID, Bắt buộc).
+- **Dữ liệu Gửi lên (Request Body):**
+
+```json
+{
+  "lineIds": [
+    "0192b2d0-7f31-7abc-8d2c-123456789012"
+  ],
+  "priority": "HIGH",
+  "ticketNote": "Bàn khách VIP, ưu tiên chế biến trước"
+}
+```
+
+- **Phản hồi Thành công (`201 Created`):**
+
+```json
+{
+  "data": {
+    "ticketId": "0192b2d0-7fb0-7abc-8d2c-123456789012",
+    "ticketNumber": "K-102",
+    "orderId": "0192b2d0-7f30-7abc-8d2c-123456789012",
+    "orderNumber": "A03-000127",
+    "tableReference": "A03",
+    "status": "SENT_TO_KITCHEN",
+    "priority": "HIGH",
+    "lines": [
+      {
+        "lineId": "0192b2d0-7f31-7abc-8d2c-123456789012",
+        "itemName": "Cà phê sữa",
+        "variantName": "STANDARD",
+        "quantity": 2,
+        "note": "Không hành",
+        "modifiers": ["Trân châu đen"]
+      }
+    ],
+    "createdAt": "2026-10-12T09:10:00Z"
+  },
+  "meta": {
+    "requestId": "req_01J...",
+    "correlationId": "cor_01J..."
+  }
+}
+```
+
+- **Mã lỗi khả dĩ:** `403 Forbidden`, `404 Not Found`, `409 order_version_conflict`, `422 validation_error`.
+
+---
+
+#### `WebSocket /ws/v1/kds`
+Kênh kết nối WebSocket truyền phát các sự kiện nhà bếp theo thời gian thực tới màn hình KDS.
+
+- **Xác thực:** Truyền Cognito token qua query parameter `?token=<access-token>` trong quá trình bắt tay (Handshake). Phải có membership chi nhánh hợp lệ với vai trò `KITCHEN`, `MANAGER` hoặc `OWNER`.
+- **Cơ chế phục hồi:** Nếu kết nối WebSocket bị đứt, KDS client tự động kết nối lại và thăm dò sự kiện bền bỉ từ Outbox/EventBridge dựa trên `lastTicketId` để tránh mất đơn.
+
+---
+
+#### `POST /api/v1/qr-sessions` (Giai đoạn P2)
+Khởi tạo phiên gọi món tại bàn bằng mã QR dành cho khách hàng tự phục vụ (Self-service Table QR Ordering).
+
+- **Thẩm quyền:** Public endpoint dành cho khách hàng (không yêu cầu JWT nhân viên); được bảo vệ bằng chữ ký mật mã (HMAC signature) gắn cố định với bàn và chi nhánh.
+- **Tiêu đề Yêu cầu (Request Headers):**
+  - `X-Correlation-Id: <uuid>` (Tùy chọn)
+  - `Content-Type: application/json; charset=utf-8` (Bắt buộc)
+- **Dữ liệu Gửi lên (Request Body):**
+
+```json
+{
+  "branchId": "0192b2d0-7f23-7abc-8d2c-123456789012",
+  "tableReference": "A03",
+  "tableSignature": "hmac-sha256-signature-from-printed-qr-code"
+}
+```
+
+- **Phản hồi Thành công (`201 Created`):**
+
+```json
+{
+  "data": {
+    "sessionId": "0192b2d0-7fc0-7abc-8d2c-123456789012",
+    "qrOrderToken": "qr_tok_01J...",
+    "branchId": "0192b2d0-7f23-7abc-8d2c-123456789012",
+    "tableReference": "A03",
+    "expiresAt": "2026-10-12T11:00:00Z",
+    "menuCatalogVersion": 19
+  },
+  "meta": {
+    "requestId": "req_01J...",
+    "correlationId": "cor_01J..."
+  }
+}
+```
+
+- **Mã lỗi khả dĩ:** `403 Forbidden` (chữ ký mã QR giả mạo hoặc bàn bị khóa), `404 Not Found`, `422 validation_error`.
 
 ---
 
